@@ -1,0 +1,91 @@
+export type BotState = "running" | "paused" | "circuit_breaker";
+
+export interface Position {
+  id: string;
+  symbol: "USDJPY" | "EURUSD" | string;
+  side: "BUY" | "SELL";
+  volumeLots: number;
+  entryPrice: number;
+  currentPrice: number;
+  stopLoss: number;
+  takeProfit: number;
+  pnlPips: number;
+  pnlAmount: number;
+  openTime: string;
+  invalidationReason: string;
+}
+
+export type CloseReason = "TAKE_PROFIT" | "STOP_LOSS" | "MANUAL" | "CIRCUIT_BREAKER";
+
+export interface TradeHistory {
+  id: string;
+  symbol: string;
+  side: "BUY" | "SELL";
+  volumeLots: number;
+  entryPrice: number;
+  closePrice: number;
+  stopLoss: number;
+  takeProfit: number;
+  pnlPips: number;
+  pnlAmount: number;
+  closeReason: CloseReason;
+  openTime: string;
+  closeTime: string;
+  cotLogId?: string;
+}
+
+export type ActionType = "BUY" | "SELL" | "HOLD";
+export type TriggerPatternType = "PINBAR" | "ENGULFING" | "FAKEOUT" | "NONE";
+
+export interface CoTLog {
+  id: string;
+  timestamp: string;
+  symbol: string;
+  action: ActionType;
+  confidence: number;
+  entryType?: "MARKET" | "LIMIT";
+  entryPrice?: number;
+  stopLoss?: number;
+  takeProfit?: number;
+  riskRewardRatio?: number;
+  macroBias: string;
+  triggerPattern: string;
+  invalidationPoint: string;
+  reasoning: string;
+  executed: boolean;
+  spreadPips: number;
+}
+
+export interface AccountMetrics {
+  balance: number;
+  equity: number;
+  margin: number;
+  freeMargin: number;
+  dailyPnl: number;
+  dailyPnlPercent: number;
+  unrealizedPnl: number;
+  winRateToday: number;
+  totalTradesToday: number;
+  winningTradesToday: number;
+  usdjpySpread: number;
+  eurusdSpread: number;
+  circuitBreakerThresholdPercent: number;
+  connectionStatus: {
+    ctrader: "connected" | "connecting" | "disconnected";
+    llm: "ready" | "busy" | "error";
+    pingMs: number;
+    environment: "DEMO" | "LIVE";
+    accountNumber: string;
+  };
+}
+
+export interface LessonLearned {
+  id: string;
+  createdAt: string;
+  symbol: string;
+  rule: string;
+  context: string;
+  active: boolean;
+  triggerTradeId?: string;
+  category: "RISK" | "TIMING" | "PATTERN" | "NEWS";
+}
