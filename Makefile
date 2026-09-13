@@ -17,15 +17,16 @@ ui: ## 管理画面 (Next.js) を起動 (http://localhost:3000)
 	@echo "--> Starting Next.js Dashboard on http://localhost:3000..."
 	cd dashboard && pnpm dev -p 3000
 
-engine: ## Rustコアエンジンを起動
-	@echo "--> Starting Rust Core Engine..."
+engine: ## Rustコアエンジンを起動 (http://localhost:4000)
+	@echo "--> Starting Rust Core Engine on http://localhost:4000..."
 	cargo run --bin ntrade
 
-dev: ## フロントエンドとRustエンジンを並行起動
-	@echo "--> Starting ntrade (Dashboard + Rust Engine)..."
-	@trap 'kill 0' SIGINT SIGTERM EXIT; \
+dev: ## フロントエンドとRustエンジンを並行起動 (UI: 3000 / API: 4000)
+	@echo "--> Starting ntrade (Dashboard on :3000 + Engine on :4000)..."
+	@trap 'kill 0' SIGINT SIGTERM; \
 	(cd dashboard && pnpm dev -p 3000) & \
-	cargo run --bin ntrade
+	cargo run --bin ntrade & \
+	wait
 
 poc: ## LLM CLI推論 (claude -p) のPoCを実行
 	@echo "--> Running LLM CLI inference PoC..."
