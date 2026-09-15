@@ -6,6 +6,7 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use crate::ctrader::{CTraderConfig, CTraderService};
+use crate::snapshot::SnapshotBundle;
 use super::types::{
     AccountInfo, AccountMetrics, BotState, CloseReason, ConnectionStatus, CoTLog, LessonLearned,
     Position, TradeHistory,
@@ -22,7 +23,14 @@ pub struct AppState {
     pub ctrader_service: Arc<RwLock<Option<Arc<CTraderService>>>>,
     pub ctrader_config: Arc<RwLock<Option<CTraderConfig>>>,
     pub available_accounts: Arc<RwLock<Vec<AccountInfo>>>,
-    pub chart_image_path: Arc<RwLock<PathBuf>>,
+    /// 直近に生成した Snapshot（客観的事実 + 画像4枚）
+    pub latest_snapshot: Arc<RwLock<Option<SnapshotBundle>>>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AppState {
@@ -30,7 +38,6 @@ impl AppState {
         let (metrics, positions, trades, cot_logs, lessons) = Self::initial_data();
 
         let initial_config = CTraderConfig::from_env().ok();
-        let chart_path = PathBuf::from("charts/mtf_analysis_latest.png");
 
         Self {
             bot_state: Arc::new(RwLock::new(BotState::Running)),
@@ -42,7 +49,7 @@ impl AppState {
             ctrader_service: Arc::new(RwLock::new(None)),
             ctrader_config: Arc::new(RwLock::new(initial_config)),
             available_accounts: Arc::new(RwLock::new(Vec::new())),
-            chart_image_path: Arc::new(RwLock::new(chart_path)),
+            latest_snapshot: Arc::new(RwLock::new(None)),
         }
     }
 

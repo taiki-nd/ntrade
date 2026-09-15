@@ -198,7 +198,7 @@ export const tradingApi = {
   },
 
   /**
-   * 4分割チャートの再生成トリガー
+   * Snapshot（時間足別チャート4枚 + 客観的事実JSON）の再生成トリガー
    */
   async generateChart(): Promise<ApiResponse<string>> {
     return await request<ApiResponse<string>>("/api/chart/generate", {
@@ -207,9 +207,53 @@ export const tradingApi = {
   },
 
   /**
-   * 最新チャート画像のURL
+   * 時間足別の最新チャート画像URL
    */
-  getLatestChartUrl(): string {
-    return `${API_BASE_URL}/api/chart/latest?t=${Date.now()}`;
+  getLatestChartUrl(tf: ChartTimeframe, cacheKey: number = Date.now()): string {
+    return `${API_BASE_URL}/api/chart/latest?tf=${tf}&t=${cacheKey}`;
+  },
+
+  /**
+   * 直近 Snapshot の客観的事実JSON
+   */
+  async getLatestSnapshot(): Promise<ApiResponse<MarketSnapshot>> {
+    return await request<ApiResponse<MarketSnapshot>>("/api/snapshot/latest");
   },
 };
+
+export type ChartTimeframe = "4H" | "1H" | "15M" | "5M";
+export const CHART_TIMEFRAMES: ChartTimeframe[] = ["4H", "1H", "15M", "5M"];
+
+/** Rust 側 MarketSnapshot の表示に必要な部分だけを型付け */
+export interface MarketSnapshot {
+  pair: string;
+  timestamp: string;
+  session: string;
+  current_price: number;
+  spread_pips: number;
+  volatility: {
+    atr14_5m_pips: number | null;
+    atr14_15m_pips: number | null;
+    atr14_1h_pips: number | null;
+    atr14_4h_pips: number | null;
+    today_range_pips: number | null;
+    avg_daily_range_pips: number | null;
+    avg_daily_range_days_sampled: number;
+    today_range_vs_avg: number | null;
+  };
+  reference_levels: {
+    prev_day_high: number | null;
+    prev_day_low: number | null;
+    today_high: number | null;
+    today_low: number | null;
+    asia_session_high: number | null;
+    asia_session_low: number | null;
+    round_numbers: number[];
+  };
+  latest_bars: {
+    "4h": string | null;
+    "1h": string | null;
+    "15m": string | null;
+    "5m": string | null;
+  };
+}

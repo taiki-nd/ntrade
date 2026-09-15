@@ -28,17 +28,15 @@ dev: ## フロントエンドとRustエンジンを並行起動 (UI: 3000 / API:
 	cargo run --bin ntrade & \
 	wait
 
-poc: ## LLM CLI推論 (claude -p) のPoCを実行
-	@echo "--> Running LLM CLI inference PoC..."
-	cargo run --bin poc_inference
+poc: ## Snapshot生成 (画像4枚+事実JSON) & claude -p 画像パス渡し推論のPoCを実行
+	@echo "--> Running Snapshot & LLM inference PoC..."
+	cargo run --bin poc_price_action
 
 ctrader: ## cTrader Open API 接続とバーデータ取得のPoCを実行
 	@echo "--> Running cTrader Open API PoC..."
 	cargo run --bin poc_ctrader
 
-step4: ## Step 4: PA特徴量抽出 & plotters 4分割チャート生成PoCを実行
-	@echo "--> Running Step 4: Price Action & Plotters PoC..."
-	cargo run --bin poc_price_action
+step4: poc ## (旧名) poc のエイリアス
 
 test: ## テストを実行 (Rust単体テスト)
 	@echo "--> Running Rust tests..."

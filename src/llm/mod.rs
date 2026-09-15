@@ -1,3 +1,3 @@
 pub mod client;
 
-pub use client::{LlmClient, LlmClientConfig};
+pub use client::{LlmBackend, LlmClient, LlmClientConfig};

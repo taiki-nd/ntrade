@@ -1,13 +1,21 @@
+//! Step 6 PoC: 判定なし Snapshot（画像4枚 + 生OHLC + 客観数値）の生成と、
+//! `claude -p` への画像パス渡し推論の疎通確認。
+//!
+//! 実行: `cargo run --bin poc_price_action` （`make step4`）
+//! - .env に cTrader 資格情報があれば実データ、無ければ擬似データ
+//! - `claude` CLI があれば推論まで実行し、observed の整合をチェックする
+//! - `NTRADE_SKIP_LLM=1` で Snapshot 生成のみ（画像の確認用）
+
 use anyhow::Result;
-use chrono::{Duration, Utc};
+use chrono::Utc;
 use std::path::PathBuf;
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use ntrade::chart::ChartPlotterConfig;
 use ntrade::ctrader::{BarPeriod, CandleBar, CTraderConfig, CTraderService};
 use ntrade::llm::{LlmClient, LlmClientConfig};
-use ntrade::strategy::{PriceActionPipeline, PromptBuilder};
+use ntrade::snapshot::{mock, AccountState, SnapshotInput, SnapshotPipeline};
+use ntrade::strategy::PromptBuilder;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -20,239 +28,115 @@ async fn main() -> Result<()> {
         .init();
 
     println!("============================================================");
-    println!("  ntrade Step 4: PA特徴量抽出 & plotters 4分割チャート描画検証");
+    println!("  ntrade Step 6: 判定なし Snapshot 生成 & 画像パス渡し推論 PoC");
     println!("============================================================");
 
     let pair = "USDJPY";
     let spread_pips = 0.2;
-    let output_dir = PathBuf::from("charts");
 
-    // 1. 相場データの取得（cTrader または 高精度シミュレーション）
-    let (bars_4h, bars_1h, bars_15m, bars_5m) = fetch_or_simulate_bars(pair).await?;
+    let (bars_4h, bars_1h, bars_15m, bars_5m, source) = fetch_or_simulate_bars(pair).await?;
+    println!("\n[1/4] バーデータ ({source}):");
+    println!("  4H {} 本 / 1H {} 本 / 15M {} 本 / 5M {} 本", bars_4h.len(), bars_1h.len(), bars_15m.len(), bars_5m.len());
 
-    println!("\n[1/4] バーデータ準備完了:");
-    println!("  - 4H  足: {} 本 (大局環境認識)", bars_4h.len());
-    println!("  - 1H  足: {} 本 (スイング構造 & EMA)", bars_1h.len());
-    println!("  - 15M 足: {} 本 (セットアップ & プルバック)", bars_15m.len());
-    println!("  - 5M  足: {} 本 (直近エントリートリガー)", bars_5m.len());
-
-    // 2. パイプライン実行（PA特徴量抽出 + 4分割チャートPNG生成）
-    println!("\n[2/4] プライスアクション特徴量抽出 & 4分割チャート生成中...");
-    let pipeline = PriceActionPipeline::with_plotter_config(
-        &output_dir,
-        ChartPlotterConfig {
-            width: 1600,
-            height: 1200,
-            bars_to_display: 45,
-            dark_mode: true,
-        },
-    );
-
-    let bundle = pipeline.process(pair, &bars_4h, &bars_1h, &bars_15m, &bars_5m, spread_pips)?;
-
-    println!("  ✓ 特徴量抽出 完了！");
-    println!("  ✓ 4分割チャートPNG生成 完了: {:?}", bundle.chart_path);
-    if bundle.chart_path.exists() {
-        let meta = std::fs::metadata(&bundle.chart_path)?;
-        println!("    (ファイルサイズ: {} KB)", meta.len() / 1024);
+    println!("\n[2/4] Snapshot 生成（画像4枚 + 客観的事実）...");
+    let pipeline = SnapshotPipeline::new(PathBuf::from("charts"));
+    let bundle = pipeline.build(&SnapshotInput {
+        pair,
+        bars_4h: &bars_4h,
+        bars_1h: &bars_1h,
+        bars_15m: &bars_15m,
+        bars_5m: &bars_5m,
+        spread_pips,
+        current_price: None,
+        now: None,
+        account_state: AccountState::default(),
+    })?;
+    for (tf, p) in bundle.charts.ordered() {
+        let size = std::fs::metadata(p).map(|m| m.len() / 1024).unwrap_or(0);
+        println!("  ✓ {:<3} {:?} ({} KB)", tf, p, size);
     }
 
-    // 3. 抽出されたプライスアクション特徴量の表示
-    println!("\n[3/4] 抽出されたプライスアクション特徴量 (JSON):");
+    println!("\n[3/4] 客観的事実 (JSON):");
     println!("------------------------------------------------------------");
-    let input_json = serde_json::to_string_pretty(&bundle.input)?;
-    println!("{}", input_json);
+    println!("{}", bundle.snapshot.to_json_pretty());
     println!("------------------------------------------------------------");
 
-    println!("\n【5M足の幾何学的特徴量サマリー】");
-    let cur = &bundle.input.five_minute_pa.current_bar;
-    println!("  ・ローソク足タイプ : {}", cur.bar_type);
-    println!("  ・方向 (Direction) : {}", cur.direction);
-    println!("  ・全レンジ (Pips)  : {:.1} pips", cur.total_range_pips);
-    println!("  ・実体比率 (Body)  : {:.1}%", cur.body_ratio * 100.0);
-    println!("  ・下ヒゲ比率 (Lower): {:.1}%", cur.lower_wick_ratio * 100.0);
-    println!("  ・上ヒゲ比率 (Upper): {:.1}%", cur.upper_wick_ratio * 100.0);
-    if let Some(rej) = cur.rejection_level {
-        println!("  ・拒絶価格 (Rejection): {:.3}", rej);
+    println!("\n[4/4] プロンプト構築 & (オプション) LLM推論:");
+    let prompt = PromptBuilder::new()
+        .with_lessons(vec![
+            "ロンドン開場直後の初動ブレイクは反転しやすい。追認の足を待って読む。".to_string(),
+        ])
+        .build(&bundle.snapshot, &bundle.charts);
+    println!("  ✓ プロンプト {} 文字", prompt.chars().count());
+
+    if std::env::var("NTRADE_SKIP_LLM").is_ok() {
+        println!("  (NTRADE_SKIP_LLM が設定されているため推論はスキップ)");
+        return Ok(());
     }
-    println!("  ・検出パターン     : {}", bundle.input.five_minute_pa.pattern_detected);
-    println!("  ・キーレベル状態   : {}", bundle.input.five_minute_pa.at_key_level);
+    let has_claude = std::process::Command::new("claude").arg("--version").output().is_ok();
+    if !has_claude {
+        println!("  (claude CLI が見つからないため推論はスキップ)");
+        return Ok(());
+    }
 
-    // 4. プロンプトの生成
-    println!("\n[4/4] LLMプロンプトの構築 & (オプション)推論テスト:");
-    let lessons = vec![
-        "4H上位足が上昇トレンドの局面では、5M逆張りショートは厳禁。".to_string(),
-        "欧州ロンドンオープン直後の初動ブレイクはダマシが多いため、プルバックを待つこと。".to_string(),
+    println!("  claude -p で推論中（画像4枚を Read で読ませる）...");
+    let client = LlmClient::new(LlmClientConfig::default());
+    let started = std::time::Instant::now();
+    let decision = client.infer(&prompt).await?;
+    println!("  所要時間: {:.1?}", started.elapsed());
+
+    println!("\n  === TradeDecision ===");
+    println!("  Action:      {:?}", decision.action);
+    println!("  Confidence:  {:.2}", decision.confidence);
+    println!("  Entry type:  {:?}", decision.entry_type);
+    println!("  Entry/SL/TP: {:?} / {:?} / {:?}", decision.entry_price, decision.stop_loss, decision.take_profit);
+    println!("  Macro:       {}", decision.analysis.macro_context);
+    println!("  Order flow:  {}", decision.analysis.order_flow);
+    println!("  Invalidation:{}", decision.analysis.invalidation);
+    println!("  Conflicts:   {}", decision.analysis.conflicts);
+    if let Some(plan) = &decision.conditional_plan {
+        println!("  Plan:        wait_for={} | then={:?} | invalidate_if={} | expires={}",
+            plan.wait_for, plan.then_action, plan.invalidate_if, plan.expires_at);
+    }
+    println!("  Reasoning:   {}", decision.reasoning);
+
+    // 観測整合: LLM が報告した最新足時刻と Snapshot の最新足時刻を突き合わせる
+    let lb = &bundle.snapshot.latest_bars;
+    let ob = &decision.observed;
+    let checks = [
+        ("4H", lb.h4.as_deref(), ob.latest_bar_4h.as_deref()),
+        ("1H", lb.h1.as_deref(), ob.latest_bar_1h.as_deref()),
+        ("15M", lb.m15.as_deref(), ob.latest_bar_15m.as_deref()),
+        ("5M", lb.m5.as_deref(), ob.latest_bar_5m.as_deref()),
     ];
-    let prompt_builder = PromptBuilder::new().with_lessons(lessons);
-    let prompt = prompt_builder.build_inference_prompt(&bundle.input);
-    println!("  ✓ プロンプト生成成功 (文字数: {} chars)", prompt.len());
-
-    // CLI推論の疎通確認（claude または agy が存在すれば実行、なければスキップ）
-    let cli_tool = if std::process::Command::new("claude").arg("--version").output().is_ok() {
-        Some("claude")
-    } else if std::process::Command::new("agy").arg("--version").output().is_ok() {
-        Some("agy")
-    } else {
-        None
-    };
-
-    if let Some(tool) = cli_tool {
-        println!("\n  [+] ローカルCLI '{}' が検出されました。LLM推論をテストします...", tool);
-        let client = LlmClient::new(LlmClientConfig {
-            cli_binary: tool.to_string(),
-            timeout_secs: 45,
-        });
-
-        match client.infer(&prompt).await {
-            Ok(decision) => {
-                println!("\n  === LLM 意思決定結果 ===");
-                println!("  Action:            {:?}", decision.action);
-                println!("  Confidence:        {:.2}", decision.confidence);
-                if let Some(entry) = decision.entry_price {
-                    println!("  Entry Price:       {:.3}", entry);
-                }
-                if let Some(sl) = decision.stop_loss {
-                    println!("  Stop Loss (SL):    {:.3}", sl);
-                }
-                if let Some(tp) = decision.take_profit {
-                    println!("  Take Profit (TP):  {:.3}", tp);
-                }
-                if let Some(rr) = decision.risk_reward_ratio {
-                    println!("  Risk:Reward Ratio: 1 : {:.2}", rr);
-                }
-                println!("  Reasoning:         {}", decision.reasoning);
-            }
-            Err(e) => {
-                println!("  [!] LLM推論呼び出しスキップまたは失敗 (PoC単体検証は成功): {}", e);
-            }
-        }
-    } else {
-        println!("  (※ claude / agy CLIが見つからないため、LLMパイプ呼び出しはスキップします)");
+    println!("\n  === 観測整合チェック (observed vs latest_bars) ===");
+    let mut all_ok = true;
+    for (tf, expected, got) in checks {
+        let ok = expected.is_some() && expected == got;
+        all_ok &= ok;
+        println!("  {:<3} expected={:?} observed={:?} {}", tf, expected, got, if ok { "OK" } else { "MISMATCH" });
     }
-
-    println!("\n============================================================");
-    println!("  Step 4: プライスアクション特徴量 & plotters 描画 検証完了！");
-    println!("  生成画像: {:?}", bundle.chart_path);
-    println!("============================================================");
+    println!("  => {}", if all_ok { "LLM は4枚とも読んで回答した" } else { "不一致あり: ガードなら HOLD に倒す対象" });
 
     Ok(())
 }
 
-/// cTrader からバーデータを取得、接続できない場合はリアルなシミュレーションデータを生成
 async fn fetch_or_simulate_bars(
     pair: &str,
-) -> Result<(Vec<CandleBar>, Vec<CandleBar>, Vec<CandleBar>, Vec<CandleBar>)> {
+) -> Result<(Vec<CandleBar>, Vec<CandleBar>, Vec<CandleBar>, Vec<CandleBar>, &'static str)> {
     if let Ok(config) = CTraderConfig::from_env() {
-        info!("Found cTrader credentials in .env, attempting live connection...");
+        info!("Found cTrader credentials, attempting live connection...");
         match CTraderService::connect(config).await {
             Ok(service) => {
-                info!("cTrader connected! Fetching MTF trendbars...");
-                let b4h = service.get_trendbars(pair, BarPeriod::H4, 40).await?;
-                let b1h = service.get_trendbars(pair, BarPeriod::H1, 40).await?;
-                let b15m = service.get_trendbars(pair, BarPeriod::M15, 40).await?;
-                let b5m = service.get_trendbars(pair, BarPeriod::M5, 40).await?;
-                return Ok((b4h, b1h, b15m, b5m));
+                let b4h = service.get_trendbars(pair, BarPeriod::H4, 60).await?;
+                let b1h = service.get_trendbars(pair, BarPeriod::H1, 60).await?;
+                let b15m = service.get_trendbars(pair, BarPeriod::M15, 60).await?;
+                let b5m = service.get_trendbars(pair, BarPeriod::M5, 60).await?;
+                return Ok((b4h, b1h, b15m, b5m, "cTrader 実データ"));
             }
-            Err(e) => {
-                warn!("cTrader connection failed ({:?}), falling back to realistic simulation.", e);
-            }
+            Err(e) => warn!("cTrader connection failed ({:?}), falling back to simulation.", e),
         }
     }
-
-    info!("Generating realistic multi-timeframe price action simulation for USD/JPY...");
-    let now = Utc::now();
-
-    // 4H足: 上昇トレンド (Higher Highs / Higher Lows: 152.50 -> 154.50)
-    let mut bars_4h = Vec::new();
-    let mut p = 152.50;
-    for i in 0..35 {
-        let open = p;
-        let close = open + 0.08 + ((i as f64 * 0.3).sin() * 0.15);
-        let high = open.max(close) + 0.20;
-        let low = open.min(close) - 0.12;
-        p = close;
-        bars_4h.push(CandleBar {
-            timestamp: now - Duration::hours((35 - i) * 4),
-            open,
-            high,
-            low,
-            close,
-            volume: 5000,
-        });
-    }
-
-    // 1H足: 4H上昇の中での押し目形成 (154.80 -> 154.10 EMA20付近へのプルバック)
-    let mut bars_1h = Vec::new();
-    let mut p = 153.80;
-    for i in 0..40 {
-        let open = p;
-        let diff = if i > 30 { -0.05 } else { 0.04 };
-        let close = open + diff + ((i as f64 * 0.2).cos() * 0.08);
-        let high = open.max(close) + 0.10;
-        let low = open.min(close) - 0.08;
-        p = close;
-        bars_1h.push(CandleBar {
-            timestamp: now - Duration::hours(40 - i),
-            open,
-            high,
-            low,
-            close,
-            volume: 1500,
-        });
-    }
-
-    // 15M足: 154.10付近で揉み合い・下げ止まり
-    let mut bars_15m = Vec::new();
-    let mut p = 154.30;
-    for i in 0..45 {
-        let open = p;
-        let diff = if i > 35 { 0.02 } else { -0.02 };
-        let close = open + diff + ((i as f64 * 0.15).sin() * 0.05);
-        let high = open.max(close) + 0.06;
-        let low = open.min(close) - 0.06;
-        p = close;
-        bars_15m.push(CandleBar {
-            timestamp: now - Duration::minutes((45 - i) * 15),
-            open,
-            high,
-            low,
-            close,
-            volume: 400,
-        });
-    }
-
-    // 5M足: 154.12のサポートで下ヒゲが長い強気レジェクション・ピンバーが出現！
-    let mut bars_5m = Vec::new();
-    let mut p: f64 = 154.25;
-    for i in 0..44 {
-        let open: f64 = p;
-        let diff: f64 = if i > 38 { -0.02 } else { 0.01 };
-        let close: f64 = open + diff;
-        let high: f64 = open.max(close) + 0.03;
-        let low: f64 = open.min(close) - 0.03;
-        p = close;
-        bars_5m.push(CandleBar {
-            timestamp: now - Duration::minutes((45 - i) * 5),
-            open,
-            high,
-            low,
-            close,
-            volume: 120,
-        });
-    }
-
-    // 45本目（最新足）: 154.12のサポートを試して下ヒゲ70%のピンバー確定！
-    // open: 154.20, low: 154.08, high: 154.24, close: 154.22
-    // range: 0.16, lower_wick: 154.20 - 154.08 = 0.12 (75%下ヒゲ!)
-    bars_5m.push(CandleBar {
-        timestamp: now,
-        open: 154.200,
-        high: 154.240,
-        low: 154.080,
-        close: 154.220,
-        volume: 380,
-    });
-
-    Ok((bars_4h, bars_1h, bars_15m, bars_5m))
+    let (a, b, c, d) = mock::simulate_multi_timeframe(Utc::now(), 154.0);
+    Ok((a, b, c, d, "擬似データ"))
 }

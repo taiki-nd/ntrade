@@ -1,32 +1,54 @@
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Json, Response},
 };
-use chrono::{Duration, Utc};
+use chrono::Utc;
+use serde::Deserialize;
 use std::fs;
 use std::path::PathBuf;
 use tracing::{info, warn};
 
-use crate::chart::ChartPlotterConfig;
-use crate::ctrader::{BarPeriod, CandleBar};
+use crate::ctrader::BarPeriod;
 use crate::server::state::AppState;
 use crate::server::types::ApiResponse;
-use crate::strategy::PriceActionPipeline;
+use crate::snapshot::{mock, AccountState, MarketSnapshot, SnapshotInput, SnapshotPipeline};
 
-/// GET /api/chart/latest
-/// 最新の4分割チャートPNG画像をバイナリストリームで配信
-pub async fn get_latest_chart(State(state): State<AppState>) -> Response {
+#[derive(Debug, Deserialize)]
+pub struct ChartQuery {
+    /// 4H / 1H / 15M / 5M（省略時は 5M）
+    pub tf: Option<String>,
+}
+
+/// GET /api/chart/latest?tf=5M
+/// 直近 Snapshot の時間足別チャートPNGを配信
+pub async fn get_latest_chart(
+    State(state): State<AppState>,
+    Query(q): Query<ChartQuery>,
+) -> Response {
+    let tf = q.tf.unwrap_or_else(|| "5M".to_string());
+
+    if state.latest_snapshot.read().await.is_none() {
+        info!("No snapshot yet, generating on demand...");
+        if let Err(e) = generate_snapshot_internal(&state, "USDJPY").await {
+            warn!("On-demand snapshot generation failed: {:?}", e);
+        }
+    }
+
     let path = {
-        let lock = state.chart_image_path.read().await;
-        lock.clone()
+        let lock = state.latest_snapshot.read().await;
+        lock.as_ref()
+            .and_then(|b| b.charts.by_timeframe(&tf).map(|p| p.to_path_buf()))
     };
 
-    // チャート画像が存在しない場合はオンデマンド生成
-    if !path.exists() {
-        info!("Chart image does not exist at {:?}, generating on demand...", path);
-        let _ = generate_chart_internal(&state, "USDJPY").await;
-    }
+    let Some(path) = path else {
+        return (
+            StatusCode::NOT_FOUND,
+            [("Content-Type", "text/plain")],
+            format!("No chart for timeframe {tf}"),
+        )
+            .into_response();
+    };
 
     match fs::read(&path) {
         Ok(bytes) => (
@@ -51,154 +73,85 @@ pub async fn get_latest_chart(State(state): State<AppState>) -> Response {
 }
 
 /// POST /api/chart/generate
-/// 手動または定期トリガーによるチャート再描画
+/// Snapshot（画像4枚 + 客観的事実）を再生成
 pub async fn generate_chart(State(state): State<AppState>) -> Json<ApiResponse<String>> {
-    info!("Triggering manual chart regeneration for USDJPY...");
-    match generate_chart_internal(&state, "USDJPY").await {
-        Ok(path_str) => Json(ApiResponse::ok_msg(
-            path_str,
-            "4分割チャートPNGを新規生成しました",
-        )),
-        Err(e) => Json(ApiResponse {
-            success: false,
-            data: None,
-            message: Some(format!("Failed to generate chart: {:?}", e)),
-        }),
+    info!("Triggering snapshot regeneration for USDJPY...");
+    match generate_snapshot_internal(&state, "USDJPY").await {
+        Ok(dir) => Json(ApiResponse::ok_msg(dir, "Snapshot（4H/1H/15M/5M 画像 + 事実JSON）を再生成しました")),
+        Err(e) => Json(ApiResponse::err(format!("Failed to generate snapshot: {:?}", e))),
     }
 }
 
-/// 内部用チャート生成ロジック
-pub async fn generate_chart_internal(state: &AppState, pair: &str) -> anyhow::Result<String> {
+/// GET /api/snapshot/latest
+/// 直近 Snapshot の客観的事実 JSON
+pub async fn get_latest_snapshot(
+    State(state): State<AppState>,
+) -> Json<ApiResponse<MarketSnapshot>> {
+    if state.latest_snapshot.read().await.is_none() {
+        if let Err(e) = generate_snapshot_internal(&state, "USDJPY").await {
+            return Json(ApiResponse::err(format!("Failed to generate snapshot: {:?}", e)));
+        }
+    }
+    let lock = state.latest_snapshot.read().await;
+    match lock.as_ref() {
+        Some(b) => Json(ApiResponse::ok(b.snapshot.clone())),
+        None => Json(ApiResponse::err("No snapshot available")),
+    }
+}
+
+/// 内部用: バー取得 → Snapshot 生成 → 状態更新。生成先ディレクトリを返す。
+pub async fn generate_snapshot_internal(state: &AppState, pair: &str) -> anyhow::Result<String> {
     let ctrader_opt = {
         let lock = state.ctrader_service.read().await;
         lock.clone()
     };
 
-    let (b4h, b1h, b15m, b5m) = if let Some(ctrader) = ctrader_opt {
+    let live = if let Some(ctrader) = ctrader_opt {
         info!("Fetching real trendbars from connected cTrader...");
         match (
-            ctrader.get_trendbars(pair, BarPeriod::H4, 45).await,
-            ctrader.get_trendbars(pair, BarPeriod::H1, 45).await,
-            ctrader.get_trendbars(pair, BarPeriod::M15, 45).await,
-            ctrader.get_trendbars(pair, BarPeriod::M5, 45).await,
+            ctrader.get_trendbars(pair, BarPeriod::H4, 60).await,
+            ctrader.get_trendbars(pair, BarPeriod::H1, 60).await,
+            ctrader.get_trendbars(pair, BarPeriod::M15, 60).await,
+            ctrader.get_trendbars(pair, BarPeriod::M5, 60).await,
         ) {
-            (Ok(b4), Ok(b1), Ok(b15), Ok(b5)) => (b4, b1, b15, b5),
-            _ => generate_mock_bars(),
+            (Ok(b4), Ok(b1), Ok(b15), Ok(b5)) => Some((b4, b1, b15, b5)),
+            _ => None,
         }
     } else {
-        generate_mock_bars()
+        None
     };
 
-    let output_dir = PathBuf::from("charts");
-    fs::create_dir_all(&output_dir)?;
+    let (b4h, b1h, b15m, b5m) = match live {
+        Some(bars) => bars,
+        None => {
+            warn!("Using simulated bars (cTrader unavailable)");
+            mock::simulate_multi_timeframe(Utc::now(), 154.0)
+        }
+    };
 
-    let pipeline = PriceActionPipeline::with_plotter_config(
-        &output_dir,
-        ChartPlotterConfig {
-            width: 1600,
-            height: 1200,
-            bars_to_display: 45,
-            dark_mode: true,
-        },
-    );
+    let spread_pips = {
+        let m = state.metrics.read().await;
+        if pair.to_uppercase().contains("JPY") { m.usdjpy_spread } else { m.eurusd_spread }
+    };
 
-    let bundle = pipeline.process(pair, &b4h, &b1h, &b15m, &b5m, 0.2)?;
-    let path_str = bundle.chart_path.to_string_lossy().to_string();
+    let pipeline = SnapshotPipeline::new(PathBuf::from("charts"));
+    let bundle = pipeline.build(&SnapshotInput {
+        pair,
+        bars_4h: &b4h,
+        bars_1h: &b1h,
+        bars_15m: &b15m,
+        bars_5m: &b5m,
+        spread_pips,
+        current_price: None,
+        now: None,
+        account_state: AccountState::default(),
+    })?;
 
+    let dir = bundle.charts.dir.to_string_lossy().to_string();
     {
-        let mut lock = state.chart_image_path.write().await;
-        *lock = bundle.chart_path;
+        let mut lock = state.latest_snapshot.write().await;
+        *lock = Some(bundle);
     }
-
-    info!("Generated chart saved at {}", path_str);
-    Ok(path_str)
-}
-
-fn generate_mock_bars() -> (Vec<CandleBar>, Vec<CandleBar>, Vec<CandleBar>, Vec<CandleBar>) {
-    let now = Utc::now();
-    let mut bars_4h = Vec::new();
-    let mut p = 152.50;
-    for i in 0..35 {
-        let open = p;
-        let close = open + 0.08 + ((i as f64 * 0.3).sin() * 0.15);
-        let high = open.max(close) + 0.20;
-        let low = open.min(close) - 0.12;
-        p = close;
-        bars_4h.push(CandleBar {
-            timestamp: now - Duration::hours((35 - i) * 4),
-            open,
-            high,
-            low,
-            close,
-            volume: 5000,
-        });
-    }
-
-    let mut bars_1h = Vec::new();
-    let mut p = 153.80;
-    for i in 0..40 {
-        let open = p;
-        let diff = if i > 30 { -0.05 } else { 0.04 };
-        let close = open + diff + ((i as f64 * 0.2).cos() * 0.08);
-        let high = open.max(close) + 0.10;
-        let low = open.min(close) - 0.08;
-        p = close;
-        bars_1h.push(CandleBar {
-            timestamp: now - Duration::hours(40 - i),
-            open,
-            high,
-            low,
-            close,
-            volume: 1500,
-        });
-    }
-
-    let mut bars_15m = Vec::new();
-    let mut p = 154.30;
-    for i in 0..45 {
-        let open = p;
-        let diff = if i > 35 { 0.02 } else { -0.02 };
-        let close = open + diff + ((i as f64 * 0.15).sin() * 0.05);
-        let high = open.max(close) + 0.06;
-        let low = open.min(close) - 0.06;
-        p = close;
-        bars_15m.push(CandleBar {
-            timestamp: now - Duration::minutes((45 - i) * 15),
-            open,
-            high,
-            low,
-            close,
-            volume: 400,
-        });
-    }
-
-    let mut bars_5m = Vec::new();
-    let mut p: f64 = 154.25;
-    for i in 0..44 {
-        let open: f64 = p;
-        let diff: f64 = if i > 38 { -0.02 } else { 0.01 };
-        let close: f64 = open + diff;
-        let high: f64 = open.max(close) + 0.03;
-        let low: f64 = open.min(close) - 0.03;
-        p = close;
-        bars_5m.push(CandleBar {
-            timestamp: now - Duration::minutes((45 - i) * 5),
-            open,
-            high,
-            low,
-            close,
-            volume: 120,
-        });
-    }
-
-    bars_5m.push(CandleBar {
-        timestamp: now,
-        open: 154.200,
-        high: 154.240,
-        low: 154.080,
-        close: 154.220,
-        volume: 380,
-    });
-
-    (bars_4h, bars_1h, bars_15m, bars_5m)
+    info!("Snapshot generated at {}", dir);
+    Ok(dir)
 }

@@ -1,3 +1,3 @@
 pub mod plotter;
 
-pub use plotter::{ChartPlotter, ChartPlotterConfig, MultiTimeframeChartData};
+pub use plotter::{ChartPlotter, ChartPlotterConfig, PriceLevel, TimeframeChart};

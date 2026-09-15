@@ -39,9 +39,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/lessons", post(handlers::lessons::create_lesson))
         .route("/api/lessons/{id}/toggle", post(handlers::lessons::toggle_lesson))
         .route("/api/lessons/{id}", delete(handlers::lessons::delete_lesson))
-        // 7. チャート画像配信 & 手動再描画
+        // 7. Snapshot: 時間足別チャート画像配信 / 再生成 / 客観的事実JSON
         .route("/api/chart/latest", get(handlers::chart::get_latest_chart))
         .route("/api/chart/generate", post(handlers::chart::generate_chart))
+        .route("/api/snapshot/latest", get(handlers::chart::get_latest_snapshot))
         // 8. cTrader OAuth 認証連携
         .route("/api/auth/ctrader/url", get(handlers::auth::get_oauth_url))
         .route("/api/auth/ctrader/exchange", post(handlers::auth::exchange_oauth_code))

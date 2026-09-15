@@ -1,6 +1,8 @@
-use crate::strategy::types::{Action, PriceActionAnalysis, TradeDecision};
+use crate::strategy::types::TradeDecision;
 use anyhow::{anyhow, Context, Result};
 use regex::Regex;
+use std::future::Future;
+use std::pin::Pin;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -8,23 +10,40 @@ use tokio::process::Command;
 use tokio::time::timeout;
 use tracing::{error, info, warn};
 
-/// LLM CLI 推論クライアント設定
+/// LLM 推論バックエンドの抽象。CLI 実装と将来の API 直叩き実装を差し替え可能にする。
+pub trait LlmBackend: Send + Sync {
+    fn infer<'a>(
+        &'a self,
+        prompt: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<TradeDecision>> + Send + 'a>>;
+}
+
+/// `claude -p` サブプロセス推論クライアントの設定
 #[derive(Debug, Clone)]
 pub struct LlmClientConfig {
-    pub cli_binary: String, // "claude" or "agy"
+    pub cli_binary: String,
+    /// 画像4枚の Read が各1ターン入るため、テキストのみの場合より長めに取る
     pub timeout_secs: u64,
+    pub max_turns: u32,
+    /// 許可するツール。画像を読むために Read が必要。
+    pub allowed_tools: Vec<String>,
+    /// None なら CLI のデフォルトモデル
+    pub model: Option<String>,
 }
 
 impl Default for LlmClientConfig {
     fn default() -> Self {
         Self {
             cli_binary: "claude".to_string(),
-            timeout_secs: 45,
+            timeout_secs: 120,
+            max_turns: 8,
+            allowed_tools: vec!["Read".to_string()],
+            model: None,
         }
     }
 }
 
-/// LLM CLI 推論クライアント
+/// `claude -p` を使う LLM クライアント
 pub struct LlmClient {
     config: LlmClientConfig,
 }
@@ -34,36 +53,49 @@ impl LlmClient {
         Self { config }
     }
 
-    /// プロンプトをCLIサブプロセス（claude -p / agy -p）へ流し込み、TradeDecisionを取得
+    pub fn config(&self) -> &LlmClientConfig {
+        &self.config
+    }
+
+    /// プロンプトを CLI に流し込み、TradeDecision を取得。失敗時は HOLD に倒す。
     pub async fn infer(&self, prompt: &str) -> Result<TradeDecision> {
         info!(
             cli = %self.config.cli_binary,
             timeout = self.config.timeout_secs,
-            "Starting LLM inference via CLI pipeline..."
+            "Starting LLM inference via CLI"
         );
 
-        let infer_future = self.execute_cli_subcommand(prompt);
-        let duration = Duration::from_secs(self.config.timeout_secs);
-
-        match timeout(duration, infer_future).await {
-            Ok(result) => match result {
-                Ok(raw_output) => self.parse_decision(&raw_output),
-                Err(e) => {
-                    error!("CLI command execution failed: {e}");
-                    Ok(self.fallback_hold(&format!("CLI execution error: {e}")))
-                }
-            },
+        let fut = self.execute_cli(prompt);
+        match timeout(Duration::from_secs(self.config.timeout_secs), fut).await {
+            Ok(Ok(raw)) => Ok(self.parse_decision(&raw)),
+            Ok(Err(e)) => {
+                error!("CLI execution failed: {e}");
+                Ok(TradeDecision::fallback_hold(format!("CLI execution error: {e}")))
+            }
             Err(_) => {
                 warn!("LLM inference timed out after {}s", self.config.timeout_secs);
-                Ok(self.fallback_hold("Inference timeout, defaulting to safe HOLD"))
+                Ok(TradeDecision::fallback_hold("inference timeout"))
             }
         }
     }
 
-    /// サブプロセスを実行し、標準出力を取得
-    async fn execute_cli_subcommand(&self, prompt: &str) -> Result<String> {
-        let mut child = Command::new(&self.config.cli_binary)
-            .arg("-p")
+    async fn execute_cli(&self, prompt: &str) -> Result<String> {
+        let schema = TradeDecision::json_schema().to_string();
+        let mut cmd = Command::new(&self.config.cli_binary);
+        cmd.arg("-p")
+            .arg("--output-format")
+            .arg("json")
+            .arg("--json-schema")
+            .arg(&schema)
+            .arg("--max-turns")
+            .arg(self.config.max_turns.to_string())
+            .arg("--tools")
+            .arg(self.config.allowed_tools.join(","));
+        if let Some(model) = &self.config.model {
+            cmd.arg("--model").arg(model);
+        }
+
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -71,98 +103,94 @@ impl LlmClient {
             .with_context(|| format!("Failed to spawn {}", self.config.cli_binary))?;
 
         if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(prompt.as_bytes())
-                .await
-                .context("Failed to write prompt to stdin")?;
-            stdin.flush().await.context("Failed to flush stdin")?;
-            drop(stdin); // EOFを送信して完了を促す
+            stdin.write_all(prompt.as_bytes()).await.context("Failed to write prompt")?;
+            stdin.flush().await?;
+            drop(stdin);
         }
 
-        let output = child
-            .wait_with_output()
-            .await
-            .context("Failed to wait for child process output")?;
-
+        let output = child.wait_with_output().await.context("Failed to wait for CLI")?;
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(anyhow!(
-                "CLI process exited with code {:?}: {}",
+                "CLI exited with {:?}: {}",
                 output.status.code(),
-                stderr
+                String::from_utf8_lossy(&output.stderr)
             ));
         }
-
-        let stdout = String::from_utf8(output.stdout)
-            .context("Output contains invalid UTF-8 characters")?;
-        Ok(stdout)
+        Ok(String::from_utf8(output.stdout).context("CLI output is not UTF-8")?)
     }
 
-    /// 出力テキストからJSONを抽出してTradeDecisionにデシリアライズ
-    pub fn parse_decision(&self, raw: &str) -> Result<TradeDecision> {
-        // ```json ... ``` ブロックを抽出
-        let json_str = if let Some(extracted) = Self::extract_json_block(raw) {
-            extracted
-        } else {
-            // ブロックが無い場合は全体をJSONとしてパース試行
-            raw.trim().to_string()
-        };
-
-        match serde_json::from_str::<TradeDecision>(&json_str) {
-            Ok(decision) => {
-                info!(
-                    action = ?decision.action,
-                    confidence = decision.confidence,
-                    "Successfully parsed TradeDecision from LLM"
-                );
-                Ok(decision)
+    /// CLI 出力（JSON エンベロープ or 生テキスト）から TradeDecision を取り出す
+    pub fn parse_decision(&self, raw: &str) -> TradeDecision {
+        match Self::extract_decision_json(raw).and_then(|v| {
+            serde_json::from_value::<TradeDecision>(v).map_err(|e| anyhow!("schema mismatch: {e}"))
+        }) {
+            Ok(d) => {
+                info!(action = ?d.action, confidence = d.confidence, "Parsed TradeDecision");
+                d
             }
             Err(e) => {
-                error!(
-                    error = %e,
-                    raw_json = %json_str,
-                    "Failed to parse LLM JSON into TradeDecision"
-                );
-                Ok(self.fallback_hold(&format!("JSON parse error: {e}")))
+                error!(error = %e, raw = %truncate(raw, 800), "Failed to parse TradeDecision");
+                TradeDecision::fallback_hold(format!("parse error: {e}"))
             }
         }
     }
 
-    /// MarkdownコードブロックからJSON文字列を抽出
-    fn extract_json_block(text: &str) -> Option<String> {
-        let re = Regex::new(r"(?s)```(?:json)?\s*(\{.*?\})\s*```").ok()?;
-        if let Some(captures) = re.captures(text) {
-            if let Some(matched) = captures.get(1) {
-                return Some(matched.as_str().trim().to_string());
+    /// 1. `--output-format json` のエンベロープ (`structured_output` → `result`)
+    /// 2. 生JSON / Markdown コードブロック
+    fn extract_decision_json(raw: &str) -> Result<serde_json::Value> {
+        let trimmed = raw.trim();
+        if let Ok(envelope) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if envelope.get("type").and_then(|t| t.as_str()) == Some("result") {
+                if envelope.get("is_error").and_then(|b| b.as_bool()) == Some(true) {
+                    return Err(anyhow!(
+                        "CLI reported error: {}",
+                        envelope.get("result").and_then(|r| r.as_str()).unwrap_or("")
+                    ));
+                }
+                if let Some(so) = envelope.get("structured_output") {
+                    if so.is_object() {
+                        return Ok(so.clone());
+                    }
+                }
+                if let Some(result) = envelope.get("result").and_then(|r| r.as_str()) {
+                    return Self::extract_from_text(result);
+                }
+                return Err(anyhow!("result envelope without structured_output/result"));
+            }
+            if envelope.get("action").is_some() {
+                return Ok(envelope);
             }
         }
-
-        // 最も外側の波括弧を探すフォールバック
-        if let (Some(start), Some(end)) = (text.find('{'), text.rfind('}')) {
-            if start < end {
-                return Some(text[start..=end].to_string());
-            }
-        }
-
-        None
+        Self::extract_from_text(trimmed)
     }
 
-    /// 安全装置としての見送り（HOLD）フォールバック
-    fn fallback_hold(&self, reason: &str) -> TradeDecision {
-        TradeDecision {
-            action: Action::Hold,
-            confidence: 0.0,
-            entry_type: None,
-            entry_price: None,
-            stop_loss: None,
-            take_profit: None,
-            risk_reward_ratio: None,
-            price_action_analysis: PriceActionAnalysis {
-                macro_bias: "N/A (System Fallback)".to_string(),
-                trigger_pattern: "N/A (System Fallback)".to_string(),
-                invalidation_point: "N/A".to_string(),
-            },
-            reasoning: format!("FALLBACK_HOLD: {}", reason),
+    fn extract_from_text(text: &str) -> Result<serde_json::Value> {
+        let re = Regex::new(r"(?s)```(?:json)?\s*(\{.*?\})\s*```").unwrap();
+        if let Some(c) = re.captures(text).and_then(|c| c.get(1)) {
+            return serde_json::from_str(c.as_str()).context("invalid JSON in code block");
         }
+        if let (Some(s), Some(e)) = (text.find('{'), text.rfind('}')) {
+            if s < e {
+                return serde_json::from_str(&text[s..=e]).context("invalid JSON object");
+            }
+        }
+        Err(anyhow!("no JSON object found in output"))
+    }
+}
+
+impl LlmBackend for LlmClient {
+    fn infer<'a>(
+        &'a self,
+        prompt: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<TradeDecision>> + Send + 'a>> {
+        Box::pin(LlmClient::infer(self, prompt))
+    }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(max).collect::<String>())
     }
 }
