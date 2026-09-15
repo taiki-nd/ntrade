@@ -1,7 +1,7 @@
 SHELL := /bin/zsh
 export PATH := $(HOME)/.nodenv/shims:$(PATH)
 
-.PHONY: help install dev ui engine test poc build clean
+.PHONY: help install dev ui engine test poc ctrader build clean
 
 help: ## コマンド一覧を表示
 	@echo "ntrade - LLM駆動型 FX自動売買システム"
@@ -31,6 +31,14 @@ dev: ## フロントエンドとRustエンジンを並行起動 (UI: 3000 / API:
 poc: ## LLM CLI推論 (claude -p) のPoCを実行
 	@echo "--> Running LLM CLI inference PoC..."
 	cargo run --bin poc_inference
+
+ctrader: ## cTrader Open API 接続とバーデータ取得のPoCを実行
+	@echo "--> Running cTrader Open API PoC..."
+	cargo run --bin poc_ctrader
+
+step4: ## Step 4: PA特徴量抽出 & plotters 4分割チャート生成PoCを実行
+	@echo "--> Running Step 4: Price Action & Plotters PoC..."
+	cargo run --bin poc_price_action
 
 test: ## テストを実行 (Rust単体テスト)
 	@echo "--> Running Rust tests..."

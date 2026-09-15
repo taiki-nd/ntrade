@@ -25,6 +25,7 @@ import {
   CoTLog,
   LessonLearned,
 } from "@/types/trading";
+import { tradingApi } from "@/lib/trading-api";
 import { toast } from "sonner";
 import {
   LayoutDashboard,
@@ -32,7 +33,6 @@ import {
   LineChart,
   History,
   Lightbulb,
-  ShieldCheck,
 } from "lucide-react";
 
 export default function TradingDashboard() {
@@ -43,75 +43,144 @@ export default function TradingDashboard() {
   const [cotLogs, setCotLogs] = React.useState<CoTLog[]>(initialCoTLogs);
   const [lessons, setLessons] = React.useState<LessonLearned[]>(initialLessons);
   const [activeTab, setActiveTab] = React.useState<string>("overview");
+  const [isBackendConnected, setIsBackendConnected] = React.useState<boolean>(false);
+
+  // バックエンドからの全データ取得同期
+  const syncWithBackend = React.useCallback(async () => {
+    try {
+      const [m, pRes, tRes, cRes, lRes] = await Promise.all([
+        tradingApi.getStatus().catch(() => null),
+        tradingApi.getPositions().catch(() => null),
+        tradingApi.getTrades().catch(() => null),
+        tradingApi.getCoTLogs().catch(() => null),
+        tradingApi.getLessons().catch(() => null),
+      ]);
+
+      if (m) {
+        setMetrics(m);
+        setIsBackendConnected(true);
+      }
+      if (pRes?.success && pRes.data) {
+        setPositions(pRes.data);
+      }
+      if (tRes?.success && tRes.data) {
+        setTrades(tRes.data);
+      }
+      if (cRes?.success && cRes.data) {
+        setCotLogs(cRes.data);
+      }
+      if (lRes?.success && lRes.data) {
+        setLessons(lRes.data);
+      }
+    } catch {
+      setIsBackendConnected(false);
+    }
+  }, []);
+
+  // 初回マウント & 5秒ごとの定期ポーリング同期
+  React.useEffect(() => {
+    syncWithBackend();
+
+    const interval = setInterval(() => {
+      syncWithBackend();
+    }, 5000);
+
+    return () => clearInterval(interval);
+  }, [syncWithBackend]);
 
   // ボット稼働トグル切り替え
-  const handleStateChange = (newState: BotState) => {
+  const handleStateChange = async (newState: BotState) => {
     setBotState(newState);
-    if (newState === "running") {
-      toast.success("自動売買エンジンを稼働開始しました", {
-        description: "5分足確定ごとにLLM推論とリスクチェックが実行されます。",
-      });
-    } else if (newState === "paused") {
-      toast.warning("自動売買を一時停止しました", {
-        description: "新規発注は停止されます（既存ポジションはブローカー側SL/TPで継続保護）。",
-      });
+    try {
+      const res = await tradingApi.updateBotState(newState);
+      if (res.success) {
+        if (newState === "running") {
+          toast.success("自動売買エンジンを稼働開始しました", {
+            description: "5分足確定ごとにLLM推論とリスクチェックが実行されます。",
+          });
+        } else {
+          toast.warning("自動売買を一時停止しました", {
+            description: "新規発注は停止されます（既存ポジションはブローカー側SL/TPで継続保護）。",
+          });
+        }
+      }
+    } catch {
+      toast.info(`ボット状態を ${newState} に設定しました (ローカルモード)`);
     }
   };
 
   // 緊急全決済 & 停止
-  const handleEmergencyStop = () => {
-    if (positions.length === 0) {
+  const handleEmergencyStop = async () => {
+    try {
+      const res = await tradingApi.emergencyStop();
+      toast.error("緊急全決済を執行しました", {
+        description: res.message || "保有中のポジションを成行決済し、自動売買を停止しました。",
+      });
       setBotState("paused");
-      toast.info("保有ポジションはありませんでした。ボットを一時停止しました。");
-      return;
+      syncWithBackend();
+    } catch {
+      // フォールバック: フロントエンド側で決済シミュレーション
+      if (positions.length === 0) {
+        setBotState("paused");
+        toast.info("保有ポジションはありませんでした。ボットを一時停止しました。");
+        return;
+      }
+
+      const nowStr = new Date().toISOString().replace("T", " ").substring(0, 19);
+      let totalPnlAmount = 0;
+
+      const closedTrades: TradeHistory[] = positions.map((p, idx) => {
+        totalPnlAmount += p.pnlAmount;
+        return {
+          id: `trd-emerg-${Date.now()}-${idx}`,
+          symbol: p.symbol,
+          side: p.side,
+          volumeLots: p.volumeLots,
+          entryPrice: p.entryPrice,
+          closePrice: p.currentPrice,
+          stopLoss: p.stopLoss,
+          takeProfit: p.takeProfit,
+          pnlPips: p.pnlPips,
+          pnlAmount: p.pnlAmount,
+          closeReason: "MANUAL",
+          openTime: p.openTime,
+          closeTime: nowStr,
+        };
+      });
+
+      setTrades((prev) => [...closedTrades, ...prev]);
+      setPositions([]);
+      setBotState("paused");
+      setMetrics((prev) => ({
+        ...prev,
+        balance: prev.balance + totalPnlAmount,
+        equity: prev.balance + totalPnlAmount,
+        unrealizedPnl: 0,
+        margin: 0,
+        freeMargin: prev.balance + totalPnlAmount,
+        dailyPnl: prev.dailyPnl + totalPnlAmount,
+        totalTradesToday: prev.totalTradesToday + closedTrades.length,
+      }));
+
+      toast.error("緊急全決済を執行しました (ローカル処理)");
     }
-
-    const nowStr = new Date().toISOString().replace("T", " ").substring(0, 19);
-    let totalPnlAmount = 0;
-
-    // 全ポジションをTradeHistoryへ移動
-    const closedTrades: TradeHistory[] = positions.map((p, idx) => {
-      totalPnlAmount += p.pnlAmount;
-      return {
-        id: `trd-emerg-${Date.now()}-${idx}`,
-        symbol: p.symbol,
-        side: p.side,
-        volumeLots: p.volumeLots,
-        entryPrice: p.entryPrice,
-        closePrice: p.currentPrice,
-        stopLoss: p.stopLoss,
-        takeProfit: p.takeProfit,
-        pnlPips: p.pnlPips,
-        pnlAmount: p.pnlAmount,
-        closeReason: "MANUAL",
-        openTime: p.openTime,
-        closeTime: nowStr,
-      };
-    });
-
-    setTrades((prev) => [...closedTrades, ...prev]);
-    setPositions([]);
-    setBotState("paused");
-    setMetrics((prev) => ({
-      ...prev,
-      balance: prev.balance + totalPnlAmount,
-      equity: prev.balance + totalPnlAmount,
-      unrealizedPnl: 0,
-      margin: 0,
-      freeMargin: prev.balance + totalPnlAmount,
-      dailyPnl: prev.dailyPnl + totalPnlAmount,
-      totalTradesToday: prev.totalTradesToday + closedTrades.length,
-      winningTradesToday:
-        prev.winningTradesToday + closedTrades.filter((t) => t.pnlPips > 0).length,
-    }));
-
-    toast.error("緊急全決済を執行しました", {
-      description: `${closedTrades.length} 件のポジションを成行決済し、ボットを一時停止しました。`,
-    });
   };
 
   // 単一ポジションの手動決済
-  const handleClosePosition = (id: string) => {
+  const handleClosePosition = async (id: string) => {
+    try {
+      const res = await tradingApi.closePosition(id);
+      if (res.success && res.data) {
+        toast.success(`${res.data.symbol} ポジションを成行決済しました`, {
+          description: `損益: ${res.data.pnlPips >= 0 ? "+" : ""}${res.data.pnlPips.toFixed(1)} pips (¥${res.data.pnlAmount.toLocaleString()})`,
+        });
+        syncWithBackend();
+        return;
+      }
+    } catch {
+      // フォールバック
+    }
+
     const target = positions.find((p) => p.id === id);
     if (!target) return;
 
@@ -134,24 +203,24 @@ export default function TradingDashboard() {
 
     setPositions((prev) => prev.filter((p) => p.id !== id));
     setTrades((prev) => [newTrade, ...prev]);
-    setMetrics((prev) => ({
-      ...prev,
-      balance: prev.balance + target.pnlAmount,
-      equity: prev.equity,
-      unrealizedPnl: prev.unrealizedPnl - target.pnlAmount,
-      dailyPnl: prev.dailyPnl + target.pnlAmount,
-      totalTradesToday: prev.totalTradesToday + 1,
-      winningTradesToday:
-        prev.winningTradesToday + (target.pnlPips > 0 ? 1 : 0),
-    }));
-
-    toast.success(`${target.symbol} ポジションを手動成行決済しました`, {
-      description: `損益: ${target.pnlPips >= 0 ? "+" : ""}${target.pnlPips.toFixed(1)} pips (¥${target.pnlAmount.toLocaleString()})`,
-    });
+    toast.success(`${target.symbol} ポジションを手動成行決済しました`);
   };
 
   // 教訓のトグル
-  const handleToggleLesson = (id: string) => {
+  const handleToggleLesson = async (id: string) => {
+    try {
+      const res = await tradingApi.toggleLesson(id);
+      if (res.success && res.data) {
+        setLessons((prev) =>
+          prev.map((l) => (l.id === id ? res.data! : l))
+        );
+        toast.info("教訓ルールの適用状態を更新しました");
+        return;
+      }
+    } catch {
+      // フォールバック
+    }
+
     setLessons((prev) =>
       prev.map((l) => (l.id === id ? { ...l, active: !l.active } : l))
     );
@@ -159,22 +228,38 @@ export default function TradingDashboard() {
   };
 
   // 教訓の追加
-  const handleAddLesson = (
+  const handleAddLesson = async (
     newLessonData: Omit<LessonLearned, "id" | "createdAt">
   ) => {
+    try {
+      const res = await tradingApi.createLesson(newLessonData);
+      if (res.success && res.data) {
+        setLessons((prev) => [res.data!, ...prev]);
+        toast.success("新しい教訓ルールを登録しました", {
+          description: "次回のLLM推論プロンプトに禁止・注意事項として注入されます。",
+        });
+        return;
+      }
+    } catch {
+      // フォールバック
+    }
+
     const newLesson: LessonLearned = {
       ...newLessonData,
       id: `les-${Date.now()}`,
       createdAt: new Date().toISOString().replace("T", " ").substring(0, 19),
     };
     setLessons((prev) => [newLesson, ...prev]);
-    toast.success("新しい教訓ルールを登録しました", {
-      description: "次回のLLM推論プロンプトに禁止・注意事項として注入されます。",
-    });
+    toast.success("新しい教訓ルールを登録しました");
   };
 
   // 教訓の削除
-  const handleDeleteLesson = (id: string) => {
+  const handleDeleteLesson = async (id: string) => {
+    try {
+      await tradingApi.deleteLesson(id);
+    } catch {
+      // フォールバック
+    }
     setLessons((prev) => prev.filter((l) => l.id !== id));
     toast.info("教訓ルールを削除しました");
   };
@@ -188,6 +273,7 @@ export default function TradingDashboard() {
           metrics={metrics}
           onStateChange={handleStateChange}
           onEmergencyStop={handleEmergencyStop}
+          onRefresh={syncWithBackend}
         />
 
         {/* 2. サマリーメトリクスカード */}

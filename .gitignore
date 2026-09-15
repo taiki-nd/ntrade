@@ -25,3 +25,6 @@ next-env.d.ts
 .vscode/
 .idea/
 *.swp
+
+# Generated chart images
+charts/

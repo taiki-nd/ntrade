@@ -1,23 +1,9 @@
 use anyhow::Result;
-use axum::{
-    extract::State,
-    response::Json,
-    routing::get,
-    Router,
-};
-use serde_json::{json, Value};
 use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::sync::RwLock;
-use tower_http::cors::CorsLayer;
-use tower_http::trace::TraceLayer;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-#[derive(Clone)]
-struct AppState {
-    bot_status: Arc<RwLock<String>>,
-}
+use ntrade::server::{create_router, AppState};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -29,22 +15,37 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    info!("Starting ntrade core engine v0.1.0...");
-    info!("Runtime initialized: Tokio + Axum + cTrader Open API + LLM CLI Pipeline");
+    info!("============================================================");
+    info!("  Starting ntrade core engine v0.1.0 (Step 5 Integrated)");
+    info!("  Runtime: Tokio + Axum + cTrader Open API + LLM Engine");
+    info!("============================================================");
 
-    let state = AppState {
-        bot_status: Arc::new(RwLock::new("running".to_string())),
-    };
+    // アプリケーション状態の初期化
+    let state = AppState::new();
 
-    let app = Router::new()
-        .route("/health", get(health_check))
-        .route("/api/status", get(get_status))
-        .layer(CorsLayer::permissive())
-        .layer(TraceLayer::new_for_http())
-        .with_state(state);
+    // バックグラウンドで cTrader への初期接続を試行
+    let state_for_init = state.clone();
+    tokio::spawn(async move {
+        state_for_init.init_ctrader_connection().await;
+    });
 
+    // Axum API サーバーの起動
+    let app = create_router(state);
     let addr = SocketAddr::from(([127, 0, 0, 1], 4000));
     info!("ntrade local API server listening on http://{}", addr);
+    info!("Endpoints available:");
+    info!("  - GET  /health");
+    info!("  - GET  /api/status");
+    info!("  - POST /api/control/state");
+    info!("  - POST /api/control/emergency-stop");
+    info!("  - GET  /api/positions");
+    info!("  - POST /api/positions/:id/close");
+    info!("  - GET  /api/trades");
+    info!("  - GET  /api/cot");
+    info!("  - GET  /api/lessons");
+    info!("  - GET  /api/chart/latest");
+    info!("  - GET  /api/auth/ctrader/url");
+    info!("  - POST /api/auth/ctrader/exchange");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app)
@@ -53,27 +54,6 @@ async fn main() -> Result<()> {
 
     info!("ntrade core engine shutdown completed.");
     Ok(())
-}
-
-async fn health_check() -> Json<Value> {
-    Json(json!({
-        "status": "ok",
-        "service": "ntrade-engine",
-        "version": "0.1.0"
-    }))
-}
-
-async fn get_status(State(state): State<AppState>) -> Json<Value> {
-    let status = state.bot_status.read().await;
-    Json(json!({
-        "status": *status,
-        "environment": "DEMO",
-        "ctrader_connection": "connected",
-        "ping_ms": 18,
-        "llm_pipeline": "ready",
-        "supported_pairs": ["USDJPY", "EURUSD"],
-        "timeframe": "5M"
-    }))
 }
 
 async fn shutdown_signal() {

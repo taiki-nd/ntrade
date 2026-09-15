@@ -11,18 +11,44 @@ cTrader Open API は、Spotware社が提供する高機能トレーディングA
 
 ---
 
-## 2. 認証・接続フロー
+### 2.1 アプリ内 OAuth 2.0 連携フロー (Step 5 実装予定)
+手動での Access Token / Refresh Token コピーを完全撤廃し、管理画面からワンクリックで認証・自動更新を行うアーキテクチャです。
+
+```mermaid
+sequenceDiagram
+    actor User as ユーザー
+    participant UI as Next.js 管理画面 (localhost:3000)
+    participant Spotware as Spotware 認可サーバー (OAuth 2.0)
+    participant Engine as Rust コアエンジン (localhost:4000)
+    participant cTrader as cTrader Open API Server
+
+    User->>UI: 「cTrader アカウントを連携」をクリック
+    UI->>Spotware: 認可URLへリダイレクト (Client ID, Scope=trading,accounts)
+    User->>Spotware: Spotware画面でログイン & 認可承認
+    Spotware-->>UI: コールバック URLへリダイレクト (?code=AUTHORIZATION_CODE)
+    UI->>Engine: POST /api/auth/ctrader/exchange (code)
+    Engine->>Spotware: トークン交換リクエスト (code, Client Secret)
+    Spotware-->>Engine: Access Token & Refresh Token 返却
+    Engine->>Engine: トークンを暗号化/保存 & バックグラウンド自動更新ループ開始
+    Engine-->>UI: 連携成功通知 (口座リスト自動同期)
+```
+
+### 2.2 ソケット接続 & 取引口座認証フロー
 
 ```mermaid
 sequenceDiagram
     participant Bot as ntrade (Local Bot)
     participant cTrader as cTrader Open API Server
 
-    Note over Bot,cTrader: SSL/TLS ソケットまたはWebSocket接続
+    Note over Bot,cTrader: SSL/TLS ソケット接続 (demo/live.ctraderapi.com:5035)
     Bot->>cTrader: ProtoOAApplicationAuthReq (Client ID, Client Secret)
     cTrader-->>Bot: ProtoOAApplicationAuthRes
     
-    Bot->>cTrader: ProtoOAAccountAuthReq (AccountId, AccessToken)
+    Note over Bot,cTrader: Access Token から口座一覧自動解決 (get_accounts_by_access_token)
+    Bot->>cTrader: ProtoOAGetAccountListByAccessTokenReq (AccessToken)
+    cTrader-->>Bot: ProtoOAGetAccountListByAccessTokenRes (ctidTraderAccountIdの特定)
+
+    Bot->>cTrader: ProtoOAAccountAuthReq (ctidTraderAccountId, AccessToken)
     cTrader-->>Bot: ProtoOAAccountAuthRes (認証完了)
     
     Note over Bot,cTrader: 初期データの同期
@@ -32,6 +58,10 @@ sequenceDiagram
     Note over Bot,cTrader: 定期バー取得 / リアルタイム購読
     Bot->>cTrader: ProtoOAGetTrendbarsReq (5M/15M/1H/4H バー履歴)
     cTrader-->>Bot: ProtoOAGetTrendbarsRes
+
+    Note over Bot,cTrader: 有効期限前の自動更新 (Refresh Token 保持時)
+    Bot->>cTrader: ProtoOARefreshTokenReq (RefreshToken)
+    cTrader-->>Bot: ProtoOARefreshTokenRes (新しい AccessToken を永続化)
 ```
 
 ---
