@@ -45,7 +45,7 @@ pub async fn close_position(
     };
     if let Some(ref ctrader) = ctrader_opt {
         let is_buy_close = target.side != "BUY";
-        let volume = (target.volume_lots * 100_000.0) as i64;
+        let volume = crate::ctrader::lots_to_volume(target.volume_lots);
         let c_clone = ctrader.clone();
         let sym = target.symbol.clone();
         tokio::spawn(async move {

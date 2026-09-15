@@ -118,6 +118,10 @@ Step 4 で実装した `PriceActionAnalyzer` は、ピンバー・包み足・�
 - リプレイの `guard_result` も同じ `guard::evaluate` を使うようになった（口座状態はゼロとして評価）。
 - 未実装: 確信度閾値の較正（十分なサンプル数のリプレイが必要）、cTrader への実発注。
 
-### Step 9: 自律売買ループ & 自己反省（Self-Reflection）
-- 5分足確定ごとに「データ更新 → Snapshot生成 → LLM判断 → 事後ガード → 条件執行/発注（デモ口座）」を実行。
-- 約定・決済結果から自己反省プロンプトを走らせ、教訓リストを更新する改善サイクルを稼働。教訓の採用は同種の失敗が複数回観測された場合に限る（[05_ai_learning_and_prompt_tuning.md](./05_ai_learning_and_prompt_tuning.md)）。
+### Step 9: 自律売買ループ & 自己反省（Self-Reflection） (実装完了 ✓ 2026-09-16 / デモ口座での実発注検証は未了)
+- `src/scheduler`: 5分足確定（境界 + `NTRADE_BAR_DELAY_SECS`）ごとに `run_decision_cycle` を対象ペア分実行。ボットが Running かつ cTrader 接続時のみ動く。`NTRADE_SCHEDULER=off` で無効化。
+- 発注先の切り替え: 既定は `PaperOrderSink`。`NTRADE_LIVE_ORDERS=1` で cTrader 接続後に `CTraderOrderSink`（サーバーサイド SL/TP 付き成行、相対 SL/TP は 1/100000 単位、ボリュームは 1 lot = 10,000,000）へ切り替わる。
+- ペーパー決済（`server/paper.rs`）: 確定 5M 足の高安で SL/TP 到達を判定し、約定履歴と当日損益を更新。同一足で両方に触れた場合は SL 扱い。
+- ブローカー同期: 実発注時は各サイクル後に reconcile し、ブローカー側で消えたポジションを除去。
+- 自己反省（`src/reflection`）: 損切りトレードごとに判断ログとエントリー後の 5M 足を渡して LLM に振り返らせ、教訓「候補」（無効）として保存。同カテゴリ・同ペアの候補が 3 件に達したら最新を採用、採用上限 10 件。判断が妥当で結果だけ悪かった場合は教訓にしない。
+- **未検証**: デモ口座での実発注（ボリューム単位・相対 SL/TP の実値）と、決済イベントからの約定履歴生成。実発注前に `NTRADE_LIVE_ORDERS=1` で最小ロットの疎通確認が必要。

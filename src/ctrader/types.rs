@@ -127,6 +127,29 @@ impl From<BarPeriod> for i32 {
     }
 }
 
+/// ロット → cTrader プロトコルのボリューム（1/100 単位。1 lot = 100,000 units = 10,000,000）
+pub fn lots_to_volume(lots: f64) -> i64 {
+    (lots * 10_000_000.0).round() as i64
+}
+
+pub fn volume_to_lots(volume: i64) -> f64 {
+    volume as f64 / 10_000_000.0
+}
+
+/// ブローカー側の保有ポジション（reconcile の結果）
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BrokerPosition {
+    pub position_id: i64,
+    pub symbol_id: i64,
+    pub symbol_name: Option<String>,
+    pub is_buy: bool,
+    pub volume_lots: f64,
+    pub entry_price: Option<f64>,
+    pub stop_loss: Option<f64>,
+    pub take_profit: Option<f64>,
+    pub open_time: Option<DateTime<Utc>>,
+}
+
 /// シンボル（通貨ペア）情報
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolInfo {

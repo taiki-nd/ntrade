@@ -4,4 +4,4 @@ pub mod types;
 
 pub use client::CTraderService;
 pub use config::CTraderConfig;
-pub use types::{BarPeriod, CandleBar, SymbolInfo};
+pub use types::{lots_to_volume, volume_to_lots, BarPeriod, BrokerPosition, CandleBar, SymbolInfo};

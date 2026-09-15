@@ -29,6 +29,16 @@ async fn main() -> Result<()> {
         state_for_init.init_ctrader_connection().await;
     });
 
+    // 5分足確定ごとの常駐スケジューラ（NTRADE_SCHEDULER=off で無効化）
+    if std::env::var("NTRADE_SCHEDULER").map(|v| v == "off").unwrap_or(false) {
+        info!("Scheduler disabled (NTRADE_SCHEDULER=off)");
+    } else {
+        let state_for_loop = state.clone();
+        tokio::spawn(async move {
+            ntrade::scheduler::run(state_for_loop).await;
+        });
+    }
+
     // Axum API サーバーの起動
     let app = create_router(state);
     let addr = SocketAddr::from(([127, 0, 0, 1], 4000));

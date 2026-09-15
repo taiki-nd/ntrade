@@ -11,7 +11,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use super::config::CTraderConfig;
-use super::types::{BarPeriod, CandleBar, SymbolInfo};
+use super::types::{volume_to_lots, BarPeriod, BrokerPosition, CandleBar, SymbolInfo};
 
 /// cTrader Open API サービス
 pub struct CTraderService {
@@ -292,6 +292,43 @@ impl CTraderService {
             to
         );
         Ok(all)
+    }
+
+    /// ブローカー側の保有ポジション一覧（reconcile）
+    pub async fn get_open_positions(&self) -> Result<Vec<BrokerPosition>> {
+        let res = self
+            .client
+            .reconcile(self.config.account_id, false)
+            .await
+            .context("Failed to reconcile positions from cTrader")?;
+        let symbols = self.symbols.read().await;
+        let by_id: HashMap<i64, String> = symbols.values().map(|s| (s.symbol_id, s.symbol_name.clone())).collect();
+        Ok(res
+            .position
+            .iter()
+            .map(|p| BrokerPosition {
+                position_id: p.position_id,
+                symbol_id: p.trade_data.symbol_id,
+                symbol_name: by_id.get(&p.trade_data.symbol_id).cloned(),
+                is_buy: p.trade_data.trade_side == ProtoOaTradeSide::Buy as i32,
+                volume_lots: volume_to_lots(p.trade_data.volume),
+                entry_price: p.price,
+                stop_loss: p.stop_loss,
+                take_profit: p.take_profit,
+                open_time: p
+                    .trade_data
+                    .open_timestamp
+                    .and_then(|ms| chrono::TimeZone::timestamp_millis_opt(&Utc, ms).single()),
+            })
+            .collect())
+    }
+
+    /// ポジション ID 指定の決済
+    pub async fn close_position_by_id(&self, position_id: i64, volume: i64) -> Result<ProtoOaExecutionEvent> {
+        self.client
+            .close_position(self.config.account_id, position_id, volume)
+            .await
+            .with_context(|| format!("Failed to close position {position_id}"))
     }
 
     /// サーバーサイドSL/TP付き成行注文の発行（デモ検証・本番兼用）

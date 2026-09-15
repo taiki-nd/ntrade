@@ -54,7 +54,7 @@ pub async fn emergency_stop(
         // cTrader 接続があれば実ブローカー決済リクエスト送信
         if let Some(ref ctrader) = ctrader_opt {
             if let Ok(_pos_id) = p.id.replace("pos-", "").parse::<i64>() {
-                let volume = (p.volume_lots * 100_000.0) as i64;
+                let volume = crate::ctrader::lots_to_volume(p.volume_lots);
                 let sym_clone = p.symbol.clone();
                 let is_buy = p.side != "BUY";
                 let c_clone = ctrader.clone();

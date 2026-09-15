@@ -98,6 +98,51 @@ impl OrderSink for PaperOrderSink {
     }
 }
 
+/// cTrader への実発注（サーバーサイド SL/TP 付き成行）
+pub struct CTraderOrderSink {
+    service: std::sync::Arc<crate::ctrader::CTraderService>,
+}
+
+impl CTraderOrderSink {
+    pub fn new(service: std::sync::Arc<crate::ctrader::CTraderService>) -> Self {
+        Self { service }
+    }
+}
+
+impl OrderSink for CTraderOrderSink {
+    fn place_market<'a>(
+        &'a self,
+        req: &'a OrderRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<OrderReceipt>> + Send + 'a>> {
+        Box::pin(async move {
+            let is_buy = req.action == Action::Buy;
+            // 相対 SL/TP は約定価格からの距離（1/100000 単位）。entry_hint を基準に距離を出す。
+            let rel = |p: f64| ((req.entry_hint - p).abs() * 100_000.0).round() as i64;
+            let volume = crate::ctrader::lots_to_volume(req.volume_lots);
+            info!(pair = %req.pair, ?req.action, volume, sl = req.stop_loss, tp = req.take_profit, "LIVE order → cTrader");
+            let ev = self
+                .service
+                .place_market_order_with_sltp(&req.pair, is_buy, volume, Some(rel(req.stop_loss)), Some(rel(req.take_profit)))
+                .await?;
+            if let Some(code) = ev.error_code.as_deref().filter(|c| !c.is_empty()) {
+                anyhow::bail!("cTrader rejected order: {code}");
+            }
+            let position_id = ev
+                .position
+                .as_ref()
+                .map(|p| p.position_id)
+                .or_else(|| ev.deal.as_ref().map(|d| d.position_id))
+                .ok_or_else(|| anyhow::anyhow!("execution event without position"))?;
+            let filled = ev
+                .deal
+                .as_ref()
+                .and_then(|d| d.execution_price)
+                .or_else(|| ev.position.as_ref().and_then(|p| p.price));
+            Ok(OrderReceipt { order_id: position_id.to_string(), filled_price: filled })
+        })
+    }
+}
+
 /// 保持中の条件付きプラン
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PendingPlan {

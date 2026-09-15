@@ -68,7 +68,8 @@ async fn guard_context(state: &AppState, pair: &str) -> GuardContext {
 }
 
 async fn place_paper_order(state: &AppState, req: OrderRequest, reason: &str) -> anyhow::Result<Position> {
-    let receipt = state.order_sink.place_market(&req).await?;
+    let sink = state.order_sink.read().await.clone();
+    let receipt = sink.place_market(&req).await?;
     let entry = receipt.filled_price.unwrap_or(req.entry_hint);
     let pos = Position {
         id: receipt.order_id,

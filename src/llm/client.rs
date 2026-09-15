@@ -79,14 +79,28 @@ impl LlmClient {
         }
     }
 
+    /// 任意の JSON Schema で構造化出力を得る（自己反省など TradeDecision 以外の用途）
+    pub async fn infer_json(&self, prompt: &str, schema: serde_json::Value) -> Result<serde_json::Value> {
+        let schema_text = schema.to_string();
+        let fut = self.execute_cli_with_schema(prompt, &schema_text);
+        let raw = timeout(Duration::from_secs(self.config.timeout_secs), fut)
+            .await
+            .map_err(|_| anyhow!("inference timeout"))??;
+        Self::extract_decision_json(&raw)
+    }
+
     async fn execute_cli(&self, prompt: &str) -> Result<String> {
         let schema = TradeDecision::json_schema().to_string();
+        self.execute_cli_with_schema(prompt, &schema).await
+    }
+
+    async fn execute_cli_with_schema(&self, prompt: &str, schema: &str) -> Result<String> {
         let mut cmd = Command::new(&self.config.cli_binary);
         cmd.arg("-p")
             .arg("--output-format")
             .arg("json")
             .arg("--json-schema")
-            .arg(&schema)
+            .arg(schema)
             .arg("--max-turns")
             .arg(self.config.max_turns.to_string())
             .arg("--tools")
@@ -157,7 +171,7 @@ impl LlmClient {
                 }
                 return Err(anyhow!("result envelope without structured_output/result"));
             }
-            if envelope.get("action").is_some() {
+            if envelope.is_object() {
                 return Ok(envelope);
             }
         }

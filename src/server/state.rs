@@ -6,7 +6,7 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use crate::ctrader::{CTraderConfig, CTraderService};
-use crate::executor::{OrderSink, PaperOrderSink, PlanBook};
+use crate::executor::{CTraderOrderSink, OrderSink, PaperOrderSink, PlanBook};
 use crate::guard::{GuardConfig, DEFAULT_GUARD_CONFIG_PATH};
 use crate::llm::{LlmClient, LlmClientConfig};
 use crate::snapshot::SnapshotBundle;
@@ -36,8 +36,8 @@ pub struct AppState {
     pub plan_book: Arc<RwLock<PlanBook>>,
     /// LLM 推論クライアント
     pub llm: Arc<LlmClient>,
-    /// 発注先（現状はペーパー）
-    pub order_sink: Arc<dyn OrderSink>,
+    /// 発注先。既定はペーパー。`NTRADE_LIVE_ORDERS=1` かつ cTrader 接続時に実発注へ切り替わる
+    pub order_sink: Arc<RwLock<Arc<dyn OrderSink>>>,
     /// 判断サイクルの直列化
     pub decide_lock: Arc<tokio::sync::Mutex<()>>,
 }
@@ -69,7 +69,7 @@ impl AppState {
             guard_config: Arc::new(RwLock::new(GuardConfig::load_or_default(DEFAULT_GUARD_CONFIG_PATH))),
             plan_book: Arc::new(RwLock::new(PlanBook::default())),
             llm: Arc::new(LlmClient::new(LlmClientConfig::default())),
-            order_sink: Arc::new(PaperOrderSink),
+            order_sink: Arc::new(RwLock::new(Arc::new(PaperOrderSink))),
             decide_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
@@ -89,7 +89,13 @@ impl AppState {
                     let service_arc = Arc::new(service);
                     {
                         let mut svc_lock = self.ctrader_service.write().await;
-                        *svc_lock = Some(service_arc);
+                        *svc_lock = Some(service_arc.clone());
+                    }
+                    if std::env::var("NTRADE_LIVE_ORDERS").map(|v| v == "1").unwrap_or(false) {
+                        warn!("NTRADE_LIVE_ORDERS=1: orders will be sent to cTrader ({})", if cfg.is_live { "LIVE" } else { "DEMO" });
+                        *self.order_sink.write().await = Arc::new(CTraderOrderSink::new(service_arc));
+                    } else {
+                        info!("Paper order mode (set NTRADE_LIVE_ORDERS=1 to send real orders)");
                     }
                     {
                         let mut m_lock = self.metrics.write().await;
