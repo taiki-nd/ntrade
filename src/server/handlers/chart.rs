@@ -12,7 +12,9 @@ use tracing::{info, warn};
 use crate::ctrader::BarPeriod;
 use crate::server::state::AppState;
 use crate::server::types::ApiResponse;
-use crate::snapshot::{mock, AccountState, MarketSnapshot, SnapshotInput, SnapshotPipeline};
+use crate::snapshot::{
+    mock, AccountState, MarketSnapshot, OpenPositionSummary, RecentDecision, SnapshotInput, SnapshotPipeline,
+};
 
 #[derive(Debug, Deserialize)]
 pub struct ChartQuery {
@@ -134,6 +136,35 @@ pub async fn generate_snapshot_internal(state: &AppState, pair: &str) -> anyhow:
         if pair.to_uppercase().contains("JPY") { m.usdjpy_spread } else { m.eurusd_spread }
     };
 
+    // 口座状態: 保有ポジションと直近の判断（フリップフロップ防止のため LLM に渡す）
+    let account_state = {
+        let positions = state.positions.read().await;
+        let cot = state.cot_logs.read().await;
+        AccountState {
+            open_positions: positions
+                .iter()
+                .filter(|p| p.symbol.eq_ignore_ascii_case(pair))
+                .map(|p| OpenPositionSummary {
+                    side: p.side.clone(),
+                    entry_price: p.entry_price,
+                    stop_loss: Some(p.stop_loss),
+                    take_profit: Some(p.take_profit),
+                    open_time: p.open_time.clone(),
+                })
+                .collect(),
+            recent_decisions: cot
+                .iter()
+                .filter(|c| c.symbol.eq_ignore_ascii_case(pair))
+                .take(3)
+                .map(|c| RecentDecision {
+                    time: c.timestamp.clone(),
+                    action: c.action.clone(),
+                    summary: c.order_flow.chars().take(120).collect(),
+                })
+                .collect(),
+        }
+    };
+
     let pipeline = SnapshotPipeline::new(PathBuf::from("charts"));
     let bundle = pipeline.build(&SnapshotInput {
         pair,
@@ -144,7 +175,7 @@ pub async fn generate_snapshot_internal(state: &AppState, pair: &str) -> anyhow:
         spread_pips,
         current_price: None,
         now: None,
-        account_state: AccountState::default(),
+        account_state,
     })?;
 
     let dir = bundle.charts.dir.to_string_lossy().to_string();

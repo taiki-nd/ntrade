@@ -110,10 +110,13 @@ Step 4 で実装した `PriceActionAnalyzer` は、ピンバー・包み足・�
 - 実績: USDJPY 2026-06-15〜09-15 の 4 時間足分を取り込み、`check-leak` 40 サンプル通過、3 サンプルのスモークランで LLM 判断→採点→保存まで確認。
 - 詳細は [06_replay_environment.md](./06_replay_environment.md)。
 
-### Step 8: 事後ガード & 条件執行
-- `guard` モジュール: [02_trading_strategy.md 7章](./02_trading_strategy.md) のガード一覧を実装。閾値は設定ファイル。確信度閾値は Step 7 の較正結果から決める。
-- `executor` モジュール: `conditional_plan` の保持、5M確定ごとの `wait_for` / `invalidate_if` 評価、期限管理、成立時のガード通過と発注。
-- ガード結果と条件評価の履歴を CoT ログに保存し、ダッシュボードに表示。
+### Step 8: 事後ガード & 条件執行 (完了 ✓ 2026-09-16)
+- `src/guard`: [02_trading_strategy.md 7章](./02_trading_strategy.md) のガード一覧を実装。閾値は `config/guard.toml`。観測整合、確信度、RR、SL幅（pips / ATR比）、SL/TPの向き、スプレッド、ポジション上限、日次損失、指標ブラックアウト、プランの構造・期限。全チェック結果を `GuardVerdict` として返し、弾いた場合はガード名を CoT ログに残す。
+- `src/executor`: `step_plan`（1本の確定足でのプラン評価。リプレイの採点と共有）、`PlanBook`（ペアごとに最新1件を保持、5M確定ごとに評価）、`OrderSink` トレイト（現状は `PaperOrderSink`。cTrader 実装は Step 9）。
+- サーバー: `POST /api/decide` が「Snapshot → 保持プランの評価 → LLM → ガード → ペーパー発注 / プラン登録 → CoT ログ」を1回実行。`GET /api/plans`, `DELETE /api/plans/{id}`, `GET /api/guard/config`。Snapshot の `account_state` に保有ポジションと直近3件の判断を入れるようにした。
+- ダッシュボード: 条件付きプラン監視カード（成立/破棄条件、手動破棄、「今すぐ判断」ボタン）。CoT ログにガード結果を表示。
+- リプレイの `guard_result` も同じ `guard::evaluate` を使うようになった（口座状態はゼロとして評価）。
+- 未実装: 確信度閾値の較正（十分なサンプル数のリプレイが必要）、cTrader への実発注。
 
 ### Step 9: 自律売買ループ & 自己反省（Self-Reflection）
 - 5分足確定ごとに「データ更新 → Snapshot生成 → LLM判断 → 事後ガード → 条件執行/発注（デモ口座）」を実行。

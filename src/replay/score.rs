@@ -1,10 +1,9 @@
 //! 採点: 判断時刻以降の5M足で結果を機械的に判定する。
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::ctrader::CandleBar;
-use crate::strategy::types::{Action, ConditionalPlan, PriceCondition, TradeDecision};
+use crate::strategy::types::{Action, ConditionalPlan, TradeDecision};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -140,49 +139,36 @@ fn score_from(bars: &[CandleBar], action: Action, entry: f64, sl: f64, tp: f64, 
     }
 }
 
-fn condition_met(cond: PriceCondition, price: f64, close: f64) -> bool {
-    match cond {
-        PriceCondition::CloseAbove => close > price,
-        PriceCondition::CloseBelow => close < price,
-    }
-}
-
 /// 条件付きプランの評価。`bars` は判断時刻以降の5M足（昇順）。
-/// 破棄 → 成立の順で各確定足を評価し、成立したら次の足からトレードとして採点する。
-pub fn evaluate_plan(bars: &[CandleBar], plan: &ConditionalPlan, expires_at: Option<DateTime<Utc>>, cfg: &ScoreConfig) -> ScoreResult {
+/// 本番の Executor と同じ `step_plan` で各確定足を評価し、成立したら次の足からトレードとして採点する。
+pub fn evaluate_plan(bars: &[CandleBar], plan: &ConditionalPlan, cfg: &ScoreConfig) -> ScoreResult {
+    use crate::executor::{step_plan, PlanStep};
+
     if !plan.is_structured() {
         return ScoreResult::flat(Outcome::PlanUnstructured);
     }
-    let (tp_price, tp_cond) = (plan.trigger_price.unwrap(), plan.trigger_condition.unwrap());
-    let (inv_price, inv_cond) = (plan.invalidate_price.unwrap(), plan.invalidate_condition.unwrap());
-
     for (i, b) in bars.iter().enumerate() {
-        if let Some(exp) = expires_at {
-            if b.timestamp >= exp {
-                return ScoreResult::flat(Outcome::PlanExpired);
+        match step_plan(plan, b) {
+            PlanStep::Waiting => {}
+            PlanStep::Expired => return ScoreResult::flat(Outcome::PlanExpired),
+            PlanStep::Invalidated => return ScoreResult::flat(Outcome::PlanInvalidated),
+            PlanStep::Unstructured => return ScoreResult::flat(Outcome::PlanUnstructured),
+            PlanStep::Triggered { action, entry } => {
+                let (Some(sl), Some(tp)) = (plan.stop_loss, plan.take_profit) else {
+                    return ScoreResult::flat(Outcome::NoSlTp);
+                };
+                let rest = &bars[i + 1..];
+                if rest.is_empty() {
+                    return ScoreResult::flat(Outcome::NoData);
+                }
+                let mut r = score_from(rest, action, entry, sl, tp, cfg);
+                r.bars_to_exit = r.bars_to_exit.map(|n| n + i + 1);
+                return r;
             }
         }
-        if condition_met(inv_cond, inv_price, b.close) {
-            return ScoreResult::flat(Outcome::PlanInvalidated);
-        }
-        if condition_met(tp_cond, tp_price, b.close) {
-            let (Some(sl), Some(tp)) = (plan.stop_loss, plan.take_profit) else {
-                return ScoreResult::flat(Outcome::NoSlTp);
-            };
-            let rest = &bars[i + 1..];
-            if rest.is_empty() {
-                return ScoreResult::flat(Outcome::NoData);
-            }
-            let mut r = score_from(rest, plan.then_action, b.close, sl, tp, cfg);
-            r.bars_to_exit = r.bars_to_exit.map(|n| n + i + 1);
-            return r;
-        }
     }
-    if expires_at.is_some() {
-        ScoreResult::flat(Outcome::NoData)
-    } else {
-        ScoreResult::flat(Outcome::PlanExpired)
-    }
+    // 期限前にデータが尽きた
+    ScoreResult::flat(Outcome::NoData)
 }
 
 /// TradeDecision 全体の採点
@@ -197,12 +183,7 @@ pub fn score_decision(bars_after: &[CandleBar], decision: &TradeDecision, cfg: &
             cfg,
         ),
         Action::Hold => match &decision.conditional_plan {
-            Some(plan) if plan.then_action != Action::Hold => {
-                let expires = crate::storage::parse_ts(&plan.expires_at)
-                    .ok()
-                    .and_then(|s| chrono::TimeZone::timestamp_opt(&Utc, s, 0).single());
-                evaluate_plan(bars_after, plan, expires, cfg)
-            }
+            Some(plan) if plan.then_action != Action::Hold => evaluate_plan(bars_after, plan, cfg),
             _ => ScoreResult::flat(Outcome::Hold),
         },
     }
@@ -211,7 +192,8 @@ pub fn score_decision(bars_after: &[CandleBar], decision: &TradeDecision, cfg: &
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{Duration, TimeZone};
+    use crate::strategy::types::PriceCondition;
+    use chrono::{Duration, TimeZone, Utc};
 
     fn bars(closes: &[(f64, f64, f64)]) -> Vec<CandleBar> {
         let base = Utc.with_ymd_and_hms(2026, 9, 15, 9, 0, 0).unwrap();
@@ -287,7 +269,7 @@ mod tests {
             (154.30, 154.18, 154.26), // 成立 (close > 154.24) -> entry 154.26
             (154.65, 154.25, 154.60), // TP
         ]);
-        let r = evaluate_plan(&b, &plan(), None, &cfg());
+        let r = evaluate_plan(&b, &plan(), &cfg());
         assert_eq!(r.outcome, Outcome::TpHit);
         assert_eq!(r.entry_price, Some(154.26));
         assert_eq!(r.bars_to_exit, Some(3));
@@ -296,14 +278,16 @@ mod tests {
     #[test]
     fn plan_invalidated_expired_and_unstructured() {
         let b = bars(&[(154.10, 154.00, 154.05)]);
-        assert_eq!(evaluate_plan(&b, &plan(), None, &cfg()).outcome, Outcome::PlanInvalidated);
+        assert_eq!(evaluate_plan(&b, &plan(), &cfg()).outcome, Outcome::PlanInvalidated);
 
+        // bars() は 09:00 から 5 分刻み。期限を 09:10 にすると 3 本目で期限切れ
         let b = bars(&[(154.22, 154.15, 154.20); 3]);
-        let exp = Utc.with_ymd_and_hms(2026, 9, 15, 9, 10, 0).unwrap();
-        assert_eq!(evaluate_plan(&b, &plan(), Some(exp), &cfg()).outcome, Outcome::PlanExpired);
+        let mut p = plan();
+        p.expires_at = "2026-09-15 09:10:00 UTC".into();
+        assert_eq!(evaluate_plan(&b, &p, &cfg()).outcome, Outcome::PlanExpired);
 
         let mut p = plan();
         p.trigger_price = None;
-        assert_eq!(evaluate_plan(&b, &p, None, &cfg()).outcome, Outcome::PlanUnstructured);
+        assert_eq!(evaluate_plan(&b, &p, &cfg()).outcome, Outcome::PlanUnstructured);
     }
 }

@@ -1,0 +1,45 @@
+# 事後ガード設定（docs/02_trading_strategy.md 7章）
+# ここにある数値は「判断」ではなく「リスク管理」。LLM のプロンプトには書かない。
+
+# 観測整合: LLM が報告した最新足時刻が Snapshot と一致しなければ HOLD
+observed_check = true
+
+# 確信度の下限（リプレイで較正するまでの暫定値）
+min_confidence = 0.70
+
+# リスクリワード下限: (TP - entry) / (entry - SL)
+min_rr = 1.5
+
+# SL 幅: 5M ATR(14) の何倍以内か、最小何 pips 以上か
+sl_atr_min = 0.5
+sl_atr_max = 4.0
+sl_min_pips = 3.0
+
+# ポジション上限
+max_positions_per_pair = 1
+max_positions_total = 1
+
+# 日次損失上限（資金比 %）。到達したらその日は新規発注を遮断
+daily_loss_limit_pct = 3.0
+
+# 条件付きプランの最長有効期間（時間）
+plan_max_hours = 8.0
+
+# 発注ロット（固定）。risk_pct を設定すると SL 幅から自動計算（pip_value_per_lot が必要）
+fixed_volume_lots = 0.01
+# risk_pct = 0.5
+# pip_value_per_lot = 1000.0
+
+# スプレッド上限（pips）。ペアごとに上書き可能
+[max_spread_pips]
+default = 1.0
+USDJPY = 1.0
+EURUSD = 1.2
+XAUUSD = 5.0
+
+# 指標ブラックアウト（UTC）。前後の分数の間は新規発注しない
+# [[news_blackout]]
+# time = "2026-09-18 12:30:00"
+# before_min = 30
+# after_min = 15
+# label = "US CPI"

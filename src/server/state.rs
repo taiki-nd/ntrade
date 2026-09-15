@@ -6,6 +6,9 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use crate::ctrader::{CTraderConfig, CTraderService};
+use crate::executor::{OrderSink, PaperOrderSink, PlanBook};
+use crate::guard::{GuardConfig, DEFAULT_GUARD_CONFIG_PATH};
+use crate::llm::{LlmClient, LlmClientConfig};
 use crate::snapshot::SnapshotBundle;
 use super::types::{
     AccountInfo, AccountMetrics, BotState, CloseReason, ConnectionStatus, CoTLog, LessonLearned,
@@ -27,6 +30,16 @@ pub struct AppState {
     pub latest_snapshot: Arc<RwLock<Option<SnapshotBundle>>>,
     /// SQLite（ヒストリカルバー・リプレイ結果）
     pub db_path: PathBuf,
+    /// 事後ガード設定（config/guard.toml）
+    pub guard_config: Arc<RwLock<GuardConfig>>,
+    /// 保持中の条件付きプラン
+    pub plan_book: Arc<RwLock<PlanBook>>,
+    /// LLM 推論クライアント
+    pub llm: Arc<LlmClient>,
+    /// 発注先（現状はペーパー）
+    pub order_sink: Arc<dyn OrderSink>,
+    /// 判断サイクルの直列化
+    pub decide_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Default for AppState {
@@ -53,6 +66,11 @@ impl AppState {
             available_accounts: Arc::new(RwLock::new(Vec::new())),
             latest_snapshot: Arc::new(RwLock::new(None)),
             db_path: PathBuf::from(crate::storage::DEFAULT_DB_PATH),
+            guard_config: Arc::new(RwLock::new(GuardConfig::load_or_default(DEFAULT_GUARD_CONFIG_PATH))),
+            plan_book: Arc::new(RwLock::new(PlanBook::default())),
+            llm: Arc::new(LlmClient::new(LlmClientConfig::default())),
+            order_sink: Arc::new(PaperOrderSink),
+            decide_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 

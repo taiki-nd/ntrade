@@ -234,7 +234,63 @@ export const tradingApi = {
   async getReplayCoverage(): Promise<ApiResponse<ReplayCoverage[]>> {
     return await request<ApiResponse<ReplayCoverage[]>>("/api/replay/coverage");
   },
+
+  /** 判断サイクルを1回実行（Snapshot → LLM → ガード → 執行/プラン登録） */
+  async decideNow(): Promise<ApiResponse<DecideResponse>> {
+    return await request<ApiResponse<DecideResponse>>("/api/decide", { method: "POST" });
+  },
+
+  /** 保持中の条件付きプラン */
+  async getPlans(): Promise<ApiResponse<PendingPlan[]>> {
+    return await request<ApiResponse<PendingPlan[]>>("/api/plans");
+  },
+
+  /** 条件付きプランを手動破棄 */
+  async discardPlan(id: string): Promise<ApiResponse<string>> {
+    return await request<ApiResponse<string>>(`/api/plans/${id}`, { method: "DELETE" });
+  },
 };
+
+export interface ConditionalPlan {
+  wait_for: string;
+  then_action: "BUY" | "SELL" | "HOLD";
+  invalidate_if: string;
+  expires_at: string;
+  trigger_price: number | null;
+  trigger_condition: "CLOSE_ABOVE" | "CLOSE_BELOW" | null;
+  invalidate_price: number | null;
+  invalidate_condition: "CLOSE_ABOVE" | "CLOSE_BELOW" | null;
+  stop_loss: number | null;
+  take_profit: number | null;
+}
+
+export interface PendingPlan {
+  id: string;
+  pair: string;
+  created_at: string;
+  cot_log_id: string | null;
+  plan: ConditionalPlan;
+}
+
+export interface GuardCheck {
+  name: string;
+  passed: boolean;
+  detail: string;
+}
+
+export interface DecideResponse {
+  cot_log_id: string;
+  decision: {
+    action: "BUY" | "SELL" | "HOLD";
+    confidence: number;
+    reasoning: string;
+  };
+  guard: { passed: boolean; failed: string[]; checks: GuardCheck[] };
+  executed: boolean;
+  plan_id: string | null;
+  plan_events: { kind: string; plan_id: string }[];
+  chart_dir: string;
+}
 
 export interface ReplayRun {
   id: number;

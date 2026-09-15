@@ -14,11 +14,11 @@ use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
 use crate::ctrader::{BarPeriod, CandleBar};
+use crate::guard::{self, GuardConfig, GuardContext};
 use crate::llm::LlmBackend;
 use crate::snapshot::measures::get_pip_size;
 use crate::snapshot::{AccountState, MarketSnapshot, SnapshotBundle, SnapshotInput, SnapshotPipeline};
 use crate::storage::{Db, ReplayDecisionRow};
-use crate::strategy::types::{Action, TradeDecision};
 use crate::strategy::PromptBuilder;
 use score::{score_decision, ScoreConfig};
 
@@ -179,56 +179,28 @@ pub struct ReplayConfig {
     pub lessons: Vec<String>,
 }
 
-/// 最小限のガード（Step 8 で本格化）。観測整合と SL の基本妥当性のみ。
-pub fn minimal_guard(decision: &TradeDecision, snapshot: &MarketSnapshot) -> String {
-    let lb = &snapshot.latest_bars;
-    let ob = &decision.observed;
-    let mismatch = [
-        (&lb.h4, &ob.latest_bar_4h),
-        (&lb.h1, &ob.latest_bar_1h),
-        (&lb.m15, &ob.latest_bar_15m),
-        (&lb.m5, &ob.latest_bar_5m),
-    ]
-    .iter()
-    .any(|(exp, got)| exp.is_some() && exp != got);
-    if mismatch {
-        return "OBSERVED_MISMATCH".into();
-    }
-    match decision.action {
-        Action::Buy | Action::Sell => {
-            let (Some(entry), Some(sl), Some(_tp)) = (decision.entry_price, decision.stop_loss, decision.take_profit) else {
-                return "NO_SL_TP".into();
-            };
-            let wrong = match decision.action {
-                Action::Buy => sl >= entry,
-                Action::Sell => sl <= entry,
-                Action::Hold => false,
-            };
-            if wrong {
-                return "SL_WRONG_SIDE".into();
-            }
-        }
-        Action::Hold => {}
-    }
-    "PASS".into()
-}
-
 pub struct ReplayRunner {
     db: Arc<Mutex<Db>>,
     llm: Arc<dyn LlmBackend>,
     cfg: ReplayConfig,
+    guard: GuardConfig,
 }
 
 impl ReplayRunner {
-    pub fn new(db: Arc<Mutex<Db>>, llm: Arc<dyn LlmBackend>, cfg: ReplayConfig) -> Self {
-        Self { db, llm, cfg }
+    pub fn new(db: Arc<Mutex<Db>>, llm: Arc<dyn LlmBackend>, cfg: ReplayConfig, guard: GuardConfig) -> Self {
+        Self { db, llm, cfg, guard }
     }
 
     /// 新規 run を作成（または `resume_run` を続行）して全サンプルを評価する。run_id を返す。
     pub async fn run(&self, resume_run: Option<i64>) -> Result<i64> {
         let cfg = &self.cfg;
         let prompt_hash = prompt_fingerprint(&cfg.lessons);
-        let guard_config = serde_json::json!({ "guard": "minimal", "max_bars_to_exit": cfg.max_bars_to_exit, "spread_pips": cfg.spread_pips }).to_string();
+        let guard_config = serde_json::json!({
+            "guard": self.guard,
+            "max_bars_to_exit": cfg.max_bars_to_exit,
+            "spread_pips": cfg.spread_pips
+        })
+        .to_string();
         let sampling = format!("step:{}m{}", cfg.step_minutes, cfg.limit.map(|l| format!(":limit={l}")).unwrap_or_default());
 
         let (run_id, done) = {
@@ -258,10 +230,11 @@ impl ReplayRunner {
 
         for t in times {
             let permit = sem.clone().acquire_owned().await?;
-            let (db, llm, source, pipeline, cfg) = (self.db.clone(), self.llm.clone(), source.clone(), pipeline.clone(), self.cfg.clone());
+            let (db, llm, source, pipeline, cfg, guard) =
+                (self.db.clone(), self.llm.clone(), source.clone(), pipeline.clone(), self.cfg.clone(), self.guard.clone());
             handles.push(tokio::spawn(async move {
                 let _p = permit;
-                let r = evaluate_one(&db, llm.as_ref(), source.as_ref(), &pipeline, &cfg, run_id, t).await;
+                let r = evaluate_one(&db, llm.as_ref(), source.as_ref(), &pipeline, &cfg, &guard, run_id, t).await;
                 if let Err(e) = &r {
                     warn!(%t, "replay sample failed: {e:#}");
                 }
@@ -281,19 +254,22 @@ impl ReplayRunner {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn evaluate_one(
     db: &Arc<Mutex<Db>>,
     llm: &dyn LlmBackend,
     source: &dyn BarSource,
     pipeline: &SnapshotPipeline,
     cfg: &ReplayConfig,
+    guard_cfg: &GuardConfig,
     run_id: i64,
     t: DateTime<Utc>,
 ) -> Result<()> {
     let bundle = build_snapshot_at(source, pipeline, &cfg.pair, t, cfg.spread_pips, cfg.bars_per_tf, AccountState::default()).await?;
     let prompt = PromptBuilder::new().with_lessons(cfg.lessons.clone()).build(&bundle.snapshot, &bundle.charts);
     let decision = llm.infer(&prompt).await?;
-    let guard = minimal_guard(&decision, &bundle.snapshot);
+    // リプレイでは口座状態を持たないので、ポジション数・日次損失は常にゼロとして評価する
+    let guard = guard::evaluate(&decision, &bundle.snapshot, &GuardContext { now: Some(t), ..Default::default() }, guard_cfg).summary();
 
     let after = {
         let db = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
@@ -475,33 +451,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn guard_flags_mismatch_and_sl_side() {
-        let snap = MarketSnapshot::build(
-            &SnapshotInput {
-                pair: "USDJPY",
-                bars_4h: &[],
-                bars_1h: &[],
-                bars_15m: &[],
-                bars_5m: &make(5, 5, Utc.with_ymd_and_hms(2026, 9, 15, 9, 0, 0).unwrap()),
-                spread_pips: 0.0,
-                current_price: None,
-                now: None,
-                account_state: AccountState::default(),
-            },
-            &SnapshotConfig::default(),
-        );
-        let mut d = TradeDecision::fallback_hold("x");
-        assert_eq!(minimal_guard(&d, &snap), "OBSERVED_MISMATCH");
-        d.observed.latest_bar_5m = snap.latest_bars.m5.clone();
-        assert_eq!(minimal_guard(&d, &snap), "PASS");
-        d.action = Action::Buy;
-        assert_eq!(minimal_guard(&d, &snap), "NO_SL_TP");
-        d.entry_price = Some(154.2);
-        d.stop_loss = Some(154.3);
-        d.take_profit = Some(154.5);
-        assert_eq!(minimal_guard(&d, &snap), "SL_WRONG_SIDE");
-        d.stop_loss = Some(154.1);
-        assert_eq!(minimal_guard(&d, &snap), "PASS");
-    }
 }

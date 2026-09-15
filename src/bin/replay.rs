@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use ntrade::ctrader::{BarPeriod, CTraderConfig, CTraderService};
+use ntrade::guard::{GuardConfig, DEFAULT_GUARD_CONFIG_PATH};
 use ntrade::llm::{LlmClient, LlmClientConfig};
 use ntrade::replay::report::{build_report, format_diff, format_report};
 use ntrade::replay::{check_leak, ReplayConfig, ReplayRunner};
@@ -158,7 +159,8 @@ async fn main() -> Result<()> {
                 chart_root: PathBuf::from("charts"),
                 lessons: lesson,
             };
-            let run_id = ReplayRunner::new(db.clone(), llm, cfg).run(resume).await?;
+            let guard = GuardConfig::load_or_default(DEFAULT_GUARD_CONFIG_PATH);
+            let run_id = ReplayRunner::new(db.clone(), llm, cfg, guard).run(resume).await?;
             let rows = db.lock().unwrap().decisions(run_id)?;
             println!("\n{}", format_report(&build_report(run_id, &rows)));
         }

@@ -10,6 +10,7 @@ import { ChartPreview } from "@/components/trading/ChartPreview";
 import { TradeHistoryTable } from "@/components/trading/TradeHistoryTable";
 import { LessonsManager } from "@/components/trading/LessonsManager";
 import { ReplayViewer } from "@/components/trading/ReplayViewer";
+import { PlanMonitor } from "@/components/trading/PlanMonitor";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   initialMetrics,
@@ -329,8 +330,9 @@ export default function TradingDashboard() {
                 <ChartPreview />
               </div>
 
-              {/* 右カラム: LLM思考ログ (5/12) */}
+              {/* 右カラム: 条件付きプラン + LLM思考ログ (5/12) */}
               <div className="xl:col-span-5 space-y-6">
+                <PlanMonitor onDecided={syncWithBackend} />
                 <CoTViewer logs={cotLogs} />
                 <TradeHistoryTable trades={trades.slice(0, 3)} />
               </div>
