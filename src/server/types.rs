@@ -72,9 +72,18 @@ pub struct CoTLog {
     pub take_profit: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub risk_reward_ratio: Option<f64>,
-    pub macro_bias: String,
-    pub trigger_pattern: String,
-    pub invalidation_point: String,
+    /// 環境認識（4H/1H）
+    pub macro_context: String,
+    /// 注文の攻防（15M/5M）
+    pub order_flow: String,
+    /// 無効化ライン（SLの根拠）
+    pub invalidation: String,
+    /// 反対材料
+    #[serde(default)]
+    pub conflicts: String,
+    /// ガードで弾かれた場合のガード名（PASS 以外）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard_result: Option<String>,
     pub reasoning: String,
     pub executed: bool,
     pub spread_pips: f64,

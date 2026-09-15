@@ -9,7 +9,6 @@ import {
   TrendingDown,
   Layers,
   Percent,
-  Gauge,
   ShieldCheck,
 } from "lucide-react";
 import { cn } from "@/lib/utils";

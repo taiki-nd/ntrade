@@ -9,6 +9,7 @@ import { CoTViewer } from "@/components/trading/CoTViewer";
 import { ChartPreview } from "@/components/trading/ChartPreview";
 import { TradeHistoryTable } from "@/components/trading/TradeHistoryTable";
 import { LessonsManager } from "@/components/trading/LessonsManager";
+import { ReplayViewer } from "@/components/trading/ReplayViewer";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   initialMetrics,
@@ -33,6 +34,7 @@ import {
   LineChart,
   History,
   Lightbulb,
+  FlaskConical,
 } from "lucide-react";
 
 export default function TradingDashboard() {
@@ -43,7 +45,6 @@ export default function TradingDashboard() {
   const [cotLogs, setCotLogs] = React.useState<CoTLog[]>(initialCoTLogs);
   const [lessons, setLessons] = React.useState<LessonLearned[]>(initialLessons);
   const [activeTab, setActiveTab] = React.useState<string>("overview");
-  const [isBackendConnected, setIsBackendConnected] = React.useState<boolean>(false);
 
   // バックエンドからの全データ取得同期
   const syncWithBackend = React.useCallback(async () => {
@@ -58,7 +59,6 @@ export default function TradingDashboard() {
 
       if (m) {
         setMetrics(m);
-        setIsBackendConnected(true);
       }
       if (pRes?.success && pRes.data) {
         setPositions(pRes.data);
@@ -73,19 +73,19 @@ export default function TradingDashboard() {
         setLessons(lRes.data);
       }
     } catch {
-      setIsBackendConnected(false);
+      // エンジン未接続時はローカル表示を維持
     }
   }, []);
 
-  // 初回マウント & 5秒ごとの定期ポーリング同期
+  // 初回マウント & 5秒ごとの定期ポーリング同期（setState はタイマーコールバック内でのみ行う）
   React.useEffect(() => {
-    syncWithBackend();
+    const initial = setTimeout(syncWithBackend, 0);
+    const interval = setInterval(syncWithBackend, 5000);
 
-    const interval = setInterval(() => {
-      syncWithBackend();
-    }, 5000);
-
-    return () => clearInterval(interval);
+    return () => {
+      clearTimeout(initial);
+      clearInterval(interval);
+    };
   }, [syncWithBackend]);
 
   // ボット稼働トグル切り替え
@@ -285,7 +285,7 @@ export default function TradingDashboard() {
           onValueChange={setActiveTab}
           className="space-y-4"
         >
-          <TabsList className="grid w-full grid-cols-5 max-w-2xl bg-muted/60">
+          <TabsList className="grid w-full grid-cols-6 max-w-3xl bg-muted/60">
             <TabsTrigger value="overview" className="gap-1.5 text-xs font-medium cursor-pointer">
               <LayoutDashboard className="h-4 w-4" />
               全体概要
@@ -306,7 +306,16 @@ export default function TradingDashboard() {
               <Lightbulb className="h-4 w-4" />
               教訓ルール
             </TabsTrigger>
+            <TabsTrigger value="replay" className="gap-1.5 text-xs font-medium cursor-pointer">
+              <FlaskConical className="h-4 w-4" />
+              リプレイ
+            </TabsTrigger>
           </TabsList>
+
+          {/* リプレイ結果 タブ */}
+          <TabsContent value="replay" className="space-y-4">
+            <ReplayViewer />
+          </TabsContent>
 
           {/* 全体概要タブ */}
           <TabsContent value="overview" className="space-y-4">

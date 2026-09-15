@@ -219,7 +219,93 @@ export const tradingApi = {
   async getLatestSnapshot(): Promise<ApiResponse<MarketSnapshot>> {
     return await request<ApiResponse<MarketSnapshot>>("/api/snapshot/latest");
   },
+
+  /** リプレイ run 一覧 */
+  async getReplayRuns(): Promise<ApiResponse<ReplayRun[]>> {
+    return await request<ApiResponse<ReplayRun[]>>("/api/replay/runs");
+  },
+
+  /** リプレイ run の詳細（集計 + 判断一覧） */
+  async getReplayRun(id: number): Promise<ApiResponse<ReplayRunDetail>> {
+    return await request<ApiResponse<ReplayRunDetail>>(`/api/replay/runs/${id}`);
+  },
+
+  /** ヒストリカルデータの収録範囲 */
+  async getReplayCoverage(): Promise<ApiResponse<ReplayCoverage[]>> {
+    return await request<ApiResponse<ReplayCoverage[]>>("/api/replay/coverage");
+  },
 };
+
+export interface ReplayRun {
+  id: number;
+  created_at: string;
+  label: string;
+  pair: string;
+  from_ts: string;
+  to_ts: string;
+  sampling: string;
+  prompt_hash: string;
+  snapshot_ver: string;
+  decisions: number;
+}
+
+export interface ReplayBucket {
+  n: number;
+  trades: number;
+  tp_hit: number;
+  sl_hit: number;
+  same_bar: number;
+  timeout: number;
+  win_rate: number | null;
+  avg_pnl_pips: number | null;
+  total_pnl_pips: number;
+}
+
+export interface ReplayReport {
+  run_id: number;
+  total: number;
+  guard_pass: number;
+  by_action: Record<string, number>;
+  by_outcome: Record<string, number>;
+  by_guard: Record<string, number>;
+  by_confidence: Record<string, ReplayBucket>;
+  by_session: Record<string, ReplayBucket>;
+  overall: ReplayBucket;
+  rejected: ReplayBucket;
+  unobserved_rate: number;
+  hold_rate: number;
+  plan_rate: number;
+  plan_triggered: number;
+  conflicts_empty_rate: number;
+}
+
+export interface ReplayDecision {
+  run_id: number;
+  t: string;
+  decision_json: string;
+  guard_result: string;
+  outcome: string;
+  pnl_pips: number | null;
+  bars_to_exit: number | null;
+  chart_dir: string;
+  session: string;
+  confidence: number;
+  action: string;
+}
+
+export interface ReplayRunDetail {
+  run: ReplayRun;
+  report: ReplayReport;
+  decisions: ReplayDecision[];
+}
+
+export interface ReplayCoverage {
+  pair: string;
+  period: string;
+  count: number;
+  first: string | null;
+  last: string | null;
+}
 
 export type ChartTimeframe = "4H" | "1H" | "15M" | "5M";
 export const CHART_TIMEFRAMES: ChartTimeframe[] = ["4H", "1H", "15M", "5M"];

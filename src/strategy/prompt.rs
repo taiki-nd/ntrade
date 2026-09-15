@@ -99,7 +99,11 @@ impl PromptBuilder {
 - analysis.order_flow: 注文の攻防（15M/5M）
 - analysis.invalidation: 無効化ラインの価格と、その価格である理由
 - analysis.conflicts: 反対材料
-- conditional_plan: 待ち条件がある場合のみ。wait_for / then_action / invalidate_if / expires_at（"YYYY-MM-DD HH:MM:SS UTC"）
+- conditional_plan: 待ち条件がある場合のみ。wait_for / then_action / invalidate_if / expires_at（"YYYY-MM-DD HH:MM:SS UTC"）に加え、プログラムが機械的に判定するための構造化条件を必ず埋める:
+  - trigger_price + trigger_condition（CLOSE_ABOVE / CLOSE_BELOW）: 5M確定足の終値がこの価格をこの向きに抜けたら成立
+  - invalidate_price + invalidate_condition: 5M確定足の終値がこの価格をこの向きに抜けたら破棄
+  - stop_loss / take_profit: 成立時に使う値
+  条件を1つの価格で表せない場合は、最も本質的な1条件に絞って書く
 - observed: 各画像のタイトルに書かれている "last bar" の時刻を "YYYY-MM-DD HH:MM" 形式でそのまま転記
 - reasoning: 判断に至った論理の要約
 "#

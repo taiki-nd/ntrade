@@ -116,14 +116,14 @@ pub fn find_swing_points(bars: &[CandleBar], window: usize) -> Vec<SwingPoint> {
         let mut is_high = true;
         let mut is_low = true;
 
-        for j in (i - window)..=(i + window) {
+        for (j, other) in bars.iter().enumerate().take(i + window + 1).skip(i - window) {
             if i == j {
                 continue;
             }
-            if bars[j].high >= current.high {
+            if other.high >= current.high {
                 is_high = false;
             }
-            if bars[j].low <= current.low {
+            if other.low <= current.low {
                 is_low = false;
             }
         }

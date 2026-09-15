@@ -94,7 +94,7 @@ export function CoTViewer({ logs }: CoTViewerProps) {
                     </span>
                   </div>
                   <p className="text-xs text-muted-foreground line-clamp-1 mt-0.5">
-                    {log.triggerPattern}
+                    {log.orderFlow}
                   </p>
                 </div>
               </div>
@@ -209,21 +209,31 @@ export function CoTViewer({ logs }: CoTViewerProps) {
               <div className="space-y-1.5 p-3 rounded-lg border bg-card">
                 <div className="flex items-center gap-2 text-xs font-semibold text-muted-foreground">
                   <TrendingUp className="h-4 w-4 text-blue-500" />
-                  <span>1. 上位足の環境認識 (Macro Bias: 4H & 1H)</span>
+                  <span>1. 環境認識 (4H / 1H)</span>
                 </div>
-                <p className="text-sm leading-relaxed">{selectedLog.macroBias}</p>
+                <p className="text-sm leading-relaxed">{selectedLog.macroContext}</p>
               </div>
 
-              {/* 5分足トリガー (プライスアクション) */}
+              {/* 注文の攻防 (15M / 5M) */}
               <div className="space-y-1.5 p-3 rounded-lg border bg-card">
                 <div className="flex items-center gap-2 text-xs font-semibold text-muted-foreground">
                   <Sparkles className="h-4 w-4 text-amber-500" />
-                  <span>2. 5分足プライスアクショントリガー (Price Action)</span>
+                  <span>2. 注文の攻防 (15M / 5M)</span>
                 </div>
                 <p className="text-sm leading-relaxed font-medium">
-                  {selectedLog.triggerPattern}
+                  {selectedLog.orderFlow}
                 </p>
               </div>
+
+              {/* 反対材料 */}
+              {selectedLog.conflicts && (
+                <div className="space-y-1.5 p-3 rounded-lg border bg-card">
+                  <div className="flex items-center gap-2 text-xs font-semibold text-muted-foreground">
+                    <span>4. 反対材料</span>
+                  </div>
+                  <p className="text-sm leading-relaxed">{selectedLog.conflicts}</p>
+                </div>
+              )}
 
               {/* シナリオ無効化価格 (客観的SL理由) */}
               <div className="space-y-1.5 p-3 rounded-lg border border-rose-500/20 bg-rose-50/30 dark:bg-rose-950/20">
@@ -232,7 +242,7 @@ export function CoTViewer({ logs }: CoTViewerProps) {
                   <span>3. シナリオ無効化ライン（客観的損切り根拠）</span>
                 </div>
                 <p className="text-sm leading-relaxed text-foreground">
-                  {selectedLog.invalidationPoint}
+                  {selectedLog.invalidation}
                 </p>
               </div>
 

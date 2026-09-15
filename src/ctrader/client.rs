@@ -234,6 +234,66 @@ impl CTraderService {
         Ok(bars)
     }
 
+    /// 期間指定でヒストリカルバーを取得する（リプレイ用）。
+    /// cTrader は1リクエストあたりの期間に上限があるため、時間足に応じてチャンク分割して繰り返し取得する。
+    pub async fn get_trendbars_range(
+        &self,
+        symbol_name: &str,
+        period: BarPeriod,
+        from: chrono::DateTime<Utc>,
+        to: chrono::DateTime<Utc>,
+    ) -> Result<Vec<CandleBar>> {
+        let symbol_id = self.get_symbol_id(symbol_name).await?;
+        let chunk = match period {
+            BarPeriod::M1 => chrono::Duration::days(2),
+            BarPeriod::M5 | BarPeriod::M15 | BarPeriod::M30 => chrono::Duration::days(7),
+            BarPeriod::H1 | BarPeriod::H4 => chrono::Duration::days(30),
+            BarPeriod::D1 => chrono::Duration::days(365),
+        };
+
+        let mut all: Vec<CandleBar> = Vec::new();
+        let mut cursor = from;
+        while cursor < to {
+            let chunk_end = (cursor + chunk).min(to);
+            let req = ProtoOaGetTrendbarsReq {
+                payload_type: Some(ProtoOaPayloadType::ProtoOaGetTrendbarsReq as i32),
+                ctid_trader_account_id: self.config.account_id,
+                symbol_id,
+                period: period.to_proto_i32(),
+                count: None,
+                from_timestamp: Some(cursor.timestamp_millis()),
+                to_timestamp: Some(chunk_end.timestamp_millis()),
+            };
+            let res: ProtoOaGetTrendbarsRes = self
+                .client
+                .command(
+                    ProtoOaPayloadType::ProtoOaGetTrendbarsReq as u32,
+                    req,
+                    ProtoOaPayloadType::ProtoOaGetTrendbarsRes as u32,
+                )
+                .await
+                .with_context(|| format!("Failed to get trendbars {}..{}", cursor, chunk_end))?;
+            let n = res.trendbar.len();
+            all.extend(res.trendbar.iter().map(CandleBar::from_proto));
+            debug!("Fetched {} {:?} bars for {} ({} .. {})", n, period, symbol_name, cursor, chunk_end);
+            cursor = chunk_end;
+            // レート制限への配慮
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
+
+        all.sort_by_key(|b| b.timestamp);
+        all.dedup_by_key(|b| b.timestamp);
+        info!(
+            "Retrieved {} historical bars for {} (period: {}, {} .. {})",
+            all.len(),
+            symbol_name,
+            period.as_str(),
+            from,
+            to
+        );
+        Ok(all)
+    }
+
     /// サーバーサイドSL/TP付き成行注文の発行（デモ検証・本番兼用）
     /// `volume`: 0.01 lot = 100
     /// `rel_sl_points`: 1 pip = 10 points = 1000 in protocol (5-digit pair)

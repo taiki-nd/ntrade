@@ -15,23 +15,22 @@ function CTraderOAuthCallbackContent() {
   const errorParam = searchParams.get("error");
   const errorDesc = searchParams.get("error_description");
 
+  // URL パラメータだけで確定するエラーは初期値で決める（effect 内の同期 setState を避ける）
+  const paramError = errorParam
+    ? errorDesc || errorParam
+    : !code
+      ? "認可コード (code) が URL パラメータに見つかりませんでした。"
+      : "";
+
   const [status, setStatus] = React.useState<"loading" | "success" | "error">(
-    "loading"
+    paramError ? "error" : "loading"
   );
-  const [errorMessage, setErrorMessage] = React.useState<string>("");
+  const [errorMessage, setErrorMessage] = React.useState<string>(paramError);
   const [accounts, setAccounts] = React.useState<AccountInfo[]>([]);
   const [countdown, setCountdown] = React.useState<number>(3);
 
   React.useEffect(() => {
-    if (errorParam) {
-      setStatus("error");
-      setErrorMessage(errorDesc || errorParam);
-      return;
-    }
-
-    if (!code) {
-      setStatus("error");
-      setErrorMessage("認可コード (code) が URL パラメータに見つかりませんでした。");
+    if (errorParam || !code) {
       return;
     }
 

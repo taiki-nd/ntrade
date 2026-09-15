@@ -89,7 +89,7 @@ Step 4 で実装した `PriceActionAnalyzer` は、ピンバー・包み足・�
   - コールバック（`/auth/ctrader/callback`）で認可コード（`code`）を受け取り、`/api/auth/ctrader/exchange` で Access/Refresh Token を自動交換・`.env` に保存・cTrader ソケット接続を即時確立。
 - **リアルタイム監視 UI**: Next.js 管理画面から 5 秒ポーリングで全データ（ポジション、履歴、CoT、メトリクス）が常時同期され、手動決済や緊急停止、教訓追加が双方向リアルタイムに連動。
 
-### Step 6: MarketSnapshot 再設計（判定除去・画像4枚・生OHLC）
+### Step 6: MarketSnapshot 再設計（判定除去・画像4枚・生OHLC） (完了 ✓ 2026-09-16)
 - `src/strategy/features.rs` の `PriceActionAnalyzer` を廃止し、`snapshot` モジュールを新設。
   - 残す: `calculate_ema`, `find_swing_points`, `find_round_numbers`, `get_pip_size`。
   - 削除: ピンバー/包み足/フェイクアウト判定、`trend_4h`/`trend_1h` ラベル、`at_key_level`、`nearest_h4_support/resistance` と欠損時の捏造値。
@@ -100,12 +100,14 @@ Step 4 で実装した `PriceActionAnalyzer` は、ピンバー・包み足・�
 - `src/llm/client.rs` を画像パス付きプロンプト、`--tools Read`、`--max-turns`、`--output-format json`、`--json-schema` に対応させ、`LlmBackend` トレイトで抽象化。
 - 検証CLI `poc_price_action` を、シミュレーションではなく実データまたは保存済みヒストリカルから Snapshot を生成する形に作り直す。
 
-### Step 7: リプレイ環境（本番稼働の前提条件）
-- cTrader からヒストリカルバー（5M/15M/1H/4H、対象ペア、少なくとも直近3ヶ月）を一括取得し SQLite に保存。
-- 指定時刻 `t` で「`t` 以前のバーのみ」から Snapshot を再生成する `replay` モジュール。**未来のバーが混入しないことをテストで保証**する。
-- サンプリング（例: 15分おき、または全5M確定）で LLM を呼び、判断とその後の値動きを保存。
-- 採点: 方向一致率、SL到達前TP到達率、確信度帯ごとの勝率、無効化ラインの妥当性、HOLD率。
-- 集計結果をダッシュボードの「リプレイ結果ビューア」で閲覧。
+### Step 7: リプレイ環境（本番稼働の前提条件） (完了 ✓ 2026-09-16)
+- `src/storage`: SQLite（`bars_history` / `replay_runs` / `replay_decisions`）。`cargo run --bin replay -- fetch` で cTrader から期間指定・差分取得。
+- `src/replay`: `BarSource` トレイト（SQLite 実装）、`build_snapshot_at(t)`、`verify_no_future_leak`、サンプリング、採点（`score.rs`）、集計（`report.rs`）、`ReplayRunner`（並列・再開対応）。
+- `ConditionalPlan` に構造化条件（`trigger_price/condition`, `invalidate_price/condition`）を追加し、条件付きプランを機械的に評価できるようにした（Step 8 の Executor と共用）。
+- 最小ガード（観測整合 / SL・TP 有無 / SL の向き）を実装。本格的なガードは Step 8。
+- CLI: `fetch` / `coverage` / `check-leak` / `run` / `report` / `diff` / `list`（`make replay-*`）。
+- API: `/api/replay/runs`, `/api/replay/runs/{id}`, `/api/replay/coverage`。ダッシュボードに「リプレイ」タブ。
+- 実績: USDJPY 2026-06-15〜09-15 の 4 時間足分を取り込み、`check-leak` 40 サンプル通過、3 サンプルのスモークランで LLM 判断→採点→保存まで確認。
 - 詳細は [06_replay_environment.md](./06_replay_environment.md)。
 
 ### Step 8: 事後ガード & 条件執行

@@ -25,6 +25,8 @@ pub struct AppState {
     pub available_accounts: Arc<RwLock<Vec<AccountInfo>>>,
     /// 直近に生成した Snapshot（客観的事実 + 画像4枚）
     pub latest_snapshot: Arc<RwLock<Option<SnapshotBundle>>>,
+    /// SQLite（ヒストリカルバー・リプレイ結果）
+    pub db_path: PathBuf,
 }
 
 impl Default for AppState {
@@ -50,6 +52,7 @@ impl AppState {
             ctrader_config: Arc::new(RwLock::new(initial_config)),
             available_accounts: Arc::new(RwLock::new(Vec::new())),
             latest_snapshot: Arc::new(RwLock::new(None)),
+            db_path: PathBuf::from(crate::storage::DEFAULT_DB_PATH),
         }
     }
 
@@ -227,10 +230,12 @@ impl AppState {
                 stop_loss: Some(154.080),
                 take_profit: Some(154.550),
                 risk_reward_ratio: Some(2.76),
-                macro_bias: "4H EMA20上方推移の強気パーフェクトオーダー。押し目買い優勢。".to_string(),
-                trigger_pattern: "154.12支持帯における下ヒゲ68%強気レジェクション・ピンバー(M5)".to_string(),
-                invalidation_point: "154.080(ピンバー安値下抜けかつ直近スイング安値割れ)".to_string(),
-                reasoning: "4H/1Hが共に明確な上昇トレンド。15Mにて154.10ラインへのプルバックが完了し、5M足で反発を示す教科書的な強気ピンバーが確定した。スプレッド0.2pipsと狭小でRR比2.76を確保できるためロングエントリーを実行。".to_string(),
+                macro_context: "4Hは安値切り上げが継続し、1HはEMA20付近まで押しを作って154.10で2度下げ止まり。買い手優勢。".to_string(),
+                order_flow: "5M直近3本で154.10割れを試したが2本連続で長い下ヒゲ。売り手のブレイク試行が拒絶され、買い手が実体を積み上げている。".to_string(),
+                invalidation: "154.080（直近5M安値の外側）。実体で割れば買い手の防衛失敗でシナリオ無効。".to_string(),
+                conflicts: "当日レンジが平均の6割でロンドン前の低ボラ。ブレイクの勢いは弱い可能性。".to_string(),
+                guard_result: None,
+                reasoning: "上位足の押し目と5Mの下げ止まりが整合。スプレッド0.2pipsでRR 2.76を確保できるためロングエントリー。".to_string(),
                 executed: true,
                 spread_pips: 0.2,
             },
@@ -245,10 +250,12 @@ impl AppState {
                 stop_loss: Some(153.720),
                 take_profit: Some(154.150),
                 risk_reward_ratio: Some(2.31),
-                macro_bias: "1Hチャネル下限サポートからのリバウンド局面。".to_string(),
-                trigger_pattern: "5M強気包み足（ブル・エンガルフィング）".to_string(),
-                invalidation_point: "153.720(直近安値割れ)".to_string(),
-                reasoning: "直近の急落後に153.80ラインで下げ止まりを確認。大陰線を丸ごと包む強気包み足が確定。リスクリワード2.31を確保できるため買い判断。".to_string(),
+                macro_context: "1Hは下降チャネル下限に到達。4Hの直近安値153.72が近く、売り手の勢いが鈍化。".to_string(),
+                order_flow: "153.80で急落が止まり、直前の陰線の値幅を丸ごと否定する陽線が確定。買い手が主導権を取り返した。".to_string(),
+                invalidation: "153.720（直近安値）。割れれば下降継続でシナリオ無効。".to_string(),
+                conflicts: "1Hはまだ下降チャネル内で、戻り売りが入りやすい位置。".to_string(),
+                guard_result: None,
+                reasoning: "急落後の下げ止まりと買い手の主導権奪還を確認。RR 2.31を確保できるため買い判断。".to_string(),
                 executed: true,
                 spread_pips: 0.2,
             },

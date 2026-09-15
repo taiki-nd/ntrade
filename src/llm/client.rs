@@ -116,7 +116,7 @@ impl LlmClient {
                 String::from_utf8_lossy(&output.stderr)
             ));
         }
-        Ok(String::from_utf8(output.stdout).context("CLI output is not UTF-8")?)
+        String::from_utf8(output.stdout).context("CLI output is not UTF-8")
     }
 
     /// CLI 出力（JSON エンベロープ or 生テキスト）から TradeDecision を取り出す

@@ -71,6 +71,33 @@ impl BarPeriod {
         }
     }
 
+    /// 1本の足の長さ
+    pub fn duration(&self) -> chrono::Duration {
+        match self {
+            BarPeriod::M1 => chrono::Duration::minutes(1),
+            BarPeriod::M5 => chrono::Duration::minutes(5),
+            BarPeriod::M15 => chrono::Duration::minutes(15),
+            BarPeriod::M30 => chrono::Duration::minutes(30),
+            BarPeriod::H1 => chrono::Duration::hours(1),
+            BarPeriod::H4 => chrono::Duration::hours(4),
+            BarPeriod::D1 => chrono::Duration::days(1),
+        }
+    }
+
+    /// "5M" / "M5" / "1H" / "H1" などの表記から変換
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_uppercase().as_str() {
+            "1M" | "M1" => Some(BarPeriod::M1),
+            "5M" | "M5" => Some(BarPeriod::M5),
+            "15M" | "M15" => Some(BarPeriod::M15),
+            "30M" | "M30" => Some(BarPeriod::M30),
+            "1H" | "H1" => Some(BarPeriod::H1),
+            "4H" | "H4" => Some(BarPeriod::H4),
+            "1D" | "D1" => Some(BarPeriod::D1),
+            _ => None,
+        }
+    }
+
     pub fn to_proto(&self) -> ProtoOaTrendbarPeriod {
         match self {
             BarPeriod::M1 => ProtoOaTrendbarPeriod::M1,

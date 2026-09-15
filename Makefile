@@ -1,7 +1,7 @@
 SHELL := /bin/zsh
 export PATH := $(HOME)/.nodenv/shims:$(PATH)
 
-.PHONY: help install dev ui engine test poc ctrader build clean
+.PHONY: help install dev ui engine test poc ctrader build clean step4 replay-fetch replay-check replay-run replay-report replay-list
 
 help: ## コマンド一覧を表示
 	@echo "ntrade - LLM駆動型 FX自動売買システム"
@@ -37,6 +37,21 @@ ctrader: ## cTrader Open API 接続とバーデータ取得のPoCを実行
 	cargo run --bin poc_ctrader
 
 step4: poc ## (旧名) poc のエイリアス
+
+replay-fetch: ## ヒストリカルバーを cTrader から取得 (FROM=YYYY-MM-DD PAIR=USDJPY)
+	cargo run --bin replay -- fetch --pair $(or $(PAIR),USDJPY) --from $(or $(FROM),2026-06-15)
+
+replay-check: ## 未来漏れ検証 (Snapshot に t より後のデータが無いこと)
+	cargo run --bin replay -- check-leak --pair $(or $(PAIR),USDJPY) --samples $(or $(SAMPLES),50)
+
+replay-run: ## リプレイ実行 (FROM= TO= LIMIT= LABEL= STEP=)
+	cargo run --bin replay -- run --pair $(or $(PAIR),USDJPY) --from $(FROM) --to $(TO) --step $(or $(STEP),15) $(if $(LIMIT),--limit $(LIMIT),) --label "$(LABEL)"
+
+replay-report: ## リプレイ集計 (RUN=<id>)
+	cargo run --bin replay -- report --run $(RUN)
+
+replay-list: ## リプレイ run 一覧
+	cargo run --bin replay -- list
 
 test: ## テストを実行 (Rust単体テスト)
 	@echo "--> Running Rust tests..."

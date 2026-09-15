@@ -43,14 +43,21 @@ export interface CoTLog {
   symbol: string;
   action: ActionType;
   confidence: number;
-  entryType?: "MARKET" | "LIMIT";
+  entryType?: "MARKET" | "LIMIT" | "CONDITIONAL";
   entryPrice?: number;
   stopLoss?: number;
   takeProfit?: number;
   riskRewardRatio?: number;
-  macroBias: string;
-  triggerPattern: string;
-  invalidationPoint: string;
+  /** 環境認識（4H/1H） */
+  macroContext: string;
+  /** 注文の攻防（15M/5M） */
+  orderFlow: string;
+  /** 無効化ライン（SLの根拠） */
+  invalidation: string;
+  /** 反対材料 */
+  conflicts?: string;
+  /** ガードで弾かれた場合のガード名 */
+  guardResult?: string;
   reasoning: string;
   executed: boolean;
   spreadPips: number;

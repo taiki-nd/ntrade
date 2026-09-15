@@ -6,3 +6,4 @@ pub mod lessons;
 pub mod positions;
 pub mod status;
 pub mod trades;
+pub mod replay;

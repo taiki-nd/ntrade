@@ -13,19 +13,7 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import {
-  ArrowUpRight,
-  ArrowDownRight,
-  Shield,
-  HelpCircle,
-  XCircle,
-} from "lucide-react";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
+import { ArrowUpRight, ArrowDownRight, XCircle } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 interface PositionTableProps {

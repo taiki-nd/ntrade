@@ -43,6 +43,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/chart/latest", get(handlers::chart::get_latest_chart))
         .route("/api/chart/generate", post(handlers::chart::generate_chart))
         .route("/api/snapshot/latest", get(handlers::chart::get_latest_snapshot))
+        // 7b. リプレイ結果
+        .route("/api/replay/runs", get(handlers::replay::list_runs))
+        .route("/api/replay/runs/{id}", get(handlers::replay::run_detail))
+        .route("/api/replay/coverage", get(handlers::replay::coverage))
         // 8. cTrader OAuth 認証連携
         .route("/api/auth/ctrader/url", get(handlers::auth::get_oauth_url))
         .route("/api/auth/ctrader/exchange", post(handlers::auth::exchange_oauth_code))

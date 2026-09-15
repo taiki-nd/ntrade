@@ -12,8 +12,6 @@ import {
   Lightbulb,
   Plus,
   Trash2,
-  AlertCircle,
-  Clock,
   Calendar,
   Sparkles,
 } from "lucide-react";
@@ -24,7 +22,6 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
-  DialogTrigger,
 } from "@/components/ui/dialog";
 
 interface LessonsManagerProps {
@@ -139,7 +136,7 @@ export function LessonsManager({
                     <select
                       className="w-full rounded-md border bg-background px-3 py-1.5 text-sm"
                       value={categoryInput}
-                      onChange={(e) => setCategoryInput(e.target.value as any)}
+                      onChange={(e) => setCategoryInput(e.target.value as LessonLearned["category"])}
                     >
                       <option value="PATTERN">パターン認識</option>
                       <option value="TIMING">時間帯・市場</option>
