@@ -64,6 +64,7 @@ export interface CoTLog {
 }
 
 export interface AccountMetrics {
+  botState: BotState;
   balance: number;
   equity: number;
   margin: number;
@@ -77,6 +78,10 @@ export interface AccountMetrics {
   usdjpySpread: number;
   eurusdSpread: number;
   circuitBreakerThresholdPercent: number;
+  /** "paper" | "live"。live のとき balance はブローカー残高 */
+  orderMode: "paper" | "live";
+  /** cTrader から取得したブローカー口座残高（未取得なら undefined） */
+  brokerBalance?: number;
   connectionStatus: {
     ctrader: "connected" | "connecting" | "disconnected";
     llm: "ready" | "busy" | "error";

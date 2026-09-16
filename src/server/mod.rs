@@ -53,6 +53,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/plans", get(handlers::plans::list_plans))
         .route("/api/plans/{id}", delete(handlers::plans::discard_plan))
         .route("/api/guard/config", get(handlers::plans::guard_config))
+        .route("/api/runtime", get(handlers::plans::runtime_info))
         // 8. cTrader OAuth 認証連携
         .route("/api/auth/ctrader/url", get(handlers::auth::get_oauth_url))
         .route("/api/auth/ctrader/exchange", post(handlers::auth::exchange_oauth_code))

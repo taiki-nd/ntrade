@@ -125,7 +125,9 @@ export function BotControlHeader({
               <span>cTrader:</span>
               <span className="font-medium text-foreground">
                 {isCtraderConnected ? (
-                  `${metrics.connectionStatus.environment} (${metrics.connectionStatus.pingMs}ms)`
+                  metrics.connectionStatus.pingMs > 0
+                    ? `${metrics.connectionStatus.environment} (${metrics.connectionStatus.pingMs}ms)`
+                    : metrics.connectionStatus.environment
                 ) : (
                   <span className="text-rose-500">未接続</span>
                 )}
@@ -152,7 +154,7 @@ export function BotControlHeader({
               <Cpu className="h-3.5 w-3.5 text-indigo-500" />
               <span>LLM Pipeline:</span>
               <span className="font-medium text-foreground">
-                claude -p / agy -p (Ready)
+                {`claude -p / agy -p (${metrics.connectionStatus.llm})`}
               </span>
             </div>
 

@@ -249,7 +249,49 @@ export const tradingApi = {
   async discardPlan(id: string): Promise<ApiResponse<string>> {
     return await request<ApiResponse<string>>(`/api/plans/${id}`, { method: "DELETE" });
   },
+
+  /** エンジンの稼働設定（読み取り専用） */
+  async getRuntime(): Promise<ApiResponse<RuntimeInfo>> {
+    return await request<ApiResponse<RuntimeInfo>>("/api/runtime");
+  },
+
+  /** 事後ガード設定 */
+  async getGuardConfig(): Promise<ApiResponse<GuardConfig>> {
+    return await request<ApiResponse<GuardConfig>>("/api/guard/config");
+  },
 };
+
+export interface RuntimeInfo {
+  orderMode: "paper" | "live";
+  schedulerEnabled: boolean;
+  pairs: string[];
+  barDelaySecs: number;
+  paperBalance: number;
+  guardConfigPath: string;
+  dbPath: string;
+  llmCli: string;
+  llmTimeoutSecs: number;
+  envFilePresent: boolean;
+}
+
+/** Rust 側 GuardConfig（snake_case のまま） */
+export interface GuardConfig {
+  observed_check: boolean;
+  min_confidence: number;
+  min_rr: number;
+  sl_atr_min: number;
+  sl_atr_max: number;
+  sl_min_pips: number;
+  max_positions_per_pair: number;
+  max_positions_total: number;
+  daily_loss_limit_pct: number;
+  plan_max_hours: number;
+  fixed_volume_lots: number;
+  risk_pct: number | null;
+  pip_value_per_lot: number | null;
+  max_spread_pips: Record<string, number>;
+  news_blackout: { time: string; before_min: number; after_min: number; label: string }[];
+}
 
 export interface ConditionalPlan {
   wait_for: string;

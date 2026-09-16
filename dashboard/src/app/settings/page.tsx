@@ -1,86 +1,176 @@
 "use client";
 
 import * as React from "react";
-import Link from "next/link";
-import { ArrowLeft, UserCheck } from "lucide-react";
-
 import { DashboardLayout } from "@/components/layouts/dashboard-layout";
-import { buttonVariants } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { PasskeyManagement } from "@/components/auth/passkey-management";
-import { useAuth } from "@/contexts/auth-context";
-import { cn } from "@/lib/utils";
+import { Button } from "@/components/ui/button";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Settings, ShieldCheck, Cpu, RefreshCw, Loader2, TriangleAlert } from "lucide-react";
+import { tradingApi, type RuntimeInfo, type GuardConfig } from "@/lib/trading-api";
+import type { AccountMetrics } from "@/types/trading";
+
+function Row({ label, value }: { label: string; value: React.ReactNode }) {
+  return (
+    <TableRow>
+      <TableCell className="text-xs text-muted-foreground w-56">{label}</TableCell>
+      <TableCell className="text-xs font-mono">{value}</TableCell>
+    </TableRow>
+  );
+}
 
 export default function SettingsPage() {
-  const { user, isLoading } = useAuth();
+  const [runtime, setRuntime] = React.useState<RuntimeInfo | null>(null);
+  const [guard, setGuard] = React.useState<GuardConfig | null>(null);
+  const [status, setStatus] = React.useState<AccountMetrics | null>(null);
+  const [loading, setLoading] = React.useState(false);
+  const [offline, setOffline] = React.useState(false);
+
+  const load = React.useCallback(async () => {
+    setLoading(true);
+    try {
+      const [r, g, s] = await Promise.all([tradingApi.getRuntime(), tradingApi.getGuardConfig(), tradingApi.getStatus()]);
+      if (r.success && r.data) setRuntime(r.data);
+      if (g.success && g.data) setGuard(g.data);
+      setStatus(s);
+      setOffline(false);
+    } catch {
+      setOffline(true);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  React.useEffect(() => {
+    const id = setTimeout(load, 0);
+    return () => clearTimeout(id);
+  }, [load]);
 
   return (
-    <DashboardLayout title="Settings">
+    <DashboardLayout title="システム設定">
       <div className="space-y-6 max-w-4xl">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-          <div>
-            <h2 className="text-2xl font-bold tracking-tight">Account & Security</h2>
-            <p className="text-muted-foreground text-sm">
-              アカウント情報およびパスキー（生体認証 / セキュリティキー）の設定を管理します。
-            </p>
-          </div>
-          <Link
-            href="/dashboard"
-            className={cn(buttonVariants({ variant: "outline", size: "sm" }), "gap-1.5 self-start sm:self-auto")}
-          >
-            <ArrowLeft className="h-4 w-4" />
-            Back to Dashboard
-          </Link>
+        <div className="flex items-center justify-between">
+          <p className="text-sm text-muted-foreground">
+            設定は環境変数（<code className="font-mono text-xs">.env</code>）と <code className="font-mono text-xs">config/guard.toml</code> で行い、ここでは現在値を確認します。変更後はエンジンの再起動が必要です。
+          </p>
+          <Button variant="outline" size="sm" onClick={load} disabled={loading} className="h-8 gap-1.5 text-xs">
+            {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+            再読込
+          </Button>
         </div>
 
-        {/* User Info Card */}
-        <Card>
-          <CardHeader>
-            <div className="flex items-center gap-2">
-              <UserCheck className="h-5 w-5 text-primary" />
-              <CardTitle className="text-lg">ユーザー情報</CardTitle>
-            </div>
-            <CardDescription>
-              現在ログイン中のセッション情報です。
-            </CardDescription>
+        {offline && (
+          <Alert variant="destructive">
+            <TriangleAlert className="h-4 w-4" />
+            <AlertTitle>Rustコアエンジンに接続できません</AlertTitle>
+            <AlertDescription>エンジン（localhost:4000）を起動してから再読込してください。</AlertDescription>
+          </Alert>
+        )}
+
+        {/* 稼働設定 */}
+        <Card className="shadow-xs">
+          <CardHeader className="pb-3">
+            <CardTitle className="text-base font-semibold flex items-center gap-2">
+              <Cpu className="h-5 w-5 text-primary" />
+              稼働設定
+            </CardTitle>
+            <CardDescription className="text-xs">スケジューラ、発注モード、LLM CLI の設定（環境変数）</CardDescription>
           </CardHeader>
-          <CardContent className="space-y-4">
-            {isLoading ? (
-              <p className="text-sm text-muted-foreground">読み込み中...</p>
-            ) : user ? (
-              <div className="grid gap-3 sm:grid-cols-2 text-sm">
-                <div>
-                  <span className="text-xs font-semibold text-muted-foreground block">ユーザーID</span>
-                  <span className="font-mono text-xs">{user.id}</span>
-                </div>
-                <div>
-                  <span className="text-xs font-semibold text-muted-foreground block">メールアドレス</span>
-                  <span>{user.email}</span>
-                </div>
-                <div>
-                  <span className="text-xs font-semibold text-muted-foreground block">ロール (権限)</span>
-                  <Badge variant="secondary" className="mt-1 capitalize">
-                    {user.role || "user"}
-                  </Badge>
-                </div>
-              </div>
+          <CardContent>
+            {runtime ? (
+              <Table>
+                <TableBody>
+                  <Row
+                    label="発注モード (NTRADE_LIVE_ORDERS)"
+                    value={
+                      <Badge variant={runtime.orderMode === "live" ? "destructive" : "secondary"}>
+                        {runtime.orderMode === "live" ? "LIVE: cTrader に実発注" : "PAPER: 発注しない"}
+                      </Badge>
+                    }
+                  />
+                  <Row label="スケジューラ (NTRADE_SCHEDULER)" value={runtime.schedulerEnabled ? "有効（5分足確定ごと）" : "無効"} />
+                  <Row label="対象ペア (NTRADE_PAIRS)" value={runtime.pairs.join(", ")} />
+                  <Row label="足確定後の待ち秒数 (NTRADE_BAR_DELAY_SECS)" value={`${runtime.barDelaySecs} 秒`} />
+                  <Row label="ペーパー初期残高 (NTRADE_PAPER_BALANCE)" value={runtime.paperBalance.toLocaleString()} />
+                  <Row label="LLM CLI" value={`${runtime.llmCli} (timeout ${runtime.llmTimeoutSecs}s)`} />
+                  <Row label="ガード設定ファイル" value={runtime.guardConfigPath} />
+                  <Row label="SQLite" value={runtime.dbPath} />
+                  <Row label=".env" value={runtime.envFilePresent ? "あり" : "なし（.env.example をコピーしてください）"} />
+                </TableBody>
+              </Table>
             ) : (
-              <div className="text-sm text-muted-foreground">
-                <p>現在ログインしていません。</p>
-                <Link
-                  href="/login"
-                  className={cn(buttonVariants({ size: "sm" }), "mt-3")}
-                >
-                  ログインページへ
-                </Link>
-              </div>
+              <p className="text-sm text-muted-foreground">読み込み中...</p>
             )}
           </CardContent>
         </Card>
 
-        {/* Passkey Security Management */}
-        <PasskeyManagement />
+        {/* 接続状態 */}
+        <Card className="shadow-xs">
+          <CardHeader className="pb-3">
+            <CardTitle className="text-base font-semibold flex items-center gap-2">
+              <Settings className="h-5 w-5 text-primary" />
+              接続と口座
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            {status ? (
+              <Table>
+                <TableBody>
+                  <Row label="cTrader" value={`${status.connectionStatus.ctrader} / ${status.connectionStatus.environment} / ${status.connectionStatus.accountNumber}`} />
+                  <Row label="ブローカー口座残高" value={status.brokerBalance !== undefined ? status.brokerBalance.toLocaleString() : "未取得"} />
+                  <Row label="表示中の残高（発注モード基準）" value={`${status.balance.toLocaleString()} (${status.orderMode})`} />
+                  <Row label="ボット状態" value={status.botState} />
+                </TableBody>
+              </Table>
+            ) : (
+              <p className="text-sm text-muted-foreground">読み込み中...</p>
+            )}
+          </CardContent>
+        </Card>
+
+        {/* ガード設定 */}
+        <Card className="shadow-xs">
+          <CardHeader className="pb-3">
+            <CardTitle className="text-base font-semibold flex items-center gap-2">
+              <ShieldCheck className="h-5 w-5 text-primary" />
+              事後ガード (config/guard.toml)
+            </CardTitle>
+            <CardDescription className="text-xs">LLM の判断を発注前に機械的に検証する閾値。判断ロジックではなくリスク管理。</CardDescription>
+          </CardHeader>
+          <CardContent>
+            {guard ? (
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead className="text-xs">項目</TableHead>
+                    <TableHead className="text-xs">値</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  <Row label="観測整合チェック" value={guard.observed_check ? "有効" : "無効"} />
+                  <Row label="確信度の下限" value={guard.min_confidence.toFixed(2)} />
+                  <Row label="リスクリワード下限" value={guard.min_rr.toFixed(2)} />
+                  <Row label="SL 幅 (5M ATR 比)" value={`${guard.sl_atr_min} 〜 ${guard.sl_atr_max}`} />
+                  <Row label="SL 最小幅" value={`${guard.sl_min_pips} pips`} />
+                  <Row label="ポジション上限" value={`ペアごと ${guard.max_positions_per_pair} / 全体 ${guard.max_positions_total}`} />
+                  <Row label="日次損失上限" value={`${guard.daily_loss_limit_pct}%`} />
+                  <Row label="条件付きプラン最長" value={`${guard.plan_max_hours} 時間`} />
+                  <Row label="ロット" value={guard.risk_pct ? `リスク ${guard.risk_pct}% から算出` : `固定 ${guard.fixed_volume_lots} lot`} />
+                  <Row
+                    label="スプレッド上限"
+                    value={Object.entries(guard.max_spread_pips)
+                      .map(([k, v]) => `${k}: ${v}`)
+                      .join(", ")}
+                  />
+                  <Row label="指標ブラックアウト" value={guard.news_blackout.length === 0 ? "なし" : guard.news_blackout.map((b) => `${b.label || ""} ${b.time} (-${b.before_min}/+${b.after_min}分)`).join(" / ")} />
+                </TableBody>
+              </Table>
+            ) : (
+              <p className="text-sm text-muted-foreground">読み込み中...</p>
+            )}
+          </CardContent>
+        </Card>
       </div>
     </DashboardLayout>
   );

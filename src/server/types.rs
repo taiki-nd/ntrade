@@ -102,6 +102,8 @@ pub struct ConnectionStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountMetrics {
+    /// ボット稼働状態（`/api/status` 応答時に最新値を反映）
+    pub bot_state: BotState,
     pub balance: f64,
     pub equity: f64,
     pub margin: f64,
@@ -115,7 +117,28 @@ pub struct AccountMetrics {
     pub usdjpy_spread: f64,
     pub eurusd_spread: f64,
     pub circuit_breaker_threshold_percent: f64,
+    /// "paper" | "live"。live のとき balance はブローカー残高を反映する
+    pub order_mode: String,
+    /// cTrader から取得したブローカー口座残高（未取得なら None）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub broker_balance: Option<f64>,
     pub connection_status: ConnectionStatus,
+}
+
+/// エンジンの稼働設定（環境変数と設定ファイル由来。読み取り専用）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeInfo {
+    pub order_mode: String,
+    pub scheduler_enabled: bool,
+    pub pairs: Vec<String>,
+    pub bar_delay_secs: i64,
+    pub paper_balance: f64,
+    pub guard_config_path: String,
+    pub db_path: String,
+    pub llm_cli: String,
+    pub llm_timeout_secs: u64,
+    pub env_file_present: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

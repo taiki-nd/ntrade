@@ -136,6 +136,15 @@ pub fn volume_to_lots(volume: i64) -> f64 {
     volume as f64 / 10_000_000.0
 }
 
+/// 口座サマリー（get_trader の結果）
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AccountSummary {
+    pub account_id: i64,
+    pub balance: f64,
+    pub leverage: Option<f64>,
+    pub is_live: bool,
+}
+
 /// ブローカー側の保有ポジション（reconcile の結果）
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BrokerPosition {

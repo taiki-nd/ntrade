@@ -44,8 +44,13 @@ export function MetricsCards({ metrics }: MetricsCardsProps) {
             {formatCurrency(metrics.equity)}
           </div>
           <p className="text-xs text-muted-foreground mt-1">
-            残高: {formatCurrency(metrics.balance)}
+            {metrics.orderMode === "live" ? "ブローカー残高" : "ペーパー残高"}: {formatCurrency(metrics.balance)}
           </p>
+          {metrics.orderMode !== "live" && metrics.brokerBalance !== undefined && (
+            <p className="text-xs text-muted-foreground">
+              cTrader 口座: {formatCurrency(metrics.brokerBalance)}
+            </p>
+          )}
         </CardContent>
       </Card>
 

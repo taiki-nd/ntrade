@@ -9,7 +9,9 @@ use crate::server::types::AccountMetrics;
 pub async fn get_status(State(state): State<AppState>) -> Json<AccountMetrics> {
     debug!("Handling GET /api/status");
 
-    // cTraderサービスが接続されている場合、可能であれば実残高情報を同期
+    // cTrader 接続時は 30 秒に 1 回ブローカー残高を同期
+    state.sync_broker_account_if_stale(std::time::Duration::from_secs(30)).await;
+
     let ctrader_opt = {
         let lock = state.ctrader_service.read().await;
         lock.clone()
@@ -29,6 +31,17 @@ pub async fn get_status(State(state): State<AppState>) -> Json<AccountMetrics> {
     metrics.unrealized_pnl = total_unrealized_pnl;
     metrics.equity = metrics.balance + total_unrealized_pnl;
     metrics.free_margin = metrics.equity - metrics.margin;
+    metrics.bot_state = *state.bot_state.read().await;
+
+    // 直近 Snapshot のスプレッドを反映
+    if let Some(bundle) = state.latest_snapshot.read().await.as_ref() {
+        let snap = &bundle.snapshot;
+        match snap.pair.to_uppercase().as_str() {
+            "USDJPY" => metrics.usdjpy_spread = snap.spread_pips,
+            "EURUSD" => metrics.eurusd_spread = snap.spread_pips,
+            _ => {}
+        }
+    }
 
     if let Some(ctrader) = ctrader_opt {
         metrics.connection_status.ctrader = "connected".to_string();

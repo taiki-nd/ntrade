@@ -4,7 +4,6 @@ import "./globals.css";
 import { ThemeProvider } from "@/components/theme-provider";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Toaster } from "@/components/ui/sonner";
-import { AuthProvider } from "@/contexts/auth-context";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -17,8 +16,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Next Scaffold - AI-Friendly Frontend Starter",
-  description: "Next.js + shadcn/ui boilerplate engineered for clean design and minimal token consumption",
+  title: "ntrade - LLM駆動型 FX自動売買ダッシュボード",
+  description: "Rust コアエンジンと LLM 推論によるプライスアクション自動売買のローカル管理画面",
 };
 
 export default function RootLayout({
@@ -40,10 +39,8 @@ export default function RootLayout({
           disableTransitionOnChange
         >
           <TooltipProvider>
-            <AuthProvider>
-              {children}
-              <Toaster position="top-right" />
-            </AuthProvider>
+            {children}
+            <Toaster position="top-right" />
           </TooltipProvider>
         </ThemeProvider>
       </body>

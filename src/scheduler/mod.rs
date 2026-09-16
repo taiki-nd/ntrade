@@ -112,9 +112,10 @@ pub async fn after_cycle(state: &AppState, pair: &str) -> anyhow::Result<()> {
         }
     }
 
-    // 2. ブローカー側ポジションとの同期（実発注時）
+    // 2. ブローカー残高・ポジションとの同期
+    state.sync_broker_account().await;
     if let Some(ctrader) = state.ctrader_service.read().await.clone() {
-        if std::env::var("NTRADE_LIVE_ORDERS").is_ok() {
+        if crate::server::state::live_orders_enabled() {
             match ctrader.get_open_positions().await {
                 Ok(broker) => {
                     let mut positions = state.positions.write().await;

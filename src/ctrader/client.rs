@@ -11,7 +11,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use super::config::CTraderConfig;
-use super::types::{volume_to_lots, BarPeriod, BrokerPosition, CandleBar, SymbolInfo};
+use super::types::{volume_to_lots, AccountSummary, BarPeriod, BrokerPosition, CandleBar, SymbolInfo};
 
 /// cTrader Open API サービス
 pub struct CTraderService {
@@ -292,6 +292,24 @@ impl CTraderService {
             to
         );
         Ok(all)
+    }
+
+    /// 口座情報（残高など）。cTrader の金額は整数で、`money_digits` 桁分を割って実値にする。
+    pub async fn get_account_info(&self) -> Result<AccountSummary> {
+        let res = self
+            .client
+            .get_trader(self.config.account_id)
+            .await
+            .context("Failed to get trader info from cTrader")?;
+        let t = res.trader;
+        let digits = t.money_digits.unwrap_or(2);
+        let scale = 10f64.powi(digits as i32);
+        Ok(AccountSummary {
+            account_id: t.ctid_trader_account_id,
+            balance: t.balance as f64 / scale,
+            leverage: t.leverage_in_cents.map(|l| l as f64 / 100.0),
+            is_live: self.config.is_live,
+        })
     }
 
     /// ブローカー側の保有ポジション一覧（reconcile）
