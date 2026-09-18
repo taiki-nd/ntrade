@@ -23,8 +23,45 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Separator } from "@/components/ui/separator";
 import { tradingApi } from "@/lib/trading-api";
+import { cn } from "@/lib/utils";
 import { toast } from "sonner";
+
+const yen = new Intl.NumberFormat("ja-JP", {
+  style: "currency",
+  currency: "JPY",
+  maximumFractionDigits: 0,
+});
+const signedYen = new Intl.NumberFormat("ja-JP", {
+  style: "currency",
+  currency: "JPY",
+  maximumFractionDigits: 0,
+  signDisplay: "exceptZero",
+});
+
+const formatCurrency = (val: number, signed = false) => (signed ? signedYen : yen).format(val);
+
+interface StatProps {
+  label: string;
+  value: string;
+  sub?: string;
+  valueClassName?: string;
+  title?: string;
+}
+
+/** ヘッダー内の1指標（ラベル + 値 + 補足）。縦幅を抑えるため2行に収める */
+function Stat({ label, value, sub, valueClassName, title }: StatProps) {
+  return (
+    <div className="flex flex-col leading-tight" title={title}>
+      <span className="text-[11px] text-muted-foreground">{label}</span>
+      <span className="flex items-baseline gap-1.5 whitespace-nowrap">
+        <span className={cn("text-sm font-semibold tabular-nums", valueClassName)}>{value}</span>
+        {sub && <span className="text-[11px] tabular-nums text-muted-foreground">{sub}</span>}
+      </span>
+    </div>
+  );
+}
 
 interface BotControlHeaderProps {
   botState: BotState;
@@ -72,133 +109,131 @@ export function BotControlHeader({
     switch (botState) {
       case "running":
         return (
-          <div className="flex items-center gap-2">
-            <span className="relative flex h-3 w-3">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-              <span className="relative inline-flex rounded-full h-3 w-3 bg-emerald-500"></span>
-            </span>
-            <span className="font-semibold text-emerald-600 dark:text-emerald-400">
-              稼働中 (AUTO RUNNING)
-            </span>
+          <div className="flex items-center gap-1.5" title="AUTO RUNNING">
+            <span className="h-2 w-2 rounded-full bg-emerald-500" />
+            <span className="text-sm font-semibold text-emerald-600 dark:text-emerald-400">稼働中</span>
           </div>
         );
       case "paused":
         return (
-          <div className="flex items-center gap-2">
-            <span className="h-3 w-3 rounded-full bg-amber-500" />
-            <span className="font-semibold text-amber-600 dark:text-amber-400">
-              一時停止中 (PAUSED)
-            </span>
+          <div className="flex items-center gap-1.5" title="PAUSED">
+            <span className="h-2 w-2 rounded-full bg-amber-500" />
+            <span className="text-sm font-semibold text-amber-600 dark:text-amber-400">一時停止中</span>
           </div>
         );
       case "circuit_breaker":
         return (
-          <div className="flex items-center gap-2">
-            <span className="h-3 w-3 rounded-full bg-rose-600 animate-pulse" />
-            <span className="font-semibold text-rose-600 dark:text-rose-400">
-              サーキットブレーカー発動 (SHUTDOWN)
-            </span>
+          <div className="flex items-center gap-1.5" title="SHUTDOWN">
+            <span className="h-2 w-2 rounded-full bg-rose-600" />
+            <span className="text-sm font-semibold text-rose-600 dark:text-rose-400">サーキットブレーカー</span>
           </div>
         );
     }
   };
 
   const isCtraderConnected = metrics.connectionStatus.ctrader === "connected";
+  const pnlClass = (v: number) =>
+    v > 0 ? "text-emerald-600 dark:text-emerald-400" : v < 0 ? "text-rose-600 dark:text-rose-400" : undefined;
+  const balanceTitle = [
+    `${metrics.orderMode === "live" ? "ブローカー残高" : "ペーパー残高"}: ${formatCurrency(metrics.balance)}`,
+    metrics.orderMode !== "live" && metrics.brokerBalance !== undefined
+      ? `cTrader 口座: ${formatCurrency(metrics.brokerBalance)}`
+      : null,
+  ]
+    .filter(Boolean)
+    .join("\n");
 
   return (
-    <div className="rounded-xl border bg-card p-4 shadow-sm">
-      <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-        {/* 左側: ステータスと接続情報 */}
-        <div className="flex flex-wrap items-center gap-4">
-          <div className="flex items-center gap-3 pr-4 border-r">
-            {getStatusBadge()}
-          </div>
+    <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-5 gap-y-2 py-2">
+      {getStatusBadge()}
 
-          <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-            {/* cTrader 接続ステータス */}
-            <div className="flex items-center gap-1.5 rounded-md bg-muted/60 px-2.5 py-1">
-              <Server
-                className={`h-3.5 w-3.5 ${
-                  isCtraderConnected ? "text-emerald-500" : "text-rose-500"
-                }`}
-              />
-              <span>cTrader:</span>
-              <span className="font-medium text-foreground">
-                {isCtraderConnected ? (
-                  metrics.connectionStatus.pingMs > 0
-                    ? `${metrics.connectionStatus.environment} (${metrics.connectionStatus.pingMs}ms)`
-                    : metrics.connectionStatus.environment
-                ) : (
-                  <span className="text-rose-500">未接続</span>
-                )}
-              </span>
-            </div>
+      <Separator orientation="vertical" className="hidden h-8 self-center sm:block" />
 
-            {/* cTrader OAuth 連携ボタン */}
-            <Button
-              variant={isCtraderConnected ? "ghost" : "outline"}
-              size="sm"
-              onClick={() => setShowOAuthDialog(true)}
-              className={`h-7 px-2.5 gap-1.5 text-xs font-medium cursor-pointer ${
-                !isCtraderConnected
-                  ? "border-emerald-500 text-emerald-600 hover:bg-emerald-50 dark:hover:bg-emerald-950/40"
-                  : "text-muted-foreground hover:text-foreground"
-              }`}
-            >
-              <Link2 className="h-3.5 w-3.5" />
-              {isCtraderConnected ? "cTrader連携設定" : "cTraderを連携"}
-            </Button>
+      {/* 口座サマリー */}
+      <div className="flex flex-wrap items-center gap-x-5 gap-y-1">
+        <Stat label="純資産" value={formatCurrency(metrics.equity)} title={balanceTitle} />
+        <Stat
+          label="本日確定"
+          value={formatCurrency(metrics.dailyPnl, true)}
+          sub={`${metrics.dailyPnl > 0 ? "+" : ""}${metrics.dailyPnlPercent.toFixed(2)}%`}
+          valueClassName={pnlClass(metrics.dailyPnl)}
+        />
+        <Stat
+          label="含み損益"
+          value={formatCurrency(metrics.unrealizedPnl, true)}
+          sub={`証拠金 ${formatCurrency(metrics.margin)}`}
+          valueClassName={pnlClass(metrics.unrealizedPnl)}
+        />
+        <Stat
+          label="本日勝率"
+          value={`${metrics.winRateToday.toFixed(1)}%`}
+          sub={`${metrics.winningTradesToday}勝${metrics.totalTradesToday - metrics.winningTradesToday}敗`}
+        />
+        <Stat
+          label="スプレッド"
+          value={`UJ ${metrics.usdjpySpread} / EU ${metrics.eurusdSpread}`}
+          sub={`日次上限 ${metrics.circuitBreakerThresholdPercent}%`}
+        />
+      </div>
 
-            {/* LLM 推論エンジン */}
-            <div className="flex items-center gap-1.5 rounded-md bg-muted/60 px-2.5 py-1">
-              <Cpu className="h-3.5 w-3.5 text-indigo-500" />
-              <span>LLM Pipeline:</span>
-              <span className="font-medium text-foreground">
-                {`claude -p / agy -p (${metrics.connectionStatus.llm})`}
-              </span>
-            </div>
-
-            {/* 口座番号 */}
-            <div className="hidden sm:flex items-center gap-1.5 rounded-md bg-muted/60 px-2.5 py-1">
-              <span className="text-muted-foreground">{metrics.connectionStatus.accountNumber}</span>
-            </div>
-          </div>
-        </div>
-
-        {/* 右側: コントロールボタン群 */}
-        <div className="flex items-center gap-2">
-          {botState === "running" ? (
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => onStateChange("paused")}
-              className="gap-1.5 text-amber-600 border-amber-300 hover:bg-amber-50 dark:border-amber-800 dark:hover:bg-amber-950/40 cursor-pointer"
-            >
-              <Pause className="h-4 w-4" />
-              一時停止
-            </Button>
+      {/* 接続状態 & コントロール */}
+      <div className="ml-auto flex items-center gap-1.5">
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => setShowOAuthDialog(true)}
+          title={`cTrader連携設定${metrics.connectionStatus.accountNumber ? ` / ${metrics.connectionStatus.accountNumber}` : ""}`}
+          className="gap-1.5 text-xs text-muted-foreground hover:text-foreground cursor-pointer"
+        >
+          <Server className={`h-3.5 w-3.5 ${isCtraderConnected ? "text-emerald-500" : "text-rose-500"}`} />
+          {isCtraderConnected ? (
+            metrics.connectionStatus.pingMs > 0
+              ? `${metrics.connectionStatus.environment} ${metrics.connectionStatus.pingMs}ms`
+              : metrics.connectionStatus.environment
           ) : (
-            <Button
-              variant="default"
-              size="sm"
-              onClick={() => onStateChange("running")}
-              className="gap-1.5 bg-emerald-600 hover:bg-emerald-700 text-white cursor-pointer"
-            >
-              <Play className="h-4 w-4" />
-              自動売買開始
-            </Button>
+            <span className="text-rose-500">cTrader未接続</span>
           )}
+        </Button>
 
-          <Button
-            variant="destructive"
-            size="sm"
-            onClick={() => setShowEmergencyDialog(true)}
-            className="gap-1.5 cursor-pointer font-semibold shadow-xs"
-          >
-            <AlertOctagon className="h-4 w-4" />
-            緊急全決済
-          </Button>
+        <div
+          className="hidden items-center gap-1.5 px-1.5 text-xs text-muted-foreground md:flex"
+          title="LLM Pipeline: claude -p / agy -p"
+        >
+          <Cpu className="h-3.5 w-3.5" />
+          {metrics.connectionStatus.llm}
         </div>
+
+        {botState === "running" ? (
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => onStateChange("paused")}
+            className="text-amber-600 border-amber-300 hover:bg-amber-50 dark:border-amber-800 dark:hover:bg-amber-950/40 cursor-pointer"
+          >
+            <Pause />
+            一時停止
+          </Button>
+        ) : (
+          <Button
+            variant="default"
+            size="sm"
+            onClick={() => onStateChange("running")}
+            className="bg-emerald-600 hover:bg-emerald-700 text-white cursor-pointer"
+          >
+            <Play />
+            自動売買開始
+          </Button>
+        )}
+
+        <Button
+          variant="destructive"
+          size="sm"
+          onClick={() => setShowEmergencyDialog(true)}
+          className="font-semibold cursor-pointer"
+        >
+          <AlertOctagon />
+          緊急全決済
+        </Button>
       </div>
 
       {/* 緊急停止確認ダイアログ */}

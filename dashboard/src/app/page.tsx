@@ -3,7 +3,6 @@
 import * as React from "react";
 import { DashboardLayout } from "@/components/layouts/dashboard-layout";
 import { BotControlHeader } from "@/components/trading/BotControlHeader";
-import { MetricsCards } from "@/components/trading/MetricsCards";
 import { PositionTable } from "@/components/trading/PositionTable";
 import { CoTViewer } from "@/components/trading/CoTViewer";
 import { ChartPreview } from "@/components/trading/ChartPreview";
@@ -11,7 +10,7 @@ import { TradeHistoryTable } from "@/components/trading/TradeHistoryTable";
 import { LessonsManager } from "@/components/trading/LessonsManager";
 import { ReplayViewer } from "@/components/trading/ReplayViewer";
 import { PlanMonitor } from "@/components/trading/PlanMonitor";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Tabs, TabsContent } from "@/components/ui/tabs";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
@@ -23,17 +22,9 @@ import {
   LessonLearned,
 } from "@/types/trading";
 import { tradingApi } from "@/lib/trading-api";
-import { useHash, setHash } from "@/hooks/use-hash";
+import { useHash } from "@/hooks/use-hash";
 import { toast } from "sonner";
-import {
-  LayoutDashboard,
-  BrainCircuit,
-  LineChart,
-  History,
-  Lightbulb,
-  FlaskConical,
-  PlugZap,
-} from "lucide-react";
+import { PlugZap } from "lucide-react";
 
 type EngineStatus = "connecting" | "online" | "offline";
 
@@ -49,10 +40,9 @@ export default function TradingDashboard() {
   const [trades, setTrades] = React.useState<TradeHistory[]>([]);
   const [cotLogs, setCotLogs] = React.useState<CoTLog[]>([]);
   const [lessons, setLessons] = React.useState<LessonLearned[]>([]);
-  // タブは URL ハッシュと同期する（サイドバーの `/#cot` などから切り替えられるように）
+  // 表示するビューは URL ハッシュで決まる（サイドバーの `/#cot` などから切り替える）
   const hash = useHash();
   const activeTab = TAB_IDS.includes(hash) ? hash : "overview";
-  const setActiveTab = (tab: string) => setHash(tab);
 
   // バックエンドからの全データ取得同期
   const syncWithBackend = React.useCallback(async () => {
@@ -195,7 +185,23 @@ export default function TradingDashboard() {
   };
 
   return (
-    <DashboardLayout title="ntrade 自動売買ダッシュボード">
+    <DashboardLayout
+      title="ntrade 自動売買ダッシュボード"
+      headerContent={
+        // 稼働ステータス・口座サマリー・緊急停止をヘッダーに常時表示
+        metrics ? (
+          <BotControlHeader
+            botState={metrics.botState}
+            metrics={metrics}
+            onStateChange={handleStateChange}
+            onEmergencyStop={handleEmergencyStop}
+            onRefresh={syncWithBackend}
+          />
+        ) : (
+          <Skeleton className="h-9 flex-1 rounded-lg" />
+        )
+      }
+    >
       <div className="space-y-6">
         {engineStatus === "offline" && (
           <Alert variant="destructive">
@@ -207,64 +213,8 @@ export default function TradingDashboard() {
           </Alert>
         )}
 
-        {metrics ? (
-          <>
-            {/* 1. 稼働ステータス & 緊急停止コントロールヘッダー */}
-            <BotControlHeader
-              botState={metrics.botState}
-              metrics={metrics}
-              onStateChange={handleStateChange}
-              onEmergencyStop={handleEmergencyStop}
-              onRefresh={syncWithBackend}
-            />
-
-            {/* 2. サマリーメトリクスカード */}
-            <MetricsCards metrics={metrics} />
-          </>
-        ) : (
-          <>
-            <Skeleton className="h-16 w-full rounded-xl" />
-            <div className="grid grid-cols-2 gap-4 lg:grid-cols-5">
-              {Array.from({ length: 5 }).map((_, i) => (
-                <Skeleton key={i} className="h-28 rounded-xl" />
-              ))}
-            </div>
-          </>
-        )}
-
-        {/* 3. メインビュータブ */}
-        <Tabs
-          value={activeTab}
-          onValueChange={setActiveTab}
-          className="space-y-4"
-        >
-          <TabsList className="grid w-full grid-cols-6 max-w-3xl bg-muted/60">
-            <TabsTrigger value="overview" className="gap-1.5 text-xs font-medium cursor-pointer">
-              <LayoutDashboard className="h-4 w-4" />
-              全体概要
-            </TabsTrigger>
-            <TabsTrigger value="cot" className="gap-1.5 text-xs font-medium cursor-pointer">
-              <BrainCircuit className="h-4 w-4" />
-              LLM思考ログ
-            </TabsTrigger>
-            <TabsTrigger value="chart" className="gap-1.5 text-xs font-medium cursor-pointer">
-              <LineChart className="h-4 w-4" />
-              チャート
-            </TabsTrigger>
-            <TabsTrigger value="trades" className="gap-1.5 text-xs font-medium cursor-pointer">
-              <History className="h-4 w-4" />
-              約定履歴
-            </TabsTrigger>
-            <TabsTrigger value="lessons" className="gap-1.5 text-xs font-medium cursor-pointer">
-              <Lightbulb className="h-4 w-4" />
-              教訓ルール
-            </TabsTrigger>
-            <TabsTrigger value="replay" className="gap-1.5 text-xs font-medium cursor-pointer">
-              <FlaskConical className="h-4 w-4" />
-              リプレイ
-            </TabsTrigger>
-          </TabsList>
-
+        {/* メインビュータブ */}
+        <Tabs value={activeTab} className="space-y-4">
           {/* リプレイ結果 タブ */}
           <TabsContent value="replay" className="space-y-4">
             <ReplayViewer />
@@ -285,7 +235,7 @@ export default function TradingDashboard() {
               {/* 右カラム: 条件付きプラン + LLM思考ログ (5/12) */}
               <div className="xl:col-span-5 space-y-6">
                 <PlanMonitor onDecided={syncWithBackend} />
-                <CoTViewer logs={cotLogs} />
+                <CoTViewer logs={cotLogs.slice(0, 3)} />
                 <TradeHistoryTable trades={trades.slice(0, 3)} />
               </div>
             </div>

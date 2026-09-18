@@ -17,7 +17,7 @@ import {
 } from "lucide-react"
 
 import { cn } from "@/lib/utils"
-import { useHash } from "@/hooks/use-hash"
+import { useHash, setHash } from "@/hooks/use-hash"
 import { Button, buttonVariants } from "@/components/ui/button"
 import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet"
 import { ThemeToggle } from "@/components/theme-toggle"
@@ -45,6 +45,8 @@ interface DashboardLayoutProps {
   children: React.ReactNode
   navItems?: NavItem[]
   title?: string
+  /** 指定するとヘッダーのタイトルを置き換え、常時表示のステータスバーとして描画する */
+  headerContent?: React.ReactNode
 }
 
 interface DashboardNavContentProps {
@@ -119,13 +121,23 @@ function DashboardNavContent({
             {navItems.map((item) => {
               const Icon = item.icon
               const isActive = isItemActive(item, pathname, hash)
+              // 同一ページ内のハッシュ遷移は Link (pushState) だと hashchange が発火せず、
+              // useHash が次の再描画（5秒ポーリング）まで追従しない。setHash で即時通知する。
+              const [itemPath, itemHash] = item.href.split("#")
+              const handleClick = (e: React.MouseEvent<HTMLAnchorElement>) => {
+                if (itemHash !== undefined && itemPath === pathname) {
+                  e.preventDefault()
+                  setHash(itemHash)
+                }
+                onItemClick?.()
+              }
 
               if (isCollapsed) {
                 return (
                   <Link
                     key={item.href}
                     href={item.href}
-                    onClick={onItemClick}
+                    onClick={handleClick}
                     title={item.title + (item.badge ? ` (${item.badge})` : "")}
                     className={cn(
                       "flex h-10 w-10 mx-auto items-center justify-center rounded-lg transition-colors",
@@ -142,7 +154,7 @@ function DashboardNavContent({
                 <Link
                   key={item.href}
                   href={item.href}
-                  onClick={onItemClick}
+                  onClick={handleClick}
                   className={cn(
                     "flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors",
                     isActive ? "bg-accent text-accent-foreground" : "text-muted-foreground hover:bg-accent/50 hover:text-foreground"
@@ -172,7 +184,7 @@ function DashboardNavContent({
   )
 }
 
-export function DashboardLayout({ children, navItems = defaultNavItems, title = "ntrade" }: DashboardLayoutProps) {
+export function DashboardLayout({ children, navItems = defaultNavItems, title = "ntrade", headerContent }: DashboardLayoutProps) {
   const pathname = usePathname()
   const hash = useHash()
   const [open, setOpen] = React.useState(false)
@@ -205,11 +217,15 @@ export function DashboardLayout({ children, navItems = defaultNavItems, title = 
       <div className="flex flex-1 flex-col h-full overflow-y-auto min-w-0" onScroll={handleScroll}>
         <header
           className={cn(
-            "sticky top-0 z-30 flex h-14 shrink-0 items-center justify-between px-4 transition-all duration-300 md:px-6",
-            isScrolled ? "border-b border-border/50 bg-background/80 backdrop-blur-md shadow-xs" : "border-b border-transparent bg-transparent"
+            "sticky top-0 z-30 flex min-h-14 shrink-0 items-center justify-between gap-3 px-4 transition-all duration-300 md:px-6",
+            headerContent
+              ? "border-b border-border bg-background/90 backdrop-blur-md"
+              : isScrolled
+                ? "border-b border-border/50 bg-background/80 backdrop-blur-md shadow-xs"
+                : "border-b border-transparent bg-transparent"
           )}
         >
-          <div className="flex items-center gap-2 sm:gap-3">
+          <div className={cn("flex items-center gap-2 sm:gap-3", headerContent && "min-w-0 flex-1")}>
             <Sheet open={open} onOpenChange={setOpen}>
               <SheetTrigger className={cn(buttonVariants({ variant: "ghost", size: "icon" }), "md:hidden cursor-pointer")}>
                 <Menu className="h-5 w-5" />
@@ -239,7 +255,14 @@ export function DashboardLayout({ children, navItems = defaultNavItems, title = 
               </Button>
             )}
 
-            <h1 className="text-base font-semibold md:text-lg">{title}</h1>
+            {headerContent ? (
+              <>
+                <h1 className="sr-only">{title}</h1>
+                {headerContent}
+              </>
+            ) : (
+              <h1 className="text-base font-semibold md:text-lg">{title}</h1>
+            )}
           </div>
 
           <div className="flex items-center gap-2">
