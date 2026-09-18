@@ -20,6 +20,7 @@ import {
   TradeHistory,
   CoTLog,
   LessonLearned,
+  Page,
 } from "@/types/trading";
 import { tradingApi } from "@/lib/trading-api";
 import { useHash } from "@/hooks/use-hash";
@@ -30,6 +31,13 @@ type EngineStatus = "connecting" | "online" | "offline";
 
 const TAB_IDS = ["overview", "cot", "chart", "trades", "lessons", "replay"];
 
+/** 概要タブに出す直近件数 */
+const RECENT_COUNT = 3;
+const COT_PAGE_SIZE = 10;
+const TRADE_PAGE_SIZE = 20;
+
+const emptyPage = <T,>(): Page<T> => ({ items: [], total: 0 });
+
 const errorMessage = (err: unknown) =>
   err instanceof Error ? err.message : "エンジンが起動しているか確認してください。";
 
@@ -37,8 +45,13 @@ export default function TradingDashboard() {
   const [engineStatus, setEngineStatus] = React.useState<EngineStatus>("connecting");
   const [metrics, setMetrics] = React.useState<AccountMetrics | null>(null);
   const [positions, setPositions] = React.useState<Position[]>([]);
-  const [trades, setTrades] = React.useState<TradeHistory[]>([]);
-  const [cotLogs, setCotLogs] = React.useState<CoTLog[]>([]);
+  // 概要タブ用の直近分と、各タブのページ分を別々に持つ
+  const [recentTrades, setRecentTrades] = React.useState<TradeHistory[]>([]);
+  const [recentCotLogs, setRecentCotLogs] = React.useState<CoTLog[]>([]);
+  const [tradePage, setTradePage] = React.useState(1);
+  const [tradesPage, setTradesPage] = React.useState<Page<TradeHistory>>(emptyPage);
+  const [cotPage, setCotPage] = React.useState(1);
+  const [cotLogsPage, setCotLogsPage] = React.useState<Page<CoTLog>>(emptyPage);
   const [lessons, setLessons] = React.useState<LessonLearned[]>([]);
   // 表示するビューは URL ハッシュで決まる（サイドバーの `/#cot` などから切り替える）
   const hash = useHash();
@@ -47,26 +60,30 @@ export default function TradingDashboard() {
   // バックエンドからの全データ取得同期
   const syncWithBackend = React.useCallback(async () => {
     try {
-      const [m, pRes, tRes, cRes, lRes] = await Promise.all([
+      const [m, pRes, rtRes, rcRes, tRes, cRes, lRes] = await Promise.all([
         tradingApi.getStatus(),
         tradingApi.getPositions(),
-        tradingApi.getTrades(),
-        tradingApi.getCoTLogs(),
+        tradingApi.getTrades({ limit: RECENT_COUNT }),
+        tradingApi.getCoTLogs({ limit: RECENT_COUNT }),
+        tradingApi.getTrades({ limit: TRADE_PAGE_SIZE, offset: (tradePage - 1) * TRADE_PAGE_SIZE }),
+        tradingApi.getCoTLogs({ limit: COT_PAGE_SIZE, offset: (cotPage - 1) * COT_PAGE_SIZE }),
         tradingApi.getLessons(),
       ]);
 
       setMetrics(m);
       if (pRes.success && pRes.data) setPositions(pRes.data);
-      if (tRes.success && tRes.data) setTrades(tRes.data);
-      if (cRes.success && cRes.data) setCotLogs(cRes.data);
+      if (rtRes.success && rtRes.data) setRecentTrades(rtRes.data.items);
+      if (rcRes.success && rcRes.data) setRecentCotLogs(rcRes.data.items);
+      if (tRes.success && tRes.data) setTradesPage(tRes.data);
+      if (cRes.success && cRes.data) setCotLogsPage(cRes.data);
       if (lRes.success && lRes.data) setLessons(lRes.data);
       setEngineStatus("online");
     } catch {
       setEngineStatus("offline");
     }
-  }, []);
+  }, [tradePage, cotPage]);
 
-  // 初回マウント & 5秒ごとの定期ポーリング同期（setState はタイマーコールバック内でのみ行う）
+  // 初回マウント・ページ切り替え時 & 5秒ごとの定期ポーリング同期（setState はタイマーコールバック内でのみ行う）
   React.useEffect(() => {
     const initial = setTimeout(syncWithBackend, 0);
     const interval = setInterval(syncWithBackend, 5000);
@@ -235,15 +252,23 @@ export default function TradingDashboard() {
               {/* 右カラム: 条件付きプラン + LLM思考ログ (5/12) */}
               <div className="xl:col-span-5 space-y-6">
                 <PlanMonitor onDecided={syncWithBackend} />
-                <CoTViewer logs={cotLogs.slice(0, 3)} />
-                <TradeHistoryTable trades={trades.slice(0, 3)} />
+                <CoTViewer logs={recentCotLogs} />
+                <TradeHistoryTable trades={recentTrades} />
               </div>
             </div>
           </TabsContent>
 
           {/* LLM思考ログ タブ */}
           <TabsContent value="cot" className="space-y-4">
-            <CoTViewer logs={cotLogs} />
+            <CoTViewer
+              logs={cotLogsPage.items}
+              pagination={{
+                page: cotPage,
+                pageSize: COT_PAGE_SIZE,
+                total: cotLogsPage.total,
+                onPageChange: setCotPage,
+              }}
+            />
           </TabsContent>
 
           {/* チャートプレビュー タブ */}
@@ -253,7 +278,15 @@ export default function TradingDashboard() {
 
           {/* 約定履歴 タブ */}
           <TabsContent value="trades" className="space-y-4">
-            <TradeHistoryTable trades={trades} />
+            <TradeHistoryTable
+              trades={tradesPage.items}
+              pagination={{
+                page: tradePage,
+                pageSize: TRADE_PAGE_SIZE,
+                total: tradesPage.total,
+                onPageChange: setTradePage,
+              }}
+            />
           </TabsContent>
 
           {/* 教訓マネージャー タブ */}

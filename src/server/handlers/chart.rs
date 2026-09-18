@@ -137,9 +137,18 @@ pub async fn generate_snapshot_internal(state: &AppState, pair: &str) -> anyhow:
     };
 
     // 口座状態: 保有ポジションと直近の判断（フリップフロップ防止のため LLM に渡す）
+    let recent_cot = {
+        let pair = pair.to_string();
+        match state.with_db(move |db| db.cot_logs(Some(&pair), 3, 0)).await {
+            Ok(page) => page.items,
+            Err(e) => {
+                warn!("Failed to load recent decisions from SQLite: {e:#}");
+                Vec::new()
+            }
+        }
+    };
     let account_state = {
         let positions = state.positions.read().await;
-        let cot = state.cot_logs.read().await;
         AccountState {
             open_positions: positions
                 .iter()
@@ -152,10 +161,8 @@ pub async fn generate_snapshot_internal(state: &AppState, pair: &str) -> anyhow:
                     open_time: p.open_time.clone(),
                 })
                 .collect(),
-            recent_decisions: cot
+            recent_decisions: recent_cot
                 .iter()
-                .filter(|c| c.symbol.eq_ignore_ascii_case(pair))
-                .take(3)
                 .map(|c| RecentDecision {
                     time: c.timestamp.clone(),
                     action: c.action.clone(),

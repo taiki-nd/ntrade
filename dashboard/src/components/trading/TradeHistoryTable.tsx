@@ -11,15 +11,22 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
-import { ArrowUpRight, ArrowDownRight, History, CheckCircle, AlertTriangle, Hand } from "lucide-react";
+import { ArrowUpRight, ArrowDownRight, History, CheckCircle, AlertTriangle, Hand, BrainCircuit } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { CoTDetailDialog } from "@/components/trading/CoTDetailDialog";
+import { PaginationBar, PaginationBarProps } from "@/components/trading/PaginationBar";
 
 interface TradeHistoryTableProps {
   trades: TradeHistory[];
+  /** 指定時はカード下部にページ送りを表示（ページングはサーバー側） */
+  pagination?: PaginationBarProps;
 }
 
-export function TradeHistoryTable({ trades }: TradeHistoryTableProps) {
+export function TradeHistoryTable({ trades, pagination }: TradeHistoryTableProps) {
+  const [selectedCotId, setSelectedCotId] = React.useState<string | null>(null);
+
   const formatCurrency = (val: number) => {
     return new Intl.NumberFormat("ja-JP", {
       style: "currency",
@@ -69,7 +76,7 @@ export function TradeHistoryTable({ trades }: TradeHistoryTableProps) {
             <span>約定履歴 (Trade History)</span>
           </CardTitle>
           <CardDescription className="text-xs">
-            本日および直近の完了済みトレードの決済結果
+            決済済みトレードの結果と、エントリーの根拠になった判断
           </CardDescription>
         </div>
       </CardHeader>
@@ -87,13 +94,14 @@ export function TradeHistoryTable({ trades }: TradeHistoryTableProps) {
                 <TableHead className="text-right">確定損益</TableHead>
                 <TableHead className="text-center">決済理由</TableHead>
                 <TableHead className="text-right">決済時刻</TableHead>
+                <TableHead className="text-center">判断</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {trades.length === 0 ? (
                 <TableRow>
                   <TableCell
-                    colSpan={9}
+                    colSpan={10}
                     className="h-24 text-center text-muted-foreground text-sm"
                   >
                     決済済みトレード履歴はありません
@@ -162,6 +170,21 @@ export function TradeHistoryTable({ trades }: TradeHistoryTableProps) {
                       <TableCell className="text-right text-xs text-muted-foreground font-mono">
                         {trd.closeTime}
                       </TableCell>
+                      <TableCell className="text-center">
+                        {trd.cotLogId ? (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-7 gap-1 text-xs"
+                            onClick={() => setSelectedCotId(trd.cotLogId ?? null)}
+                          >
+                            <BrainCircuit className="h-3.5 w-3.5" />
+                            根拠
+                          </Button>
+                        ) : (
+                          <span className="text-xs text-muted-foreground">—</span>
+                        )}
+                      </TableCell>
                     </TableRow>
                   );
                 })
@@ -169,7 +192,14 @@ export function TradeHistoryTable({ trades }: TradeHistoryTableProps) {
             </TableBody>
           </Table>
         </div>
+        {pagination && (
+          <div className="px-4 py-3 border-t">
+            <PaginationBar {...pagination} />
+          </div>
+        )}
       </CardContent>
+
+      <CoTDetailDialog cotLogId={selectedCotId} onClose={() => setSelectedCotId(null)} />
     </Card>
   );
 }

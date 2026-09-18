@@ -11,8 +11,10 @@ use crate::server::types::{ApiResponse, CreateLessonRequest, LessonLearned};
 /// GET /api/lessons
 /// 自己反省ルール（教訓）一覧を返却
 pub async fn get_lessons(State(state): State<AppState>) -> Json<ApiResponse<Vec<LessonLearned>>> {
-    let lock = state.lessons.read().await;
-    Json(ApiResponse::ok(lock.clone()))
+    match state.with_db(|db| db.lessons()).await {
+        Ok(lessons) => Json(ApiResponse::ok(lessons)),
+        Err(e) => Json(ApiResponse::err(format!("{e:#}"))),
+    }
 }
 
 /// POST /api/lessons
@@ -34,10 +36,11 @@ pub async fn create_lesson(
         category: payload.category,
     };
 
-    let mut lock = state.lessons.write().await;
-    lock.insert(0, new_lesson.clone());
-
-    Json(ApiResponse::ok_msg(new_lesson, "教訓ルールを登録しました"))
+    let saved = new_lesson.clone();
+    match state.with_db(move |db| db.upsert_lesson(&saved)).await {
+        Ok(()) => Json(ApiResponse::ok_msg(new_lesson, "教訓ルールを登録しました")),
+        Err(e) => Json(ApiResponse::err(format!("{e:#}"))),
+    }
 }
 
 /// POST /api/lessons/:id/toggle
@@ -48,17 +51,19 @@ pub async fn toggle_lesson(
 ) -> Json<ApiResponse<LessonLearned>> {
     info!("Toggling lesson rule id: {}", id);
 
-    let mut lock = state.lessons.write().await;
-    if let Some(target) = lock.iter_mut().find(|l| l.id == id) {
-        target.active = !target.active;
-        let updated = target.clone();
-        Json(ApiResponse::ok_msg(updated, "教訓ルールの適用状態を切り替えました"))
-    } else {
-        Json(ApiResponse {
-            success: false,
-            data: None,
-            message: Some(format!("Lesson {} not found", id)),
+    let key = id.clone();
+    let res = state
+        .with_db(move |db| {
+            let Some(mut target) = db.lesson(&key)? else { return Ok(None) };
+            target.active = !target.active;
+            db.upsert_lesson(&target)?;
+            Ok(Some(target))
         })
+        .await;
+    match res {
+        Ok(Some(updated)) => Json(ApiResponse::ok_msg(updated, "教訓ルールの適用状態を切り替えました")),
+        Ok(None) => Json(ApiResponse::err(format!("Lesson {} not found", id))),
+        Err(e) => Json(ApiResponse::err(format!("{e:#}"))),
     }
 }
 
@@ -70,17 +75,10 @@ pub async fn delete_lesson(
 ) -> Json<ApiResponse<()>> {
     info!("Deleting lesson rule id: {}", id);
 
-    let mut lock = state.lessons.write().await;
-    let initial_len = lock.len();
-    lock.retain(|l| l.id != id);
-
-    if lock.len() < initial_len {
-        Json(ApiResponse::ok_msg((), "教訓ルールを削除しました"))
-    } else {
-        Json(ApiResponse {
-            success: false,
-            data: None,
-            message: Some(format!("Lesson {} not found", id)),
-        })
+    let key = id.clone();
+    match state.with_db(move |db| db.delete_lesson(&key)).await {
+        Ok(true) => Json(ApiResponse::ok_msg((), "教訓ルールを削除しました")),
+        Ok(false) => Json(ApiResponse::err(format!("Lesson {} not found", id))),
+        Err(e) => Json(ApiResponse::err(format!("{e:#}"))),
     }
 }

@@ -13,6 +13,8 @@ export interface Position {
   pnlAmount: number;
   openTime: string;
   invalidationReason: string;
+  /** このポジションを建てた判断（CoT ログ ID） */
+  cotLogId?: string;
 }
 
 export type CloseReason = "TAKE_PROFIT" | "STOP_LOSS" | "MANUAL" | "CIRCUIT_BREAKER";
@@ -100,4 +102,20 @@ export interface LessonLearned {
   active: boolean;
   triggerTradeId?: string;
   category: "RISK" | "TIMING" | "PATTERN" | "NEWS";
+}
+
+/** 一覧 API のページング結果 */
+export interface Page<T> {
+  items: T[];
+  /** 条件に一致する全件数 */
+  total: number;
+}
+
+/** 判断1件と、そこから生まれた取引 */
+export interface CoTDetail {
+  log: CoTLog;
+  /** 決済済みの取引 */
+  trades: TradeHistory[];
+  /** 保有中のポジション */
+  openPositions: Position[];
 }

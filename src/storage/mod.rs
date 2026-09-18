@@ -1,4 +1,9 @@
-//! SQLite 永続化。ヒストリカルバー・リプレイ結果・cTrader OAuth トークンを保存する。
+//! SQLite 永続化。ヒストリカルバー・リプレイ結果・cTrader OAuth トークン、
+//! および本番の判断ログ・ポジション・決済履歴・教訓（`journal`）を保存する。
+
+mod journal;
+
+pub use journal::Page;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
@@ -123,6 +128,7 @@ impl Db {
             );
             "#,
         )?;
+        self.migrate_journal()?;
         Ok(())
     }
 

@@ -12,8 +12,7 @@ use crate::llm::{LlmClient, LlmClientConfig};
 use crate::snapshot::SnapshotBundle;
 use crate::storage::Db;
 use super::types::{
-    AccountInfo, AccountMetrics, BotState, ConnectionStatus, CoTLog, LessonLearned,
-    Position, TradeHistory,
+    AccountInfo, AccountMetrics, BotState, ConnectionStatus, CoTLog, Position, TradeHistory,
 };
 
 #[derive(Clone)]
@@ -21,16 +20,15 @@ pub struct AppState {
     pub bot_state: Arc<RwLock<BotState>>,
     pub metrics: Arc<RwLock<AccountMetrics>>,
     pub positions: Arc<RwLock<Vec<Position>>>,
-    pub trades: Arc<RwLock<Vec<TradeHistory>>>,
-    pub cot_logs: Arc<RwLock<Vec<CoTLog>>>,
-    pub lessons: Arc<RwLock<Vec<LessonLearned>>>,
     pub ctrader_service: Arc<RwLock<Option<Arc<CTraderService>>>>,
     pub ctrader_config: Arc<RwLock<Option<CTraderConfig>>>,
     pub available_accounts: Arc<RwLock<Vec<AccountInfo>>>,
     /// 直近に生成した Snapshot（客観的事実 + 画像4枚）
     pub latest_snapshot: Arc<RwLock<Option<SnapshotBundle>>>,
-    /// SQLite（ヒストリカルバー・リプレイ結果）
+    /// SQLite（ヒストリカルバー・リプレイ結果・判断ログ・ポジション・決済履歴・教訓）
     pub db_path: PathBuf,
+    /// `positions` の SQLite 書き出しを直列化する（古いスナップショットで上書きしないため）
+    positions_persist_lock: Arc<tokio::sync::Mutex<()>>,
     /// 事後ガード設定（config/guard.toml）
     pub guard_config: Arc<RwLock<GuardConfig>>,
     /// 保持中の条件付きプラン
@@ -50,6 +48,22 @@ pub struct AppState {
 /// `NTRADE_PAPER_BALANCE` が指定されていればその値
 fn paper_balance_override() -> Option<f64> {
     std::env::var("NTRADE_PAPER_BALANCE").ok().and_then(|v| v.trim_matches('"').parse::<f64>().ok())
+}
+
+/// 前回終了時の保有ポジション（ペーパー決済の継続と判断ログとの対応付けのため）
+fn load_saved_positions(db_path: &std::path::Path) -> Vec<Position> {
+    match Db::open(db_path).and_then(|db| db.positions()) {
+        Ok(positions) => {
+            if !positions.is_empty() {
+                info!(count = positions.len(), "Restored open positions from SQLite");
+            }
+            positions
+        }
+        Err(e) => {
+            warn!("Failed to load positions from SQLite: {e:#}");
+            Vec::new()
+        }
+    }
 }
 
 fn load_saved_tokens(db_path: &std::path::Path) -> Option<TokenSet> {
@@ -75,9 +89,10 @@ impl Default for AppState {
 
 impl AppState {
     pub fn new() -> Self {
-        let (metrics, positions, trades, cot_logs, lessons) = Self::initial_data();
+        let metrics = Self::initial_metrics();
 
         let db_path = PathBuf::from(crate::storage::DEFAULT_DB_PATH);
+        let positions = load_saved_positions(&db_path);
         // SQLite に保存済みのトークンがあれば .env の値より優先する（自動更新で .env は古くなるため）
         let initial_config = CTraderConfig::from_env().ok().map(|cfg| match load_saved_tokens(&db_path) {
             Some(tokens) => {
@@ -91,14 +106,12 @@ impl AppState {
             bot_state: Arc::new(RwLock::new(BotState::Running)),
             metrics: Arc::new(RwLock::new(metrics)),
             positions: Arc::new(RwLock::new(positions)),
-            trades: Arc::new(RwLock::new(trades)),
-            cot_logs: Arc::new(RwLock::new(cot_logs)),
-            lessons: Arc::new(RwLock::new(lessons)),
             ctrader_service: Arc::new(RwLock::new(None)),
             ctrader_config: Arc::new(RwLock::new(initial_config)),
             available_accounts: Arc::new(RwLock::new(Vec::new())),
             latest_snapshot: Arc::new(RwLock::new(None)),
             db_path,
+            positions_persist_lock: Arc::new(tokio::sync::Mutex::new(())),
             guard_config: Arc::new(RwLock::new(GuardConfig::load_or_default(DEFAULT_GUARD_CONFIG_PATH))),
             plan_book: Arc::new(RwLock::new(PlanBook::default())),
             llm: Arc::new(LlmClient::new(LlmClientConfig::default())),
@@ -334,13 +347,52 @@ impl AppState {
         Ok(())
     }
 
-    /// 起動時の初期状態。ダミーデータは持たず、ペーパー口座の初期残高のみ設定する
+    /// SQLite を開いて `f` を専用スレッドで実行する
+    pub async fn with_db<T, F>(&self, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Db) -> Result<T> + Send + 'static,
+    {
+        let path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || f(&mut Db::open(path)?)).await?
+    }
+
+    /// 現在の保有ポジションを SQLite に書き出す。`positions` を変更したら呼ぶ
+    pub async fn persist_positions(&self) {
+        let _serial = self.positions_persist_lock.lock().await;
+        let snapshot = self.positions.read().await.clone();
+        if let Err(e) = self.with_db(move |db| db.replace_positions(&snapshot)).await {
+            error!("Failed to persist positions to SQLite: {e:#}");
+        }
+    }
+
+    /// 決済履歴を SQLite に記録する
+    pub async fn record_trades(&self, trades: Vec<TradeHistory>) {
+        if trades.is_empty() {
+            return;
+        }
+        let res = self
+            .with_db(move |db| trades.iter().try_for_each(|t| db.insert_trade(t)))
+            .await;
+        if let Err(e) = res {
+            error!("Failed to record trades to SQLite: {e:#}");
+        }
+    }
+
+    /// 判断ログを SQLite に記録する
+    pub async fn record_cot_log(&self, log: CoTLog) {
+        if let Err(e) = self.with_db(move |db| db.insert_cot_log(&log)).await {
+            error!("Failed to record CoT log to SQLite: {e:#}");
+        }
+    }
+
+    /// 起動時の口座メトリクス。ペーパー口座の初期残高のみ設定する
     /// （`NTRADE_PAPER_BALANCE`、未指定なら cTrader 接続まで仮に 1,000,000）。
-    fn initial_data() -> (AccountMetrics, Vec<Position>, Vec<TradeHistory>, Vec<CoTLog>, Vec<LessonLearned>) {
+    fn initial_metrics() -> AccountMetrics {
         // cTrader 接続後はブローカー残高で上書きされる（`sync_broker_account`）
         let balance = paper_balance_override().unwrap_or(1_000_000.0);
 
-        let metrics = AccountMetrics {
+        AccountMetrics {
             bot_state: BotState::Running,
             balance,
             equity: balance,
@@ -364,8 +416,6 @@ impl AppState {
                 environment: "DEMO".to_string(),
                 account_number: "未連携".to_string(),
             },
-        };
-
-        (metrics, Vec::new(), Vec::new(), Vec::new(), Vec::new())
+        }
     }
 }

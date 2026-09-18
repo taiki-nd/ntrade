@@ -1,8 +1,10 @@
 import {
   AccountMetrics,
   BotState,
+  CoTDetail,
   CoTLog,
   LessonLearned,
+  Page,
   Position,
   TradeHistory,
 } from "@/types/trading";
@@ -60,6 +62,19 @@ async function request<T>(
   }
 }
 
+export interface PageParams {
+  limit?: number;
+  offset?: number;
+}
+
+function toQuery(params: PageParams): string {
+  const q = new URLSearchParams();
+  if (params.limit !== undefined) q.set("limit", String(params.limit));
+  if (params.offset !== undefined) q.set("offset", String(params.offset));
+  const s = q.toString();
+  return s ? `?${s}` : "";
+}
+
 export const tradingApi = {
   /**
    * ボットおよび口座ステータスの取得
@@ -104,17 +119,24 @@ export const tradingApi = {
   },
 
   /**
-   * 約定・決済履歴一覧の取得
+   * 決済履歴の取得（新しい順・ページング）
    */
-  async getTrades(): Promise<ApiResponse<TradeHistory[]>> {
-    return await request<ApiResponse<TradeHistory[]>>("/api/trades");
+  async getTrades(params: PageParams = {}): Promise<ApiResponse<Page<TradeHistory>>> {
+    return await request<ApiResponse<Page<TradeHistory>>>(`/api/trades${toQuery(params)}`);
   },
 
   /**
-   * LLM思考プロセス（CoT）ログ一覧の取得
+   * LLM思考プロセス（CoT）ログの取得（新しい順・ページング）
    */
-  async getCoTLogs(): Promise<ApiResponse<CoTLog[]>> {
-    return await request<ApiResponse<CoTLog[]>>("/api/cot");
+  async getCoTLogs(params: PageParams = {}): Promise<ApiResponse<Page<CoTLog>>> {
+    return await request<ApiResponse<Page<CoTLog>>>(`/api/cot${toQuery(params)}`);
+  },
+
+  /**
+   * 判断1件と、そこから建てたポジション・決済履歴の取得
+   */
+  async getCoTDetail(id: string): Promise<ApiResponse<CoTDetail>> {
+    return await request<ApiResponse<CoTDetail>>(`/api/cot/${encodeURIComponent(id)}`);
   },
 
   /**

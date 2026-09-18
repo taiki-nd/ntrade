@@ -23,6 +23,9 @@ pub struct Position {
     pub pnl_amount: f64,
     pub open_time: String,
     pub invalidation_reason: String,
+    /// このポジションを建てた判断（CoT ログ）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cot_log_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,6 +165,42 @@ pub struct LessonLearned {
 }
 
 // リクエスト & レスポンス用構造体
+
+pub const DEFAULT_PAGE_LIMIT: usize = 20;
+pub const MAX_PAGE_LIMIT: usize = 200;
+
+/// 一覧 API のページング指定（`?limit=20&offset=0`）
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PageQuery {
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    /// ペアで絞り込む（CoT ログのみ）
+    pub symbol: Option<String>,
+    /// 判断 ID で絞り込む（決済履歴のみ）
+    pub cot_log_id: Option<String>,
+}
+
+impl PageQuery {
+    pub fn limit(&self) -> usize {
+        self.limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT)
+    }
+
+    pub fn offset(&self) -> usize {
+        self.offset.unwrap_or(0)
+    }
+}
+
+/// 1件の判断と、そこから生まれた取引
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoTDetail {
+    pub log: CoTLog,
+    /// 決済済みの取引
+    pub trades: Vec<TradeHistory>,
+    /// 保有中のポジション
+    pub open_positions: Vec<Position>,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct UpdateBotStateRequest {

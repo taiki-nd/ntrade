@@ -67,7 +67,7 @@ async fn guard_context(state: &AppState, pair: &str) -> GuardContext {
     }
 }
 
-async fn place_paper_order(state: &AppState, req: OrderRequest, reason: &str) -> anyhow::Result<Position> {
+async fn place_paper_order(state: &AppState, req: OrderRequest, reason: &str, cot_log_id: &str) -> anyhow::Result<Position> {
     let sink = state.order_sink.read().await.clone();
     let receipt = sink.place_market(&req).await?;
     let entry = receipt.filled_price.unwrap_or(req.entry_hint);
@@ -84,8 +84,10 @@ async fn place_paper_order(state: &AppState, req: OrderRequest, reason: &str) ->
         pnl_amount: 0.0,
         open_time: Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
         invalidation_reason: reason.to_string(),
+        cot_log_id: Some(cot_log_id.to_string()),
     };
     state.positions.write().await.push(pos.clone());
+    state.persist_positions().await;
     Ok(pos)
 }
 
@@ -103,6 +105,9 @@ async fn process_pending_plans(state: &AppState, pair: &str, bundle: &SnapshotBu
             let verdict = guard::evaluate_plan_trigger(&p.plan, *entry, &bundle.snapshot, &ctx, &cfg);
             let balance = state.metrics.read().await.balance;
             let sl_pips = (entry - p.plan.stop_loss.unwrap_or(*entry)).abs() / bundle.snapshot.pip_size.max(1e-9);
+            let trigger_cot_id = format!("cot-plan-{}", Utc::now().timestamp_millis());
+            // ポジションはプランを立てた LLM 判断に紐付ける（成立ログは機械的な記録のため）
+            let origin_cot_id = p.cot_log_id.clone().unwrap_or_else(|| trigger_cot_id.clone());
             let executed = if verdict.passed {
                 let req = OrderRequest {
                     pair: pair.to_string(),
@@ -113,12 +118,12 @@ async fn process_pending_plans(state: &AppState, pair: &str, bundle: &SnapshotBu
                     take_profit: p.plan.take_profit.unwrap_or_default(),
                     reason: format!("conditional plan {} triggered: {}", p.id, p.plan.wait_for),
                 };
-                place_paper_order(state, req, &p.plan.invalidate_if).await.is_ok()
+                place_paper_order(state, req, &p.plan.invalidate_if, &origin_cot_id).await.is_ok()
             } else {
                 false
             };
             let log = CoTLog {
-                id: format!("cot-plan-{}", Utc::now().timestamp_millis()),
+                id: trigger_cot_id,
                 timestamp: Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
                 symbol: pair.to_string(),
                 action: action_str(p.plan.then_action),
@@ -128,7 +133,7 @@ async fn process_pending_plans(state: &AppState, pair: &str, bundle: &SnapshotBu
                 stop_loss: p.plan.stop_loss,
                 take_profit: p.plan.take_profit,
                 risk_reward_ratio: None,
-                macro_context: format!("条件付きプラン {} が成立（元ログ: {:?}）", p.id, p.cot_log_id),
+                macro_context: format!("条件付きプラン {} が成立（元の判断: {}）", p.id, p.cot_log_id.as_deref().unwrap_or("不明")),
                 order_flow: p.plan.wait_for.clone(),
                 invalidation: p.plan.invalidate_if.clone(),
                 conflicts: String::new(),
@@ -137,7 +142,7 @@ async fn process_pending_plans(state: &AppState, pair: &str, bundle: &SnapshotBu
                 executed,
                 spread_pips: bundle.snapshot.spread_pips,
             };
-            state.cot_logs.write().await.insert(0, log);
+            state.record_cot_log(log).await;
         } else {
             info!(?event, "plan event");
         }
@@ -160,7 +165,8 @@ pub async fn run_decision_cycle(state: &AppState, pair: &str) -> anyhow::Result<
     let plan_events = process_pending_plans(state, pair, &bundle).await?;
 
     // 3. LLM 判断
-    let lessons: Vec<String> = state.lessons.read().await.iter().filter(|l| l.active).map(|l| l.rule.clone()).collect();
+    let lessons: Vec<String> =
+        state.with_db(|db| db.lessons()).await?.into_iter().filter(|l| l.active).map(|l| l.rule).collect();
     let prompt = PromptBuilder::new().with_lessons(lessons).build(&bundle.snapshot, &bundle.charts);
     let decision = state.llm.infer(&prompt).await?;
 
@@ -192,7 +198,7 @@ pub async fn run_decision_cycle(state: &AppState, pair: &str) -> anyhow::Result<
                 take_profit: tp,
                 reason: cot_id.clone(),
             };
-            executed = place_paper_order(state, req, &decision.analysis.invalidation).await.is_ok();
+            executed = place_paper_order(state, req, &decision.analysis.invalidation, &cot_id).await.is_ok();
         } else if let Some(plan) = decision.conditional_plan.clone().filter(|p| p.then_action != Action::Hold) {
             plan_id = Some(state.plan_book.write().await.add(pair, plan, Some(cot_id.clone())));
         }
@@ -223,7 +229,7 @@ pub async fn run_decision_cycle(state: &AppState, pair: &str) -> anyhow::Result<
         executed,
         spread_pips: bundle.snapshot.spread_pips,
     };
-    state.cot_logs.write().await.insert(0, log);
+    state.record_cot_log(log).await;
     info!(action = ?decision.action, guard = %verdict.summary(), executed, ?plan_id, "decision cycle done");
 
     Ok(DecideResponse {

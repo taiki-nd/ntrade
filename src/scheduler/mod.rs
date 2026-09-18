@@ -91,8 +91,10 @@ pub async fn after_cycle(state: &AppState, pair: &str) -> anyhow::Result<()> {
         *positions = open;
         closed
     };
+    // 含み損益の更新も含めて毎回書き出す
+    state.persist_positions().await;
+    state.record_trades(closed.clone()).await;
     if !closed.is_empty() {
-        let mut trades = state.trades.write().await;
         let mut metrics = state.metrics.write().await;
         for t in &closed {
             metrics.balance += t.pnl_amount;
@@ -107,7 +109,6 @@ pub async fn after_cycle(state: &AppState, pair: &str) -> anyhow::Result<()> {
             } else {
                 0.0
             };
-            trades.insert(0, t.clone());
             info!(id = %t.id, ?t.close_reason, pnl_pips = t.pnl_pips, "paper position closed");
         }
     }
@@ -118,12 +119,16 @@ pub async fn after_cycle(state: &AppState, pair: &str) -> anyhow::Result<()> {
         if crate::server::state::live_orders_enabled() {
             match ctrader.get_open_positions().await {
                 Ok(broker) => {
-                    let mut positions = state.positions.write().await;
-                    // ブローカーに無い実ポジションは決済済みとみなして除去
-                    let before = positions.len();
-                    positions.retain(|p| p.id.starts_with("paper-") || broker.iter().any(|b| b.position_id.to_string() == p.id));
-                    if positions.len() != before {
-                        info!("removed {} positions closed on broker side", before - positions.len());
+                    let removed = {
+                        let mut positions = state.positions.write().await;
+                        // ブローカーに無い実ポジションは決済済みとみなして除去
+                        let before = positions.len();
+                        positions.retain(|p| p.id.starts_with("paper-") || broker.iter().any(|b| b.position_id.to_string() == p.id));
+                        before - positions.len()
+                    };
+                    if removed > 0 {
+                        info!("removed {} positions closed on broker side", removed);
+                        state.persist_positions().await;
                     }
                 }
                 Err(e) => warn!("reconcile failed: {e:#}"),
@@ -142,29 +147,41 @@ pub async fn after_cycle(state: &AppState, pair: &str) -> anyhow::Result<()> {
             }
         };
         tokio::spawn(async move {
-            let cot = t.cot_log_id.as_ref().and_then(|id| {
-                futures_lite_block(state.cot_logs.clone(), id.clone())
-            });
+            let cot = match t.cot_log_id.clone() {
+                Some(id) => state.with_db(move |db| db.cot_log(&id)).await.unwrap_or_else(|e| {
+                    warn!(trade = %t.id, "failed to load CoT log for reflection: {e:#}");
+                    None
+                }),
+                None => None,
+            };
             match reflection::reflect(&state.llm, &t, cot.as_ref(), &post_bars).await {
                 Ok(r) if !r.decision_was_sound && !r.lesson.trim().is_empty() => {
-                    let mut lessons = state.lessons.write().await;
-                    lessons.insert(
-                        0,
-                        LessonLearned {
-                            id: format!("les-{}", Utc::now().timestamp_millis()),
-                            created_at: Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-                            symbol: t.symbol.clone(),
-                            rule: r.lesson.clone(),
-                            context: r.root_cause.clone(),
-                            active: false,
-                            trigger_trade_id: Some(t.id.clone()),
-                            category: r.category.clone(),
-                        },
-                    );
-                    if let Some(id) = reflection::maybe_adopt(&mut lessons, &t.symbol, &r.category, LESSON_ADOPT_THRESHOLD, LESSON_MAX_ACTIVE) {
-                        info!(lesson = %id, category = %r.category, "lesson adopted (threshold reached)");
-                    } else {
-                        info!(category = %r.category, "lesson candidate stored (inactive)");
+                    let lesson = LessonLearned {
+                        id: format!("les-{}", Utc::now().timestamp_millis()),
+                        created_at: Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                        symbol: t.symbol.clone(),
+                        rule: r.lesson.clone(),
+                        context: r.root_cause.clone(),
+                        active: false,
+                        trigger_trade_id: Some(t.id.clone()),
+                        category: r.category.clone(),
+                    };
+                    let (symbol, category) = (t.symbol.clone(), r.category.clone());
+                    let adopted = state
+                        .with_db(move |db| {
+                            db.upsert_lesson(&lesson)?;
+                            let mut lessons = db.lessons()?;
+                            let adopted = reflection::maybe_adopt(&mut lessons, &symbol, &category, LESSON_ADOPT_THRESHOLD, LESSON_MAX_ACTIVE);
+                            if let Some(l) = adopted.as_ref().and_then(|id| lessons.iter().find(|l| &l.id == id)) {
+                                db.upsert_lesson(l)?;
+                            }
+                            Ok(adopted)
+                        })
+                        .await;
+                    match adopted {
+                        Ok(Some(id)) => info!(lesson = %id, category = %r.category, "lesson adopted (threshold reached)"),
+                        Ok(None) => info!(category = %r.category, "lesson candidate stored (inactive)"),
+                        Err(e) => warn!(trade = %t.id, "failed to store lesson: {e:#}"),
                     }
                 }
                 Ok(r) => info!(trade = %t.id, sound = r.decision_was_sound, "reflection: no lesson"),
@@ -173,14 +190,6 @@ pub async fn after_cycle(state: &AppState, pair: &str) -> anyhow::Result<()> {
         });
     }
     Ok(())
-}
-
-/// CoT ログを ID で同期的に引く小さなヘルパー（spawn 内で使う）
-fn futures_lite_block(
-    logs: std::sync::Arc<tokio::sync::RwLock<Vec<crate::server::types::CoTLog>>>,
-    id: String,
-) -> Option<crate::server::types::CoTLog> {
-    logs.try_read().ok().and_then(|l| l.iter().find(|c| c.id == id).cloned())
 }
 
 #[cfg(test)]

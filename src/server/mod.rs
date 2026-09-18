@@ -35,6 +35,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/trades", get(handlers::trades::get_trades))
         // 5. LLM思考ログ (CoT)
         .route("/api/cot", get(handlers::cot::get_cot_logs))
+        .route("/api/cot/{id}", get(handlers::cot::get_cot_detail))
         // 6. 自己反省ルール (教訓CRUD)
         .route("/api/lessons", get(handlers::lessons::get_lessons))
         .route("/api/lessons", post(handlers::lessons::create_lesson))

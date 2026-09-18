@@ -62,7 +62,7 @@ pub fn settle(positions: Vec<Position>, pair: &str, bar: &CandleBar) -> (Vec<Pos
             close_reason: reason,
             open_time: p.open_time.clone(),
             close_time: bar.timestamp.format("%Y-%m-%d %H:%M:%S").to_string(),
-            cot_log_id: Some(p.invalidation_reason.clone()).filter(|s| s.starts_with("cot-")),
+            cot_log_id: p.cot_log_id.clone(),
         });
     }
     let _ = Utc::now();
@@ -87,7 +87,8 @@ mod tests {
             pnl_pips: 0.0,
             pnl_amount: 0.0,
             open_time: "t".into(),
-            invalidation_reason: "cot-9".into(),
+            invalidation_reason: "5M終値が154.10を割り込んだら無効".into(),
+            cot_log_id: Some("cot-9".into()),
         }
     }
 

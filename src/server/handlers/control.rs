@@ -27,7 +27,6 @@ pub async fn emergency_stop(
     info!("EXECUTING EMERGENCY STOP: Closing all open positions...");
 
     let mut positions_lock = state.positions.write().await;
-    let mut trades_lock = state.trades.write().await;
     let mut metrics_lock = state.metrics.write().await;
     let mut bot_state_lock = state.bot_state.write().await;
 
@@ -46,11 +45,11 @@ pub async fn emergency_stop(
     let now_str = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let count = positions_lock.len();
     let mut total_pnl = 0.0;
+    let mut closed = Vec::with_capacity(count);
 
-    for p in positions_lock.drain(..) {
+    for (idx, p) in positions_lock.drain(..).enumerate() {
         total_pnl += p.pnl_amount;
 
-        let next_idx = trades_lock.len();
         // cTrader 接続があれば実ブローカー決済リクエスト送信
         if let Some(ref ctrader) = ctrader_opt {
             if let Ok(_pos_id) = p.id.replace("pos-", "").parse::<i64>() {
@@ -66,25 +65,22 @@ pub async fn emergency_stop(
             }
         }
 
-        trades_lock.insert(
-            0,
-            TradeHistory {
-                id: format!("trd-emerg-{}-{}", Utc::now().timestamp_millis(), next_idx),
-                symbol: p.symbol,
-                side: p.side,
-                volume_lots: p.volume_lots,
-                entry_price: p.entry_price,
-                close_price: p.current_price,
-                stop_loss: p.stop_loss,
-                take_profit: p.take_profit,
-                pnl_pips: p.pnl_pips,
-                pnl_amount: p.pnl_amount,
-                close_reason: CloseReason::Manual,
-                open_time: p.open_time,
-                close_time: now_str.clone(),
-                cot_log_id: None,
-            },
-        );
+        closed.push(TradeHistory {
+            id: format!("trd-emerg-{}-{}", Utc::now().timestamp_millis(), idx),
+            symbol: p.symbol,
+            side: p.side,
+            volume_lots: p.volume_lots,
+            entry_price: p.entry_price,
+            close_price: p.current_price,
+            stop_loss: p.stop_loss,
+            take_profit: p.take_profit,
+            pnl_pips: p.pnl_pips,
+            pnl_amount: p.pnl_amount,
+            close_reason: CloseReason::Manual,
+            open_time: p.open_time,
+            close_time: now_str.clone(),
+            cot_log_id: p.cot_log_id,
+        });
     }
 
     // 口座メトリクスの更新
@@ -95,6 +91,9 @@ pub async fn emergency_stop(
     metrics_lock.unrealized_pnl = 0.0;
     metrics_lock.daily_pnl += total_pnl;
     metrics_lock.total_trades_today += count as u32;
+    drop((positions_lock, metrics_lock, bot_state_lock));
+    state.persist_positions().await;
+    state.record_trades(closed).await;
 
     let msg = format!(
         "緊急全決済を実行しました: {} 件のポジションを成行決済し、自動売買を一時停止しました（確定損益: ¥{:.0}）",

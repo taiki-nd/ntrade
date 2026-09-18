@@ -36,6 +36,8 @@ pub async fn close_position(
     };
 
     let target = positions_lock.remove(index);
+    drop(positions_lock);
+    state.persist_positions().await;
     let now_str = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
     // cTrader への実発注（接続時）
@@ -69,14 +71,10 @@ pub async fn close_position(
         close_reason: CloseReason::Manual,
         open_time: target.open_time,
         close_time: now_str,
-        cot_log_id: None,
+        cot_log_id: target.cot_log_id,
     };
 
-    // 取引履歴に追加
-    {
-        let mut trades_lock = state.trades.write().await;
-        trades_lock.insert(0, trade.clone());
-    }
+    state.record_trades(vec![trade.clone()]).await;
 
     // 口座メトリクス更新
     {
