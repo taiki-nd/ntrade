@@ -140,6 +140,8 @@ pub fn volume_to_lots(volume: i64) -> f64 {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AccountSummary {
     pub account_id: i64,
+    /// cTrader アプリに表示される口座番号（ログイン番号）
+    pub trader_login: Option<i64>,
     pub balance: f64,
     pub leverage: Option<f64>,
     pub is_live: bool,

@@ -29,6 +29,9 @@ async fn main() -> Result<()> {
         state_for_init.init_ctrader_connection().await;
     });
 
+    // cTrader トークンの期限監視・自動更新（SQLite に保存）と切断時の再接続
+    tokio::spawn(state.clone().run_token_refresh_loop());
+
     // 5分足確定ごとの常駐スケジューラ（NTRADE_SCHEDULER=off で無効化）
     if std::env::var("NTRADE_SCHEDULER").map(|v| v == "off").unwrap_or(false) {
         info!("Scheduler disabled (NTRADE_SCHEDULER=off)");

@@ -30,6 +30,7 @@ pub async fn guard_config(State(state): State<AppState>) -> Json<ApiResponse<Gua
 /// エンジンの稼働設定（読み取り専用）
 pub async fn runtime_info(State(state): State<AppState>) -> Json<ApiResponse<RuntimeInfo>> {
     let llm = state.llm.config();
+    let ctrader = state.ctrader_config.read().await.clone();
     let info = RuntimeInfo {
         order_mode: if live_orders_enabled() { "live".into() } else { "paper".into() },
         scheduler_enabled: !std::env::var("NTRADE_SCHEDULER").map(|v| v.trim_matches('"') == "off").unwrap_or(false),
@@ -44,6 +45,9 @@ pub async fn runtime_info(State(state): State<AppState>) -> Json<ApiResponse<Run
         llm_cli: llm.cli_binary.clone(),
         llm_timeout_secs: llm.timeout_secs,
         env_file_present: std::path::Path::new(".env").exists(),
+        ctrader_token_present: ctrader.as_ref().is_some_and(|c| !c.access_token.is_empty()),
+        ctrader_refresh_token_present: ctrader.as_ref().is_some_and(|c| c.refresh_token.is_some()),
+        ctrader_token_expires_at: ctrader.and_then(|c| c.token_expires_at).map(crate::storage::fmt_ts),
     };
     Json(ApiResponse::ok(info))
 }

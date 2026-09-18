@@ -95,7 +95,8 @@ impl LlmClient {
     }
 
     async fn execute_cli_with_schema(&self, prompt: &str, schema: &str) -> Result<String> {
-        let mut cmd = Command::new(&self.config.cli_binary);
+        let binary_path = resolve_cli_path(&self.config.cli_binary);
+        let mut cmd = Command::new(binary_path);
         cmd.arg("-p")
             .arg("--output-format")
             .arg("json")
@@ -207,4 +208,25 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         format!("{}…", s.chars().take(max).collect::<String>())
     }
+}
+
+/// CLI バイナリのパス解決。
+/// 1. 環境変数 `NTRADE_LLM_CLI` があれば最優先
+/// 2. `~/.local/bin/{binary}` が存在すればそれを使用（古い nodenv 等の shim より優先）
+/// 3. それ以外は指定された名前で PATH 検索
+fn resolve_cli_path(binary: &str) -> std::path::PathBuf {
+    if let Ok(custom) = std::env::var("NTRADE_LLM_CLI") {
+        if !custom.trim().is_empty() {
+            return std::path::PathBuf::from(custom.trim());
+        }
+    }
+    if !binary.contains('/') {
+        if let Ok(home) = std::env::var("HOME") {
+            let local_bin = std::path::PathBuf::from(home).join(".local/bin").join(binary);
+            if local_bin.is_file() {
+                return local_bin;
+            }
+        }
+    }
+    std::path::PathBuf::from(binary)
 }

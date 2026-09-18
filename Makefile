@@ -1,5 +1,5 @@
 SHELL := /bin/zsh
-export PATH := $(HOME)/.nodenv/shims:$(PATH)
+export PATH := $(HOME)/.local/bin:$(HOME)/.nodenv/shims:$(PATH)
 
 .PHONY: help install dev ui engine test poc ctrader build clean step4 replay-fetch replay-check replay-run replay-report replay-list
 

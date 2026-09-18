@@ -306,6 +306,7 @@ impl CTraderService {
         let scale = 10f64.powi(digits as i32);
         Ok(AccountSummary {
             account_id: t.ctid_trader_account_id,
+            trader_login: t.trader_login,
             balance: t.balance as f64 / scale,
             leverage: t.leverage_in_cents.map(|l| l as f64 / 100.0),
             is_live: self.config.is_live,
@@ -393,30 +394,6 @@ impl CTraderService {
                     .context("Failed to place market order")
             }
         }
-    }
-
-    /// Refresh Token を用いて Access Token を自動更新
-    pub async fn refresh_access_token(&mut self) -> Result<String> {
-        let refresh_token = self
-            .config
-            .refresh_token
-            .as_ref()
-            .ok_or_else(|| anyhow!("Refresh token is not configured in CTRADER_REFRESH_TOKEN"))?;
-
-        info!("Refreshing cTrader access token...");
-        let res = self
-            .client
-            .refresh_token(refresh_token)
-            .await
-            .context("Failed to refresh token with cTrader API")?;
-
-        info!("Access token refreshed successfully (expires_in: {:?})", res.expires_in);
-        self.config.access_token = res.access_token.clone();
-        if !res.refresh_token.is_empty() {
-            self.config.refresh_token = Some(res.refresh_token);
-        }
-
-        Ok(res.access_token)
     }
 
     /// 現在の口座設定を取得

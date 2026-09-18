@@ -271,6 +271,10 @@ export interface RuntimeInfo {
   dbPath: string;
   llmCli: string;
   llmTimeoutSecs: number;
+  ctraderTokenPresent: boolean;
+  ctraderRefreshTokenPresent: boolean;
+  /** Access Token の失効時刻（UTC, "YYYY-MM-DD HH:MM:SS"）。不明なら null */
+  ctraderTokenExpiresAt: string | null;
   envFilePresent: boolean;
 }
 

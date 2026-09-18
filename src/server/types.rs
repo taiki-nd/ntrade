@@ -139,6 +139,12 @@ pub struct RuntimeInfo {
     pub llm_cli: String,
     pub llm_timeout_secs: u64,
     pub env_file_present: bool,
+    /// cTrader の認証情報（トークン）が設定されているか
+    pub ctrader_token_present: bool,
+    /// Refresh Token があり自動更新できるか
+    pub ctrader_refresh_token_present: bool,
+    /// Access Token の失効時刻（UTC）。不明なら None
+    pub ctrader_token_expires_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

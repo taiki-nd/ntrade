@@ -1,18 +1,17 @@
 use axum::{extract::State, response::Json};
 use serde::Deserialize;
 use std::env;
-use std::sync::Arc;
 use tracing::{error, info, warn};
 
-use crate::ctrader::{CTraderConfig, CTraderService};
+use crate::ctrader::{CTraderConfig, CTraderService, TokenSet};
 use crate::server::state::AppState;
 use crate::server::types::{
     AccountInfo, ApiResponse, OAuthExchangeRequest, OAuthUrlResponse, SelectAccountRequest,
 };
 
 const DEFAULT_REDIRECT_URI: &str = "http://localhost:3000/auth/ctrader/callback";
-const SPOTWARE_AUTH_URL: &str = "https://openapi.ctrader.com/apps/auth";
-const SPOTWARE_TOKEN_URL: &str = "https://openapi.ctrader.com/apps/token";
+const SPOTWARE_AUTH_URL: &str = "https://id.ctrader.com/my/settings/openapi/grantingaccess/";
+use crate::ctrader::token::SPOTWARE_TOKEN_URL;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -23,7 +22,8 @@ struct SpotwareTokenResponse {
     pub token_type: Option<String>,
     pub expires_in: Option<i64>,
     pub error_code: Option<String>,
-    pub error_description: Option<String>,
+    #[serde(alias = "errorDescription")]
+    pub description: Option<String>,
 }
 
 /// GET /api/auth/ctrader/url
@@ -40,10 +40,14 @@ pub async fn get_oauth_url(State(_state): State<AppState>) -> Json<ApiResponse<O
         });
     }
 
-    let url = format!(
-        "{}?client_id={}&redirect_uri={}&scope=trading,accounts",
-        SPOTWARE_AUTH_URL, client_id, redirect_uri
-    );
+    // scope は "trading"（発注可）か "accounts"（閲覧のみ）のどちらか1つ
+    let url = match reqwest::Url::parse_with_params(
+        SPOTWARE_AUTH_URL,
+        &[("client_id", client_id.as_str()), ("redirect_uri", redirect_uri.as_str()), ("scope", "trading")],
+    ) {
+        Ok(u) => u.to_string(),
+        Err(e) => return Json(ApiResponse::err(format!("認可URLの生成に失敗しました: {e}"))),
+    };
 
     Json(ApiResponse::ok(OAuthUrlResponse {
         url,
@@ -97,7 +101,7 @@ pub async fn exchange_oauth_code(
     ];
 
     info!("Sending token request to Spotware: {}", SPOTWARE_TOKEN_URL);
-    let resp = match http_client.post(SPOTWARE_TOKEN_URL).form(&token_req).send().await {
+    let resp = match http_client.get(SPOTWARE_TOKEN_URL).query(&token_req).send().await {
         Ok(r) => r,
         Err(e) => {
             error!("Failed to request token from Spotware: {:?}", e);
@@ -121,7 +125,7 @@ pub async fn exchange_oauth_code(
         }
     };
 
-    if let Some(err_desc) = token_data.error_description {
+    if let Some(err_desc) = token_data.description.or(token_data.error_code) {
         warn!("Spotware returned error: {:?}", err_desc);
         return Json(ApiResponse {
             success: false,
@@ -141,18 +145,18 @@ pub async fn exchange_oauth_code(
         }
     };
 
-    let refresh_token = token_data.refresh_token;
+    let tokens = TokenSet {
+        access_token,
+        refresh_token: token_data.refresh_token.filter(|t| !t.is_empty()),
+        expires_at: token_data.expires_in.map(|s| chrono::Utc::now().timestamp() + s),
+    };
+    if tokens.refresh_token.is_none() {
+        warn!("Spotware did not return a refresh token; automatic token refresh will be unavailable");
+    }
 
-    info!("Access token received successfully! Updating .env file...");
-    // 1. .env の更新 & 保存
-    if let Err(e) = AppState::update_env_file("CTRADER_ACCESS_TOKEN", &access_token) {
-        warn!("Failed to update CTRADER_ACCESS_TOKEN in .env: {:?}", e);
-    }
-    if let Some(ref r_token) = refresh_token {
-        if let Err(e) = AppState::update_env_file("CTRADER_REFRESH_TOKEN", r_token) {
-            warn!("Failed to update CTRADER_REFRESH_TOKEN in .env: {:?}", e);
-        }
-    }
+    info!("Access token received successfully! Saving tokens to SQLite...");
+    // 1. トークンを SQLite に保存（以後の自動更新もここを更新する）
+    state.save_ctrader_tokens(&tokens).await;
 
     // 2. 取引口座一覧を取得し、cTrader サービスに即座に接続
     let env_mode = env::var("CTRADER_ENV").unwrap_or_else(|_| "DEMO".to_string());
@@ -166,13 +170,15 @@ pub async fn exchange_oauth_code(
         client_id: client_id.clone(),
         client_secret: client_secret.clone(),
         account_id,
-        access_token: access_token.clone(),
-        refresh_token: refresh_token.clone(),
+        access_token: String::new(),
+        refresh_token: None,
+        token_expires_at: None,
         is_live,
-    };
+    }
+    .with_tokens(&tokens);
 
     info!("Connecting to cTrader Open API with newly obtained token...");
-    match CTraderService::connect(config.clone()).await {
+    match CTraderService::connect(config).await {
         Ok(service) => {
             let actual_account_id = service.config().account_id;
             info!("Successfully connected to cTrader! Target account: {}", actual_account_id);
@@ -180,25 +186,7 @@ pub async fn exchange_oauth_code(
             // .env の口座番号も同期
             let _ = AppState::update_env_file("CTRADER_ACCOUNT_ID", &actual_account_id.to_string());
 
-            let service_arc = Arc::new(service);
-            {
-                let mut svc_lock = state.ctrader_service.write().await;
-                *svc_lock = Some(service_arc);
-            }
-            {
-                let mut cfg_lock = state.ctrader_config.write().await;
-                *cfg_lock = Some(config);
-            }
-            {
-                let mut m_lock = state.metrics.write().await;
-                m_lock.connection_status.ctrader = "connected".to_string();
-                m_lock.connection_status.environment = if is_live { "LIVE".to_string() } else { "DEMO".to_string() };
-                m_lock.connection_status.account_number = format!(
-                    "cTrader #{} ({})",
-                    actual_account_id,
-                    if is_live { "Live" } else { "Demo" }
-                );
-            }
+            state.install_ctrader(service, true).await;
 
             let accounts = vec![AccountInfo {
                 trader_login: actual_account_id,
@@ -245,27 +233,19 @@ pub async fn select_account(
 
     let _ = AppState::update_env_file("CTRADER_ACCOUNT_ID", &payload.account_id.to_string());
 
-    // 設定を再読み込みして再接続
-    if let Ok(config) = CTraderConfig::from_env() {
-        if let Ok(service) = CTraderService::connect(config.clone()).await {
-            let service_arc = Arc::new(service);
-            {
-                let mut svc_lock = state.ctrader_service.write().await;
-                *svc_lock = Some(service_arc);
-            }
-            {
-                let mut m_lock = state.metrics.write().await;
-                m_lock.connection_status.account_number = format!(
-                    "cTrader #{} ({})",
-                    payload.account_id,
-                    if config.is_live { "Live" } else { "Demo" }
-                );
-            }
-            return Json(ApiResponse::ok_msg(
-                format!("口座 #{} に切り替えました", payload.account_id),
-                "口座を切り替えました",
-            ));
-        }
+    // 現在の設定（SQLite 保存済みトークン込み）で口座だけ差し替えて再接続
+    let current = state.ctrader_config.read().await.clone();
+    let Some(mut config) = current.or_else(|| CTraderConfig::from_env().ok()) else {
+        return Json(ApiResponse::err("cTrader の認証情報がありません"));
+    };
+    config.account_id = payload.account_id;
+    if let Err(e) = state.connect_ctrader(config, true).await {
+        warn!("Account switch failed: {e:#}");
+    } else {
+        return Json(ApiResponse::ok_msg(
+            format!("口座 #{} に切り替えました", payload.account_id),
+            "口座を切り替えました",
+        ));
     }
 
     Json(ApiResponse::err("口座の切り替えに失敗しました"))

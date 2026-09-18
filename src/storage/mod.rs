@@ -1,11 +1,13 @@
-//! SQLite 永続化。ヒストリカルバーとリプレイ結果を保存する。
+//! SQLite 永続化。ヒストリカルバー・リプレイ結果・cTrader OAuth トークンを保存する。
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
-use crate::ctrader::{BarPeriod, CandleBar};
+use crate::ctrader::{BarPeriod, CandleBar, TokenSet};
+
+const CTRADER_PROVIDER: &str = "ctrader";
 
 pub const DEFAULT_DB_PATH: &str = "data/ntrade.db";
 
@@ -112,9 +114,44 @@ impl Db {
               action        TEXT NOT NULL,
               PRIMARY KEY (run_id, t)
             );
+            CREATE TABLE IF NOT EXISTS oauth_tokens (
+              provider      TEXT PRIMARY KEY,
+              access_token  TEXT NOT NULL,
+              refresh_token TEXT,
+              expires_at    INTEGER,
+              updated_at    INTEGER NOT NULL
+            );
             "#,
         )?;
         Ok(())
+    }
+
+    // -------------------------------------------------------------- tokens
+
+    pub fn save_ctrader_tokens(&self, tokens: &TokenSet) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO oauth_tokens (provider, access_token, refresh_token, expires_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                CTRADER_PROVIDER,
+                tokens.access_token,
+                tokens.refresh_token,
+                tokens.expires_at,
+                Utc::now().timestamp()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_ctrader_tokens(&self) -> Result<Option<TokenSet>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT access_token, refresh_token, expires_at FROM oauth_tokens WHERE provider = ?1",
+                params![CTRADER_PROVIDER],
+                |r| Ok(TokenSet { access_token: r.get(0)?, refresh_token: r.get(1)?, expires_at: r.get(2)? }),
+            )
+            .optional()?)
     }
 
     // ---------------------------------------------------------------- bars
@@ -410,5 +447,17 @@ mod tests {
         let d = db.decisions(id).unwrap();
         assert_eq!(d[0].outcome, "TP_HIT");
         assert_eq!(db.decided_ts(id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ctrader_tokens_roundtrip() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(db.load_ctrader_tokens().unwrap().is_none());
+        let mut t = TokenSet { access_token: "a1".into(), refresh_token: Some("r1".into()), expires_at: Some(100) };
+        db.save_ctrader_tokens(&t).unwrap();
+        t.access_token = "a2".into();
+        t.expires_at = None;
+        db.save_ctrader_tokens(&t).unwrap();
+        assert_eq!(db.load_ctrader_tokens().unwrap(), Some(t));
     }
 }
