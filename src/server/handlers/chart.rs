@@ -3,7 +3,7 @@ use axum::{
     http::{header, StatusCode},
     response::{IntoResponse, Json, Response},
 };
-use chrono::Utc;
+use anyhow::Context;
 use serde::Deserialize;
 use std::fs;
 use std::path::PathBuf;
@@ -13,7 +13,7 @@ use crate::ctrader::BarPeriod;
 use crate::server::state::AppState;
 use crate::server::types::ApiResponse;
 use crate::snapshot::{
-    mock, AccountState, MarketSnapshot, OpenPositionSummary, RecentDecision, SnapshotInput, SnapshotPipeline,
+    AccountState, MarketSnapshot, OpenPositionSummary, RecentDecision, SnapshotInput, SnapshotPipeline,
 };
 
 #[derive(Debug, Deserialize)]
@@ -108,28 +108,13 @@ pub async fn generate_snapshot_internal(state: &AppState, pair: &str) -> anyhow:
         lock.clone()
     };
 
-    let live = if let Some(ctrader) = ctrader_opt {
-        info!("Fetching real trendbars from connected cTrader...");
-        match (
-            ctrader.get_trendbars(pair, BarPeriod::H4, 60).await,
-            ctrader.get_trendbars(pair, BarPeriod::H1, 60).await,
-            ctrader.get_trendbars(pair, BarPeriod::M15, 60).await,
-            ctrader.get_trendbars(pair, BarPeriod::M5, 60).await,
-        ) {
-            (Ok(b4), Ok(b1), Ok(b15), Ok(b5)) => Some((b4, b1, b15, b5)),
-            _ => None,
-        }
-    } else {
-        None
-    };
-
-    let (b4h, b1h, b15m, b5m) = match live {
-        Some(bars) => bars,
-        None => {
-            warn!("Using simulated bars (cTrader unavailable)");
-            mock::simulate_multi_timeframe(Utc::now(), 154.0)
-        }
-    };
+    // 実データが取れないときは作らない（模擬データのチャートを LLM の判断や画面に使わないため）
+    let ctrader = ctrader_opt.ok_or_else(|| anyhow::anyhow!("cTrader is not connected; snapshot needs live bars"))?;
+    info!("Fetching real trendbars from connected cTrader...");
+    let b4h = ctrader.get_trendbars(pair, BarPeriod::H4, 60).await.context("failed to fetch 4H bars")?;
+    let b1h = ctrader.get_trendbars(pair, BarPeriod::H1, 60).await.context("failed to fetch 1H bars")?;
+    let b15m = ctrader.get_trendbars(pair, BarPeriod::M15, 60).await.context("failed to fetch 15M bars")?;
+    let b5m = ctrader.get_trendbars(pair, BarPeriod::M5, 60).await.context("failed to fetch 5M bars")?;
 
     let spread_pips = {
         let m = state.metrics.read().await;
