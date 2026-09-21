@@ -139,7 +139,8 @@ impl LlmClient {
         match Self::extract_decision_json(raw).and_then(|v| {
             serde_json::from_value::<TradeDecision>(v).map_err(|e| anyhow!("schema mismatch: {e}"))
         }) {
-            Ok(d) => {
+            Ok(mut d) => {
+                d.normalize();
                 info!(action = ?d.action, confidence = d.confidence, "Parsed TradeDecision");
                 d
             }

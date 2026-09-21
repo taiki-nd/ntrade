@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { BrainCircuit, Eye, Clock } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { ActionBadge, CoTDetailDialog } from "@/components/trading/CoTDetailDialog";
+import { ActionBadge, ExecutionBadge, CoTDetailDialog } from "@/components/trading/CoTDetailDialog";
 import { PaginationBar, PaginationBarProps } from "@/components/trading/PaginationBar";
 
 interface CoTViewerProps {
@@ -61,8 +61,14 @@ export function CoTViewer({ logs, pagination }: CoTViewerProps) {
                 </div>
               </div>
 
-              {/* 右側: 確信度ゲージと詳細ボタン */}
+              {/* 右側: 執行ステータス、確信度ゲージ、詳細ボタン */}
               <div className="flex items-center gap-3 sm:gap-4 shrink-0 justify-between sm:justify-end">
+                <ExecutionBadge
+                  action={log.action}
+                  executed={log.executed}
+                  guardResult={log.guardResult}
+                />
+
                 <div className="w-24 sm:w-28 space-y-1 shrink-0">
                   <div className="flex justify-between text-xs">
                     <span className="text-muted-foreground text-[11px]">確信度</span>

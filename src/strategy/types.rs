@@ -116,6 +116,11 @@ pub struct TradeDecision {
 }
 
 impl TradeDecision {
+    /// 確信度などを正規化する（0.1刻みに丸め、0.0〜1.0の範囲に収める）
+    pub fn normalize(&mut self) {
+        self.confidence = ((self.confidence * 10.0).round() / 10.0).clamp(0.0, 1.0);
+    }
+
     /// 安全側のフォールバック（HOLD）
     pub fn fallback_hold(reason: impl Into<String>) -> Self {
         let reason = reason.into();
@@ -146,7 +151,12 @@ impl TradeDecision {
             "required": ["action", "confidence", "analysis", "observed", "reasoning"],
             "properties": {
                 "action": { "type": "string", "enum": ["BUY", "SELL", "HOLD"] },
-                "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+                "confidence": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                    "description": "相場の優位性・エントリー機会に対する確信度（0.0〜1.0、0.1刻み）"
+                },
                 "entry_type": { "type": ["string", "null"], "enum": ["MARKET", "LIMIT", "CONDITIONAL", null] },
                 "entry_price": { "type": ["number", "null"] },
                 "stop_loss": { "type": ["number", "null"] },

@@ -203,7 +203,7 @@ flowchart TD
 ```json
 {
   "action": "BUY | SELL | HOLD",
-  "confidence": 0.72,
+  "confidence": 0.7,
   "entry_type": "MARKET | LIMIT | CONDITIONAL",
   "entry_price": 154.215,
   "stop_loss": 154.070,

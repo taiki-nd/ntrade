@@ -92,7 +92,12 @@ impl PromptBuilder {
 【出力】
 指定された JSON Schema に従って結果を返してください。各フィールドの意味:
 - action: BUY / SELL / HOLD
-- confidence: 0〜1。今この瞬間に action を執行することへの確信度
+- confidence: 0.0〜1.0（0.1刻み）。相場の優位性・エントリー機会に対する確信度。0.62のような細かい小数ではなく必ず0.1刻みで指定する:
+  - 0.0〜0.4: 方向感がなく拮抗 / 手掛かりが乏しい（HOLD）
+  - 0.5: どちらかに偏りはあるが、エントリー根拠が薄い / 見極め待ち（HOLD）
+  - 0.6: 上位足の優位性やセットアップの兆候はあるが、今すぐ入るには条件未達（条件付きプラン待ちのHOLDなど）
+  - 0.7: セットアップが成立しており、リスクリワードも見合っている（エントリー検討水準）
+  - 0.8以上: 上位足・下位足・ローソク足の攻防がすべて整合し、極めて強い優位性がある
 - entry_type: MARKET（成行で今入る）/ LIMIT / CONDITIONAL（今は入らず conditional_plan を待つ）/ null
 - entry_price, stop_loss, take_profit: BUY/SELL の場合は必須。stop_loss は analysis.invalidation の価格と一致させる
 - analysis.macro_context: 環境認識（4H/1H）
