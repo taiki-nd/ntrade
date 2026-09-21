@@ -122,6 +122,10 @@ async fn process_pending_plans(state: &AppState, pair: &str, bundle: &SnapshotBu
             } else {
                 false
             };
+            let rr = match (*entry, p.plan.stop_loss, p.plan.take_profit) {
+                (e, Some(sl), Some(tp)) if (e - sl).abs() > 0.0 => Some(((tp - e) / (e - sl)).abs()),
+                _ => None,
+            };
             let log = CoTLog {
                 id: trigger_cot_id,
                 timestamp: Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
@@ -132,7 +136,7 @@ async fn process_pending_plans(state: &AppState, pair: &str, bundle: &SnapshotBu
                 entry_price: Some(*entry),
                 stop_loss: p.plan.stop_loss,
                 take_profit: p.plan.take_profit,
-                risk_reward_ratio: None,
+                risk_reward_ratio: rr,
                 macro_context: format!("条件付きプラン {} が成立（元の判断: {}）", p.id, p.cot_log_id.as_deref().unwrap_or("不明")),
                 order_flow: p.plan.wait_for.clone(),
                 invalidation: p.plan.invalidate_if.clone(),

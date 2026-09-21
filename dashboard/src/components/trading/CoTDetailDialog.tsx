@@ -128,7 +128,7 @@ export function CoTDetailDialog({ cotLogId, onClose }: CoTDetailDialogProps) {
                   <div>
                     <span className="text-xs text-muted-foreground">想定リスクリワード比</span>
                     <div className="text-lg font-bold font-mono text-emerald-600 dark:text-emerald-400">
-                      1 : {log.riskRewardRatio?.toFixed(2)}
+                      {log.riskRewardRatio != null ? `1 : ${log.riskRewardRatio.toFixed(2)}` : "-"}
                     </div>
                   </div>
                   <div>
