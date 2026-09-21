@@ -112,8 +112,12 @@ impl OrderSink for CTraderOrderSink {
     ) -> Pin<Box<dyn Future<Output = Result<OrderReceipt>> + Send + 'a>> {
         Box::pin(async move {
             let is_buy = req.action == Action::Buy;
-            // 相対 SL/TP は約定価格からの距離（1/100000 単位）。entry_hint を基準に距離を出す。
-            let rel = |p: f64| ((req.entry_hint - p).abs() * 100_000.0).round() as i64;
+            let pip_size = crate::snapshot::measures::get_pip_size(&req.pair);
+            // 相対 SL/TP は protocol points（1 pip = 10,000 points）。entry_hint を基準に距離を出す。
+            let rel = |p: f64| {
+                let pips = (req.entry_hint - p).abs() / pip_size;
+                (pips * 10_000.0).round() as i64
+            };
             let volume = crate::ctrader::lots_to_volume(req.volume_lots);
             info!(pair = %req.pair, ?req.action, volume, sl = req.stop_loss, tp = req.take_profit, "LIVE order → cTrader");
             let ev = self

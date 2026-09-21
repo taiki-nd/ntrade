@@ -75,9 +75,12 @@ export function getGuardShortLabel(guardResult?: string): string | null {
     PLAN_EXPIRY: "期限切れ",
     PLAN_SL_WRONG_SIDE: "プランSL不正",
     PLAN_TP_WRONG_SIDE: "プランTP不正",
+    ORDER_FAILED: "発注エラー",
   };
 
-  const firstLabel = labelMap[parts[0]] ?? "ガード抑止";
+  const rawFirst = parts[0];
+  const baseKey = rawFirst.includes(":") ? rawFirst.slice(0, rawFirst.indexOf(":")).trim() : rawFirst;
+  const firstLabel = labelMap[baseKey] ?? (baseKey.startsWith("ORDER_FAILED") ? "発注エラー" : "ガード抑止");
   if (parts.length > 1) {
     return `${firstLabel} 他`;
   }
@@ -112,7 +115,24 @@ export function ExecutionBadge({
     );
   }
 
+  const isOrderFailed = guardResult?.includes("ORDER_FAILED");
   const shortLabel = getGuardShortLabel(guardResult);
+
+  if (isOrderFailed) {
+    return (
+      <Badge
+        variant="outline"
+        className={cn(
+          "text-[10px] text-rose-700 dark:text-rose-400 border-rose-500/40 bg-rose-500/10 gap-1 shrink-0 py-0 px-1.5 h-5 font-semibold",
+          className
+        )}
+        title={guardResult ? `発注エラー: ${guardResult}` : "発注エラー"}
+      >
+        <ShieldAlert className="h-3 w-3" />
+        未発注 (発注エラー)
+      </Badge>
+    );
+  }
 
   return (
     <Badge
@@ -151,122 +171,172 @@ export function getEffectiveRiskRewardRatio(log?: CoTDetail["log"]): number | nu
 
 function getGuardReasonDetails(code: string, log?: CoTDetail["log"]): GuardReasonInfo {
   const trimmed = code.trim();
-  switch (trimmed) {
+  const colonIndex = trimmed.indexOf(":");
+  const key = colonIndex !== -1 ? trimmed.slice(0, colonIndex).trim() : trimmed;
+  const extraDetail = colonIndex !== -1 ? trimmed.slice(colonIndex + 1).trim() : null;
+
+  if (key === "ORDER_FAILED" || key.startsWith("ORDER_FAILED")) {
+    return {
+      code: "ORDER_FAILED",
+      title: "注文執行エラー",
+      description: extraDetail
+        ? `事後ガードは通過しましたが、注文執行時にエラーが発生しました: ${extraDetail}`
+        : "事後ガードは通過しましたが、ブローカーへの発注処理でエラーが発生しました。",
+    };
+  }
+
+  switch (key) {
     case "CONFIDENCE_LOW":
       return {
-        code: trimmed,
+        code: key,
         title: "推論確信度不足",
-        description: log
+        description: extraDetail
+          ? `推論確信度が発注基準を下回っています（${extraDetail}）。`
+          : log
           ? `推論確信度（${(log.confidence * 100).toFixed(0)}%）が発注基準（70%）を下回っているため、安全のため見送りました。`
           : "推論確信度が発注基準（70%）を下回っているため、安全のため見送りました。",
       };
     case "RR_TOO_LOW": {
       const rr = getEffectiveRiskRewardRatio(log);
       return {
-        code: trimmed,
+        code: key,
         title: "想定リスクリワード比不足",
-        description: rr != null
+        description: extraDetail
+          ? `想定リスクリワード比が最低基準未満です（${extraDetail}）。`
+          : rr != null
           ? `想定リスクリワード比（1 : ${rr.toFixed(2)}）が最低基準（1 : 1.5）未満のため、十分な期待値が得られないと判断されました。`
           : "想定リスクリワード比が最低基準（1 : 1.5）未満のため、十分な期待値が得られないと判断されました。",
       };
     }
     case "SL_TOO_TIGHT":
       return {
-        code: trimmed,
+        code: key,
         title: "損切り幅が狭すぎる",
-        description: "ストップロスまでの距離が近すぎるため、ノイズによる即時ロスカットを避けるため見送りました。",
+        description: extraDetail
+          ? `ストップロスまでの距離が近すぎます（${extraDetail}）。ノイズによる即時ロスカットを避けるため見送りました。`
+          : "ストップロスまでの距離が近すぎるため、ノイズによる即時ロスカットを避けるため見送りました。",
       };
     case "SL_ATR_RANGE":
       return {
-        code: trimmed,
+        code: key,
         title: "損切り幅のボラティリティ不一致",
-        description: "損切り幅が直近のボラティリティ（ATR）の適正範囲外（過小または過大）です。",
+        description: extraDetail
+          ? `損切り幅が直近ボラティリティ（ATR）の適正範囲外です（${extraDetail}）。`
+          : "損切り幅が直近のボラティリティ（ATR）の適正範囲外（過小または過大）です。",
       };
     case "SL_WRONG_SIDE":
       return {
-        code: trimmed,
+        code: key,
         title: "損切り価格の方向不正",
-        description: "注文方向（買い/売り）に対して損切り（SL）価格の設定方向が矛盾しています。",
+        description: extraDetail
+          ? `注文方向に対して損切り（SL）価格の設定方向が矛盾しています（${extraDetail}）。`
+          : "注文方向（買い/売り）に対して損切り（SL）価格の設定方向が矛盾しています。",
       };
     case "TP_WRONG_SIDE":
       return {
-        code: trimmed,
+        code: key,
         title: "利確価格の方向不正",
-        description: "注文方向（買い/売り）に対して利確（TP）価格の設定方向が矛盾しています。",
+        description: extraDetail
+          ? `注文方向に対して利確（TP）価格の設定方向が矛盾しています（${extraDetail}）。`
+          : "注文方向（買い/売り）に対して利確（TP）価格の設定方向が矛盾しています。",
       };
     case "NO_SL_TP":
       return {
-        code: trimmed,
+        code: key,
         title: "損切り/利確の未設定",
-        description: "エントリー価格、ストップロス、テイクプロフィットのいずれかが設定されていません。",
+        description: extraDetail
+          ? `エントリー価格、ストップロス、テイクプロフィットの設定に不備があります（${extraDetail}）。`
+          : "エントリー価格、ストップロス、テイクプロフィットのいずれかが設定されていません。",
       };
     case "SPREAD_TOO_WIDE":
       return {
-        code: trimmed,
+        code: key,
         title: "スプレッド拡大",
-        description: log
+        description: extraDetail
+          ? `スプレッドが許容最大値を超えています（${extraDetail}）。`
+          : log
           ? `スプレッド（${log.spreadPips} pips）が許容最大値を超えて拡大しているため、コスト増を回避し見送りました。`
           : "スプレッドが許容最大値を超えて拡大しているため、コスト増を回避し見送りました。",
       };
     case "MAX_POSITIONS":
       return {
-        code: trimmed,
+        code: key,
         title: "最大ポジション数上限",
-        description: "該当通貨ペアまたは口座全体の同時保有ポジション上限に達しているため、新規発注を見送りました。",
+        description: extraDetail
+          ? `ポジション数上限に達しています（${extraDetail}）。`
+          : "該当通貨ペアまたは口座全体の同時保有ポジション上限に達しているため、新規発注を見送りました。",
       };
     case "DAILY_LOSS_LIMIT":
       return {
-        code: trimmed,
+        code: key,
         title: "当日損失限度到達",
-        description: "当日の確定損失が許容上限（日次ドローダウン限度）に達しているため、リスク管理のため新規発注を停止しています。",
+        description: extraDetail
+          ? `当日の確定損失が許容上限に達しています（${extraDetail}）。`
+          : "当日の確定損失が許容上限（日次ドローダウン限度）に達しているため、リスク管理のため新規発注を停止しています。",
       };
     case "NEWS_BLACKOUT":
       return {
-        code: trimmed,
+        code: key,
         title: "重要指標・ニュース発表前後",
-        description: "重要経済指標の発表前後の取引停止時間帯に該当するため、突発的な急変動を避けるため発注を見送りました。",
+        description: extraDetail
+          ? `重要経済指標の発表前後の取引停止時間帯に該当します（${extraDetail}）。`
+          : "重要経済指標の発表前後の取引停止時間帯に該当するため、突発的な急変動を避けるため発注を見送りました。",
       };
     case "OBSERVED_MISMATCH":
       return {
-        code: trimmed,
+        code: key,
         title: "観測足データの不整合",
-        description: "LLMが参照した直近ローソク足データとシステムのスナップショットデータに不整合が検出されました。",
+        description: extraDetail
+          ? `LLMが参照した直近足データとシステムデータに不整合が検出されました（${extraDetail}）。`
+          : "LLMが参照した直近ローソク足データとシステムのスナップショットデータに不整合が検出されました。",
       };
     case "PLAN_UNSTRUCTURED":
       return {
-        code: trimmed,
+        code: key,
         title: "プラン条件の構造不正",
-        description: "条件付き注文のトリガー条件または無効化条件が正しく設定されていません。",
+        description: extraDetail
+          ? `条件付き注文の構造不正です（${extraDetail}）。`
+          : "条件付き注文のトリガー条件または無効化条件が正しく設定されていません。",
       };
     case "PLAN_NO_SL_TP":
       return {
-        code: trimmed,
+        code: key,
         title: "プラン損切り/利確未設定",
-        description: "条件付き注文のストップロスまたはテイクプロフィットが設定されていません。",
+        description: extraDetail
+          ? `条件付き注文のSL/TPが未設定です（${extraDetail}）。`
+          : "条件付き注文のストップロスまたはテイクプロフィットが設定されていません。",
       };
     case "PLAN_EXPIRY":
       return {
-        code: trimmed,
+        code: key,
         title: "プラン有効期限不正",
-        description: "条件付き注文の有効期限が切れているか、許容される最大有効期限を超えています。",
+        description: extraDetail
+          ? `条件付き注文の有効期限が不正です（${extraDetail}）。`
+          : "条件付き注文の有効期限が切れているか、許容される最大有効期限を超えています。",
       };
     case "PLAN_SL_WRONG_SIDE":
       return {
-        code: trimmed,
+        code: key,
         title: "プラン損切り価格の方向不正",
-        description: "プランの注文方向に対して損切り価格の設定方向が矛盾しています。",
+        description: extraDetail
+          ? `プランの損切り方向不正です（${extraDetail}）。`
+          : "プランの注文方向に対して損切り価格の設定方向が矛盾しています。",
       };
     case "PLAN_TP_WRONG_SIDE":
       return {
-        code: trimmed,
+        code: key,
         title: "プラン利確価格の方向不正",
-        description: "プランの注文方向に対して利確価格の設定方向が矛盾しています。",
+        description: extraDetail
+          ? `プランの利確方向不正です（${extraDetail}）。`
+          : "プランの注文方向に対して利確価格の設定方向が矛盾しています。",
       };
     default:
       return {
-        code: trimmed,
-        title: `事後ガードによる抑止 (${trimmed})`,
-        description: "リスク管理ルール（事後ガード）の検証に合格しなかったため、安全のため発注を見送りました。",
+        code: key,
+        title: key.startsWith("ORDER_FAILED") ? "注文執行エラー" : `事後ガードによる抑止 (${key})`,
+        description: extraDetail
+          ? `${extraDetail}`
+          : "リスク管理ルール（事後ガード）の検証に合格しなかったため、安全のため発注を見送りました。",
       };
   }
 }
@@ -379,10 +449,20 @@ export function CoTDetailDialog({ cotLogId, onClose }: CoTDetailDialogProps) {
                           <ShieldCheck className="h-4 w-4 shrink-0" />
                           <span>発注済み</span>
                         </span>
+                      ) : log.guardResult?.includes("ORDER_FAILED") ? (
+                        <span className="text-rose-600 dark:text-rose-400 flex items-center gap-1">
+                          <ShieldAlert className="h-4 w-4 shrink-0" />
+                          <span>未発注（発注エラー）</span>
+                        </span>
+                      ) : log.guardResult && log.guardResult !== "PASS" ? (
+                        <span className="text-amber-600 dark:text-amber-400 flex items-center gap-1">
+                          <ShieldAlert className="h-4 w-4 shrink-0" />
+                          <span>未発注（ガード抑止{getGuardShortLabel(log.guardResult) ? `: ${getGuardShortLabel(log.guardResult)}` : ""}）</span>
+                        </span>
                       ) : (
                         <span className="text-amber-600 dark:text-amber-400 flex items-center gap-1">
                           <ShieldAlert className="h-4 w-4 shrink-0" />
-                          <span>未発注（ガード抑止）</span>
+                          <span>未発注（未執行）</span>
                         </span>
                       )}
                     </div>
@@ -393,11 +473,31 @@ export function CoTDetailDialog({ cotLogId, onClose }: CoTDetailDialogProps) {
 
             {/* 未発注理由カード (未発注の場合) */}
             {log.action !== "HOLD" && !log.executed && (
-              <div className="space-y-2.5 p-3.5 rounded-lg border border-amber-500/30 bg-amber-500/5 dark:bg-amber-950/20">
+              <div
+                className={cn(
+                  "space-y-2.5 p-3.5 rounded-lg border",
+                  log.guardResult?.includes("ORDER_FAILED")
+                    ? "border-rose-500/30 bg-rose-500/5 dark:bg-rose-950/20"
+                    : "border-amber-500/30 bg-amber-500/5 dark:bg-amber-950/20"
+                )}
+              >
                 <div className="flex items-center justify-between gap-2 flex-wrap">
-                  <div className="flex items-center gap-2 text-xs font-semibold text-amber-700 dark:text-amber-400">
+                  <div
+                    className={cn(
+                      "flex items-center gap-2 text-xs font-semibold",
+                      log.guardResult?.includes("ORDER_FAILED")
+                        ? "text-rose-700 dark:text-rose-400"
+                        : "text-amber-700 dark:text-amber-400"
+                    )}
+                  >
                     <ShieldAlert className="h-4 w-4 shrink-0" />
-                    <span>未発注理由（事後ガードによる抑止）</span>
+                    <span>
+                      {log.guardResult?.includes("ORDER_FAILED")
+                        ? "未発注理由（注文執行エラー）"
+                        : guardReasons.length > 0
+                        ? "未発注理由（事後ガードによる抑止）"
+                        : "未発注理由（注文未執行）"}
+                    </span>
                   </div>
                   {log.guardResult && (
                     <span className="text-[11px] font-mono text-muted-foreground bg-muted/60 px-1.5 py-0.5 rounded border">
@@ -411,20 +511,35 @@ export function CoTDetailDialog({ cotLogId, onClose }: CoTDetailDialogProps) {
                     {guardReasons.map((reason) => (
                       <div
                         key={reason.code}
-                        className="p-2.5 rounded-md bg-card/80 border border-amber-500/20 space-y-1 text-xs shadow-xs"
+                        className={cn(
+                          "p-2.5 rounded-md bg-card/80 border space-y-1 text-xs shadow-xs",
+                          reason.code === "ORDER_FAILED"
+                            ? "border-rose-500/30"
+                            : "border-amber-500/20"
+                        )}
                       >
                         <div className="flex items-center gap-2 flex-wrap">
-                          <span className="font-semibold text-foreground">
+                          <span
+                            className={cn(
+                              "font-semibold",
+                              reason.code === "ORDER_FAILED" ? "text-rose-600 dark:text-rose-400" : "text-foreground"
+                            )}
+                          >
                             {reason.title}
                           </span>
                           <Badge
                             variant="outline"
-                            className="text-[10px] font-mono py-0 px-1.5 h-4 text-muted-foreground border-amber-500/30"
+                            className={cn(
+                              "text-[10px] font-mono py-0 px-1.5 h-4",
+                              reason.code === "ORDER_FAILED"
+                                ? "text-rose-600 border-rose-500/30"
+                                : "text-muted-foreground border-amber-500/30"
+                            )}
                           >
                             {reason.code}
                           </Badge>
                         </div>
-                        <p className="text-muted-foreground leading-relaxed">
+                        <p className="text-muted-foreground leading-relaxed whitespace-pre-wrap">
                           {reason.description}
                         </p>
                       </div>
@@ -432,7 +547,7 @@ export function CoTDetailDialog({ cotLogId, onClose }: CoTDetailDialogProps) {
                   </div>
                 ) : (
                   <p className="text-xs text-muted-foreground leading-relaxed">
-                    事後ガードまたはシステム条件により、安全のため発注が見送られました。
+                    事後ガードは通過しましたが、注文処理が完了しませんでした（ブローカー未接続または発注処理エラーの可能性があります）。
                   </p>
                 )}
               </div>
