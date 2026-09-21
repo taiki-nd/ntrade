@@ -86,7 +86,7 @@ mod tests {
         state.record_cot_log(cot("cot-1")).await;
         state.record_cot_log(cot("cot-2")).await;
         *state.positions.write().await = vec![Position {
-            id: "paper-2".into(),
+            id: "pos-2".into(),
             symbol: "USDJPY".into(),
             side: "BUY".into(),
             volume_lots: 0.1,
@@ -103,7 +103,7 @@ mod tests {
         state.persist_positions().await;
         state
             .record_trades(vec![TradeHistory {
-                id: "trd-paper-1".into(),
+                id: "trd-1".into(),
                 symbol: "USDJPY".into(),
                 side: "BUY".into(),
                 volume_lots: 0.1,

@@ -12,7 +12,6 @@ use tracing::{info, warn};
 use crate::ctrader::{BarPeriod, CandleBar};
 use crate::reflection;
 use crate::server::handlers::decide::run_decision_cycle;
-use crate::server::paper;
 use crate::server::state::AppState;
 use crate::server::types::{BotState, CloseReason, LessonLearned, TradeHistory};
 
@@ -70,7 +69,7 @@ pub async fn run(state: AppState) {
     }
 }
 
-/// サイクル後: ペーパー決済 / ブローカー同期 → 決済トレードの自己反省
+/// サイクル後: ブローカー同期 → 決済トレードの自己反省
 pub async fn after_cycle(state: &AppState, pair: &str) -> anyhow::Result<()> {
     let bundle = state.latest_snapshot.read().await.clone();
     let Some(bundle) = bundle else { return Ok(()) };
@@ -84,20 +83,74 @@ pub async fn after_cycle(state: &AppState, pair: &str) -> anyhow::Result<()> {
         volume: 0,
     };
 
-    // 1. ペーパーポジションの決済判定
-    let closed: Vec<TradeHistory> = {
-        let mut positions = state.positions.write().await;
-        let (open, closed) = paper::settle(std::mem::take(&mut *positions), pair, &bar);
-        *positions = open;
-        closed
-    };
-    // 含み損益の更新も含めて毎回書き出す
-    state.persist_positions().await;
-    state.record_trades(closed.clone()).await;
+    let mut closed: Vec<TradeHistory> = Vec::new();
+
+    // 1. ブローカー残高・ポジションとの同期
+    state.sync_broker_account().await;
+    if let Some(ctrader) = state.ctrader_service.read().await.clone() {
+        match ctrader.get_open_positions().await {
+            Ok(broker) => {
+                let mut positions = state.positions.write().await;
+                let mut remaining = Vec::new();
+                for p in positions.drain(..) {
+                    if broker.iter().any(|b| b.position_id.to_string() == p.id) {
+                        remaining.push(p);
+                    } else {
+                        // ブローカー側で決済された
+                        let is_buy = p.side == "BUY";
+                        let sign = if is_buy { 1.0 } else { -1.0 };
+                        let close_price = bar.close;
+                        let pip = crate::snapshot::measures::get_pip_size(&p.symbol);
+                        let pv = crate::snapshot::measures::pip_value_per_lot(&p.symbol);
+                        let pnl_pips = ((close_price - p.entry_price) * sign / pip * 10.0).round() / 10.0;
+                        let pnl_amount = (pnl_pips * pv * p.volume_lots).round();
+                        let reason = if (is_buy && close_price <= p.stop_loss) || (!is_buy && close_price >= p.stop_loss) {
+                            CloseReason::StopLoss
+                        } else if (is_buy && close_price >= p.take_profit) || (!is_buy && close_price <= p.take_profit) {
+                            CloseReason::TakeProfit
+                        } else {
+                            CloseReason::Manual
+                        };
+                        closed.push(TradeHistory {
+                            id: format!("trd-{}", p.id),
+                            symbol: p.symbol,
+                            side: p.side,
+                            volume_lots: p.volume_lots,
+                            entry_price: p.entry_price,
+                            close_price,
+                            stop_loss: p.stop_loss,
+                            take_profit: p.take_profit,
+                            pnl_pips,
+                            pnl_amount,
+                            close_reason: reason,
+                            open_time: p.open_time,
+                            close_time: bar.timestamp.format("%Y-%m-%d %H:%M:%S").to_string(),
+                            cot_log_id: p.cot_log_id,
+                        });
+                    }
+                }
+                // 確定足終値で含み損益を更新
+                let pip = crate::snapshot::measures::get_pip_size(pair);
+                let pv = crate::snapshot::measures::pip_value_per_lot(pair);
+                for p in remaining.iter_mut().filter(|p| p.symbol.eq_ignore_ascii_case(pair)) {
+                    let is_buy = p.side == "BUY";
+                    let sign = if is_buy { 1.0 } else { -1.0 };
+                    p.current_price = bar.close;
+                    p.pnl_pips = ((bar.close - p.entry_price) * sign / pip * 10.0).round() / 10.0;
+                    p.pnl_amount = (p.pnl_pips * pv * p.volume_lots).round();
+                }
+                *positions = remaining;
+                drop(positions);
+                state.persist_positions().await;
+            }
+            Err(e) => warn!("reconcile failed: {e:#}"),
+        }
+    }
+
     if !closed.is_empty() {
+        state.record_trades(closed.clone()).await;
         let mut metrics = state.metrics.write().await;
         for t in &closed {
-            metrics.balance += t.pnl_amount;
             metrics.daily_pnl += t.pnl_amount;
             metrics.daily_pnl_percent = if metrics.balance > 0.0 { metrics.daily_pnl / metrics.balance * 100.0 } else { 0.0 };
             metrics.total_trades_today += 1;
@@ -109,30 +162,7 @@ pub async fn after_cycle(state: &AppState, pair: &str) -> anyhow::Result<()> {
             } else {
                 0.0
             };
-            info!(id = %t.id, ?t.close_reason, pnl_pips = t.pnl_pips, "paper position closed");
-        }
-    }
-
-    // 2. ブローカー残高・ポジションとの同期
-    state.sync_broker_account().await;
-    if let Some(ctrader) = state.ctrader_service.read().await.clone() {
-        if crate::server::state::live_orders_enabled() {
-            match ctrader.get_open_positions().await {
-                Ok(broker) => {
-                    let removed = {
-                        let mut positions = state.positions.write().await;
-                        // ブローカーに無い実ポジションは決済済みとみなして除去
-                        let before = positions.len();
-                        positions.retain(|p| p.id.starts_with("paper-") || broker.iter().any(|b| b.position_id.to_string() == p.id));
-                        before - positions.len()
-                    };
-                    if removed > 0 {
-                        info!("removed {} positions closed on broker side", removed);
-                        state.persist_positions().await;
-                    }
-                }
-                Err(e) => warn!("reconcile failed: {e:#}"),
-            }
+            info!(id = %t.id, ?t.close_reason, pnl_pips = t.pnl_pips, "position closed on broker");
         }
     }
 

@@ -100,6 +100,13 @@ impl Db {
               trigger_trade_id TEXT,
               category         TEXT NOT NULL
             );
+            UPDATE cot_logs
+            SET risk_reward_ratio = ABS((take_profit - entry_price) / (entry_price - stop_loss))
+            WHERE risk_reward_ratio IS NULL
+              AND entry_price IS NOT NULL
+              AND stop_loss IS NOT NULL
+              AND take_profit IS NOT NULL
+              AND ABS(entry_price - stop_loss) > 0;
             "#,
         )?;
         Ok(())
@@ -447,7 +454,7 @@ mod tests {
     fn positions_are_replaced() {
         let mut db = Db::open_in_memory().unwrap();
         let p = Position {
-            id: "paper-1".into(),
+            id: "pos-1".into(),
             symbol: "USDJPY".into(),
             side: "BUY".into(),
             volume_lots: 0.1,

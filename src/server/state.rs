@@ -6,7 +6,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 use crate::ctrader::{token, CTraderConfig, CTraderService, TokenSet};
-use crate::executor::{CTraderOrderSink, OrderSink, PaperOrderSink, PlanBook};
+use crate::executor::{CTraderOrderSink, DisconnectedOrderSink, OrderSink, PlanBook};
 use crate::guard::{GuardConfig, DEFAULT_GUARD_CONFIG_PATH};
 use crate::llm::{LlmClient, LlmClientConfig};
 use crate::snapshot::SnapshotBundle;
@@ -35,19 +35,12 @@ pub struct AppState {
     pub plan_book: Arc<RwLock<PlanBook>>,
     /// LLM 推論クライアント
     pub llm: Arc<LlmClient>,
-    /// 発注先。既定はペーパー。`NTRADE_LIVE_ORDERS=1` かつ cTrader 接続時に実発注へ切り替わる
+    /// 発注先（cTrader 接続時は CTraderOrderSink、未接続時は DisconnectedOrderSink）
     pub order_sink: Arc<RwLock<Arc<dyn OrderSink>>>,
     /// 判断サイクルの直列化
     pub decide_lock: Arc<tokio::sync::Mutex<()>>,
     /// ブローカー残高の最終同期時刻
     pub last_broker_sync: Arc<RwLock<Option<std::time::Instant>>>,
-    /// ペーパー残高をブローカー残高で初期化済みか（`NTRADE_PAPER_BALANCE` 指定時は最初から true）
-    pub paper_balance_seeded: Arc<RwLock<bool>>,
-}
-
-/// `NTRADE_PAPER_BALANCE` が指定されていればその値
-fn paper_balance_override() -> Option<f64> {
-    std::env::var("NTRADE_PAPER_BALANCE").ok().and_then(|v| v.trim_matches('"').parse::<f64>().ok())
 }
 
 /// 前回終了時の保有ポジション（ペーパー決済の継続と判断ログとの対応付けのため）
@@ -76,9 +69,9 @@ fn load_saved_tokens(db_path: &std::path::Path) -> Option<TokenSet> {
     }
 }
 
-/// `NTRADE_LIVE_ORDERS=1` なら実発注
+/// 実発注のみサポート
 pub fn live_orders_enabled() -> bool {
-    std::env::var("NTRADE_LIVE_ORDERS").map(|v| v.trim_matches('"') == "1").unwrap_or(false)
+    true
 }
 
 impl Default for AppState {
@@ -115,10 +108,9 @@ impl AppState {
             guard_config: Arc::new(RwLock::new(GuardConfig::load_or_default(DEFAULT_GUARD_CONFIG_PATH))),
             plan_book: Arc::new(RwLock::new(PlanBook::default())),
             llm: Arc::new(LlmClient::new(LlmClientConfig::default())),
-            order_sink: Arc::new(RwLock::new(Arc::new(PaperOrderSink))),
+            order_sink: Arc::new(RwLock::new(Arc::new(DisconnectedOrderSink))),
             decide_lock: Arc::new(tokio::sync::Mutex::new(())),
             last_broker_sync: Arc::new(RwLock::new(None)),
-            paper_balance_seeded: Arc::new(RwLock::new(paper_balance_override().is_some())),
         }
     }
 
@@ -171,12 +163,8 @@ impl AppState {
         let service_arc = Arc::new(service);
         *self.ctrader_service.write().await = Some(service_arc.clone());
         *self.ctrader_config.write().await = Some(cfg.clone());
-        if live_orders_enabled() {
-            warn!("NTRADE_LIVE_ORDERS=1: orders will be sent to cTrader ({})", if cfg.is_live { "LIVE" } else { "DEMO" });
-            *self.order_sink.write().await = Arc::new(CTraderOrderSink::new(service_arc));
-        } else {
-            info!("Paper order mode (set NTRADE_LIVE_ORDERS=1 to send real orders)");
-        }
+        info!("cTrader connected: live order sink installed ({})", if cfg.is_live { "LIVE" } else { "DEMO" });
+        *self.order_sink.write().await = Arc::new(CTraderOrderSink::new(service_arc));
         {
             let mut m_lock = self.metrics.write().await;
             m_lock.connection_status.ctrader = "connected".to_string();
@@ -268,29 +256,21 @@ impl AppState {
         }
     }
 
-    /// 口座の接続・切り替え直後に呼ぶ。ペーパー残高を新しい口座の残高で初期化し直す。
+    /// 口座の接続・切り替え直後に呼ぶ。ブローカー残高を同期する。
     pub async fn on_account_connected(&self) {
-        *self.paper_balance_seeded.write().await = paper_balance_override().is_some();
         self.sync_broker_account().await;
     }
 
     /// cTrader から口座残高を取得して metrics に反映する。
-    /// ペーパーモードでは、口座接続後の最初の同期でだけ `balance`（ペーパー残高）をブローカー残高に揃え、
-    /// 以降はペーパー損益で動かす（`NTRADE_PAPER_BALANCE` 指定時は揃えない）。
-    /// 実発注モードでは毎回 `balance` をブローカー残高に揃える。
     pub async fn sync_broker_account(&self) {
         let Some(ctrader) = self.ctrader_service.read().await.clone() else { return };
         match ctrader.get_account_info().await {
             Ok(acc) => {
                 let mut m = self.metrics.write().await;
                 m.broker_balance = Some(acc.balance);
-                let mut seeded = self.paper_balance_seeded.write().await;
-                if live_orders_enabled() || !*seeded {
-                    m.balance = acc.balance;
-                    m.equity = m.balance + m.unrealized_pnl;
-                    m.free_margin = m.equity - m.margin;
-                    *seeded = true;
-                }
+                m.balance = acc.balance;
+                m.equity = m.balance + m.unrealized_pnl;
+                m.free_margin = m.equity - m.margin;
                 if let Some(login) = acc.trader_login {
                     m.connection_status.account_number =
                         format!("cTrader #{} ({})", login, if acc.is_live { "Live" } else { "Demo" });
@@ -386,18 +366,14 @@ impl AppState {
         }
     }
 
-    /// 起動時の口座メトリクス。ペーパー口座の初期残高のみ設定する
-    /// （`NTRADE_PAPER_BALANCE`、未指定なら cTrader 接続まで仮に 1,000,000）。
+    /// 起動時の口座メトリクス。cTrader 接続後にブローカー残高で上書きされる（`sync_broker_account`）
     fn initial_metrics() -> AccountMetrics {
-        // cTrader 接続後はブローカー残高で上書きされる（`sync_broker_account`）
-        let balance = paper_balance_override().unwrap_or(1_000_000.0);
-
         AccountMetrics {
             bot_state: BotState::Running,
-            balance,
-            equity: balance,
+            balance: 0.0,
+            equity: 0.0,
             margin: 0.0,
-            free_margin: balance,
+            free_margin: 0.0,
             daily_pnl: 0.0,
             daily_pnl_percent: 0.0,
             unrealized_pnl: 0.0,
@@ -407,7 +383,7 @@ impl AppState {
             usdjpy_spread: 0.0,
             eurusd_spread: 0.0,
             circuit_breaker_threshold_percent: -3.0,
-            order_mode: if live_orders_enabled() { "live".to_string() } else { "paper".to_string() },
+            order_mode: "live".to_string(),
             broker_balance: None,
             connection_status: ConnectionStatus {
                 ctrader: "connecting".to_string(),

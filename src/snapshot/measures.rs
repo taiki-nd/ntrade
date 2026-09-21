@@ -32,6 +32,16 @@ pub fn price_digits(pair: &str) -> usize {
     }
 }
 
+/// 1 lot・1 pip あたりの損益額（口座通貨建ての概算）。JPY口座 + JPYクロス想定。
+pub fn pip_value_per_lot(pair: &str) -> f64 {
+    if pair.to_uppercase().contains("JPY") {
+        1000.0
+    } else {
+        // USD建てペアを JPY 口座で見た概算（1 pip = 10 USD ≒ 1500 JPY）
+        1500.0
+    }
+}
+
 /// 指数平滑移動平均（EMA）を計算する
 pub fn calculate_ema(bars: &[CandleBar], period: usize) -> Vec<Option<f64>> {
     let n = bars.len();

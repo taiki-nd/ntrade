@@ -67,7 +67,7 @@ async fn guard_context(state: &AppState, pair: &str) -> GuardContext {
     }
 }
 
-async fn place_paper_order(state: &AppState, req: OrderRequest, reason: &str, cot_log_id: &str) -> anyhow::Result<Position> {
+async fn execute_order(state: &AppState, req: OrderRequest, reason: &str, cot_log_id: &str) -> anyhow::Result<Position> {
     let sink = state.order_sink.read().await.clone();
     let receipt = sink.place_market(&req).await?;
     let entry = receipt.filled_price.unwrap_or(req.entry_hint);
@@ -108,6 +108,7 @@ async fn process_pending_plans(state: &AppState, pair: &str, bundle: &SnapshotBu
             let trigger_cot_id = format!("cot-plan-{}", Utc::now().timestamp_millis());
             // ポジションはプランを立てた LLM 判断に紐付ける（成立ログは機械的な記録のため）
             let origin_cot_id = p.cot_log_id.clone().unwrap_or_else(|| trigger_cot_id.clone());
+            let mut execution_error = None;
             let executed = if verdict.passed {
                 let req = OrderRequest {
                     pair: pair.to_string(),
@@ -118,13 +119,25 @@ async fn process_pending_plans(state: &AppState, pair: &str, bundle: &SnapshotBu
                     take_profit: p.plan.take_profit.unwrap_or_default(),
                     reason: format!("conditional plan {} triggered: {}", p.id, p.plan.wait_for),
                 };
-                place_paper_order(state, req, &p.plan.invalidate_if, &origin_cot_id).await.is_ok()
+                match execute_order(state, req, &p.plan.invalidate_if, &origin_cot_id).await {
+                    Ok(_) => true,
+                    Err(e) => {
+                        warn!("Failed to place order for plan {}: {e:#}", p.id);
+                        execution_error = Some(format!("ORDER_FAILED: {e:#}"));
+                        false
+                    }
+                }
             } else {
                 false
             };
             let rr = match (*entry, p.plan.stop_loss, p.plan.take_profit) {
                 (e, Some(sl), Some(tp)) if (e - sl).abs() > 0.0 => Some(((tp - e) / (e - sl)).abs()),
                 _ => None,
+            };
+            let guard_result = if !verdict.passed {
+                Some(verdict.summary())
+            } else {
+                execution_error
             };
             let log = CoTLog {
                 id: trigger_cot_id,
@@ -141,7 +154,7 @@ async fn process_pending_plans(state: &AppState, pair: &str, bundle: &SnapshotBu
                 order_flow: p.plan.wait_for.clone(),
                 invalidation: p.plan.invalidate_if.clone(),
                 conflicts: String::new(),
-                guard_result: (!verdict.passed).then(|| verdict.summary()),
+                guard_result,
                 reasoning: format!("5M確定足 {} 終値 {:.5} で成立条件を満たした", bar.timestamp.format("%H:%M"), bar.close),
                 executed,
                 spread_pips: bundle.snapshot.spread_pips,
@@ -179,11 +192,12 @@ pub async fn run_decision_cycle(state: &AppState, pair: &str) -> anyhow::Result<
     let ctx = guard_context(state, pair).await;
     let verdict = guard::evaluate(&decision, &bundle.snapshot, &ctx, &cfg);
 
-    // 5. 執行（ペーパー）/ プラン登録
+    // 5. 執行（実発注）/ プラン登録
     let cot_id = format!("cot-{}", Utc::now().timestamp_millis());
     let is_trade = matches!(decision.action, Action::Buy | Action::Sell);
     let mut executed = false;
     let mut plan_id = None;
+    let mut execution_error = None;
     if verdict.passed {
         if is_trade {
             let (entry, sl, tp) = (
@@ -202,7 +216,13 @@ pub async fn run_decision_cycle(state: &AppState, pair: &str) -> anyhow::Result<
                 take_profit: tp,
                 reason: cot_id.clone(),
             };
-            executed = place_paper_order(state, req, &decision.analysis.invalidation, &cot_id).await.is_ok();
+            match execute_order(state, req, &decision.analysis.invalidation, &cot_id).await {
+                Ok(_) => executed = true,
+                Err(e) => {
+                    warn!("Failed to place order: {e:#}");
+                    execution_error = Some(format!("ORDER_FAILED: {e:#}"));
+                }
+            }
         } else if let Some(plan) = decision.conditional_plan.clone().filter(|p| p.then_action != Action::Hold) {
             plan_id = Some(state.plan_book.write().await.add(pair, plan, Some(cot_id.clone())));
         }
@@ -212,6 +232,11 @@ pub async fn run_decision_cycle(state: &AppState, pair: &str) -> anyhow::Result<
     let rr = match (decision.entry_price, decision.stop_loss, decision.take_profit) {
         (Some(e), Some(sl), Some(tp)) if (e - sl).abs() > 0.0 => Some(((tp - e) / (e - sl)).abs()),
         _ => None,
+    };
+    let guard_result = if !verdict.passed {
+        Some(verdict.summary())
+    } else {
+        execution_error
     };
     let log = CoTLog {
         id: cot_id.clone(),
@@ -228,7 +253,7 @@ pub async fn run_decision_cycle(state: &AppState, pair: &str) -> anyhow::Result<
         order_flow: decision.analysis.order_flow.clone(),
         invalidation: decision.analysis.invalidation.clone(),
         conflicts: decision.analysis.conflicts.clone(),
-        guard_result: (!verdict.passed).then(|| verdict.summary()),
+        guard_result,
         reasoning: decision.reasoning.clone(),
         executed,
         spread_pips: bundle.snapshot.spread_pips,

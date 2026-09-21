@@ -101,17 +101,16 @@ export default function SettingsPage() {
               <Table>
                 <TableBody>
                   <Row
-                    label="発注モード (NTRADE_LIVE_ORDERS)"
+                    label="発注モード"
                     value={
-                      <Badge variant={runtime.orderMode === "live" ? "destructive" : "secondary"}>
-                        {runtime.orderMode === "live" ? "LIVE: cTrader に実発注" : "PAPER: 発注しない"}
+                      <Badge variant="default">
+                        LIVE: cTrader に実発注
                       </Badge>
                     }
                   />
                   <Row label="スケジューラ (NTRADE_SCHEDULER)" value={runtime.schedulerEnabled ? "有効（5分足確定ごと）" : "無効"} />
                   <Row label="対象ペア (NTRADE_PAIRS)" value={runtime.pairs.join(", ")} />
                   <Row label="足確定後の待ち秒数 (NTRADE_BAR_DELAY_SECS)" value={`${runtime.barDelaySecs} 秒`} />
-                  <Row label="ペーパー初期残高 (NTRADE_PAPER_BALANCE)" value={runtime.paperBalance.toLocaleString()} />
                   <Row label="LLM CLI" value={`${runtime.llmCli} (timeout ${runtime.llmTimeoutSecs}s)`} />
                   <Row label="ガード設定ファイル" value={runtime.guardConfigPath} />
                   <Row label="SQLite" value={runtime.dbPath} />

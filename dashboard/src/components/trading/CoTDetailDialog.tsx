@@ -135,6 +135,20 @@ interface GuardReasonInfo {
   description: string;
 }
 
+export function getEffectiveRiskRewardRatio(log?: CoTDetail["log"]): number | null {
+  if (!log) return null;
+  if (log.riskRewardRatio != null) return log.riskRewardRatio;
+  if (
+    log.entryPrice != null &&
+    log.stopLoss != null &&
+    log.takeProfit != null &&
+    Math.abs(log.entryPrice - log.stopLoss) > 0
+  ) {
+    return Math.abs((log.takeProfit - log.entryPrice) / (log.entryPrice - log.stopLoss));
+  }
+  return null;
+}
+
 function getGuardReasonDetails(code: string, log?: CoTDetail["log"]): GuardReasonInfo {
   const trimmed = code.trim();
   switch (trimmed) {
@@ -146,14 +160,16 @@ function getGuardReasonDetails(code: string, log?: CoTDetail["log"]): GuardReaso
           ? `推論確信度（${(log.confidence * 100).toFixed(0)}%）が発注基準（70%）を下回っているため、安全のため見送りました。`
           : "推論確信度が発注基準（70%）を下回っているため、安全のため見送りました。",
       };
-    case "RR_TOO_LOW":
+    case "RR_TOO_LOW": {
+      const rr = getEffectiveRiskRewardRatio(log);
       return {
         code: trimmed,
         title: "想定リスクリワード比不足",
-        description: log?.riskRewardRatio != null
-          ? `想定リスクリワード比（1 : ${log.riskRewardRatio.toFixed(2)}）が最低基準（1 : 1.5）未満のため、十分な期待値が得られないと判断されました。`
+        description: rr != null
+          ? `想定リスクリワード比（1 : ${rr.toFixed(2)}）が最低基準（1 : 1.5）未満のため、十分な期待値が得られないと判断されました。`
           : "想定リスクリワード比が最低基準（1 : 1.5）未満のため、十分な期待値が得られないと判断されました。",
       };
+    }
     case "SL_TOO_TIGHT":
       return {
         code: trimmed,
@@ -300,6 +316,7 @@ export function CoTDetailDialog({ cotLogId, onClose }: CoTDetailDialogProps) {
   const log = detail?.log;
   const digits = log?.symbol.includes("JPY") ? 3 : 5;
   const guardReasons = React.useMemo(() => parseGuardReasons(log?.guardResult, log), [log]);
+  const effectiveRR = React.useMemo(() => getEffectiveRiskRewardRatio(log), [log]);
 
   return (
     <Dialog open={!!cotLogId} onOpenChange={(open) => !open && onClose()}>
@@ -351,7 +368,7 @@ export function CoTDetailDialog({ cotLogId, onClose }: CoTDetailDialogProps) {
                   <div className="min-w-0">
                     <span className="text-xs text-muted-foreground">想定リスクリワード比</span>
                     <div className="text-lg font-bold font-mono text-emerald-600 dark:text-emerald-400">
-                      {log.riskRewardRatio != null ? `1 : ${log.riskRewardRatio.toFixed(2)}` : "-"}
+                      {effectiveRR != null ? `1 : ${effectiveRR.toFixed(2)}` : "-"}
                     </div>
                   </div>
                   <div className="min-w-0">

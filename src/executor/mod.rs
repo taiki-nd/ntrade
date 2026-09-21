@@ -80,20 +80,16 @@ pub struct OrderReceipt {
     pub filled_price: Option<f64>,
 }
 
-/// 発注せずログだけ残す（ペーパー）。
-pub struct PaperOrderSink;
+/// cTrader 未接続時のプレースホルダー。未接続時の発注はエラーとする。
+pub struct DisconnectedOrderSink;
 
-impl OrderSink for PaperOrderSink {
+impl OrderSink for DisconnectedOrderSink {
     fn place_market<'a>(
         &'a self,
-        req: &'a OrderRequest,
+        _req: &'a OrderRequest,
     ) -> Pin<Box<dyn Future<Output = Result<OrderReceipt>> + Send + 'a>> {
         Box::pin(async move {
-            info!(?req, "PAPER order (not sent to broker)");
-            Ok(OrderReceipt {
-                order_id: format!("paper-{}", Utc::now().timestamp_millis()),
-                filled_price: Some(req.entry_hint),
-            })
+            anyhow::bail!("cTrader is not connected; cannot place order");
         })
     }
 }

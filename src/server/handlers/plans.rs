@@ -5,7 +5,7 @@ use axum::{
 
 use crate::executor::PendingPlan;
 use crate::guard::{GuardConfig, DEFAULT_GUARD_CONFIG_PATH};
-use crate::server::state::{live_orders_enabled, AppState};
+use crate::server::state::AppState;
 use crate::server::types::{ApiResponse, RuntimeInfo};
 
 /// GET /api/plans
@@ -32,14 +32,11 @@ pub async fn runtime_info(State(state): State<AppState>) -> Json<ApiResponse<Run
     let llm = state.llm.config();
     let ctrader = state.ctrader_config.read().await.clone();
     let info = RuntimeInfo {
-        order_mode: if live_orders_enabled() { "live".into() } else { "paper".into() },
+        order_mode: "live".into(),
         scheduler_enabled: !std::env::var("NTRADE_SCHEDULER").map(|v| v.trim_matches('"') == "off").unwrap_or(false),
         pairs: crate::scheduler::pairs_from_env(),
         bar_delay_secs: std::env::var("NTRADE_BAR_DELAY_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(15),
-        paper_balance: std::env::var("NTRADE_PAPER_BALANCE")
-            .ok()
-            .and_then(|v| v.trim_matches('"').parse().ok())
-            .unwrap_or(1_000_000.0),
+        paper_balance: 0.0,
         guard_config_path: DEFAULT_GUARD_CONFIG_PATH.to_string(),
         db_path: state.db_path.to_string_lossy().to_string(),
         llm_cli: llm.cli_binary.clone(),
