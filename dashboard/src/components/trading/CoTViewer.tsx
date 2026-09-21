@@ -42,30 +42,30 @@ export function CoTViewer({ logs, pagination }: CoTViewerProps) {
             <div
               key={log.id}
               onClick={() => setSelectedId(log.id)}
-              className="flex flex-col sm:flex-row sm:items-center justify-between p-3.5 rounded-lg border bg-card/60 hover:bg-accent/40 cursor-pointer transition-colors gap-3"
+              className="group flex flex-col sm:flex-row sm:items-center justify-between p-3.5 rounded-lg border bg-card/60 hover:bg-accent/40 cursor-pointer transition-colors gap-3 overflow-hidden"
             >
-              {/* 左側: アクションと通貨・時間 */}
-              <div className="flex items-center gap-3">
+              {/* 左側: アクションと通貨・時間・理由 */}
+              <div className="flex items-center gap-3 min-w-0 flex-1">
                 <ActionBadge action={log.action} />
-                <div>
+                <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2">
-                    <span className="font-bold text-sm">{log.symbol}</span>
-                    <span className="text-xs text-muted-foreground flex items-center gap-1">
-                      <Clock className="h-3 w-3" />
-                      {log.timestamp}
+                    <span className="font-bold text-sm shrink-0">{log.symbol}</span>
+                    <span className="text-xs text-muted-foreground flex items-center gap-1 min-w-0 truncate font-mono">
+                      <Clock className="h-3 w-3 shrink-0" />
+                      <span className="truncate">{log.timestamp}</span>
                     </span>
                   </div>
-                  <p className="text-xs text-muted-foreground line-clamp-1 mt-0.5">
+                  <p className="text-xs text-muted-foreground truncate mt-0.5" title={log.orderFlow}>
                     {log.orderFlow}
                   </p>
                 </div>
               </div>
 
               {/* 右側: 確信度ゲージと詳細ボタン */}
-              <div className="flex items-center gap-4 sm:justify-end">
-                <div className="w-28 space-y-1">
+              <div className="flex items-center gap-3 sm:gap-4 shrink-0 justify-between sm:justify-end">
+                <div className="w-24 sm:w-28 space-y-1 shrink-0">
                   <div className="flex justify-between text-xs">
-                    <span className="text-muted-foreground">確信度</span>
+                    <span className="text-muted-foreground text-[11px]">確信度</span>
                     <span className="font-mono font-semibold">{confidencePercent}%</span>
                   </div>
                   <Progress
@@ -81,9 +81,18 @@ export function CoTViewer({ logs, pagination }: CoTViewerProps) {
                   />
                 </div>
 
-                <Button variant="ghost" size="sm" className="h-8 gap-1 text-xs">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-8 gap-1 text-xs shrink-0 px-2.5"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setSelectedId(log.id);
+                  }}
+                >
                   <Eye className="h-3.5 w-3.5" />
-                  根拠を開く
+                  <span className="hidden xl:inline">根拠を開く</span>
+                  <span className="inline xl:hidden">根拠</span>
                 </Button>
               </div>
             </div>

@@ -25,25 +25,25 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
-export function ActionBadge({ action }: { action: ActionType }) {
+export function ActionBadge({ action, className }: { action: ActionType; className?: string }) {
   switch (action) {
     case "BUY":
       return (
-        <Badge className="bg-emerald-600 hover:bg-emerald-600 text-white gap-1">
+        <Badge className={cn("bg-emerald-600 hover:bg-emerald-600 text-white gap-1 shrink-0", className)}>
           <ArrowUpRight className="h-3.5 w-3.5" />
           BUY
         </Badge>
       );
     case "SELL":
       return (
-        <Badge className="bg-rose-600 hover:bg-rose-600 text-white gap-1">
+        <Badge className={cn("bg-rose-600 hover:bg-rose-600 text-white gap-1 shrink-0", className)}>
           <ArrowDownRight className="h-3.5 w-3.5" />
           SELL
         </Badge>
       );
     case "HOLD":
       return (
-        <Badge variant="outline" className="text-muted-foreground gap-1 border-dashed">
+        <Badge variant="outline" className={cn("text-muted-foreground gap-1 border-dashed shrink-0", className)}>
           <MinusCircle className="h-3.5 w-3.5" />
           HOLD (見送り)
         </Badge>
