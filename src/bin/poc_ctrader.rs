@@ -129,11 +129,17 @@ async fn main() -> Result<()> {
         println!();
     }
 
-    // 5. 発注経路の検証（--test-order 指定時のみ。実際に建玉が立つ）
-    if std::env::args().any(|a| a == "--test-order") {
-        println!("[5/5] テスト発注（USDJPY 0.01 lot BUY / SL・TP なし）:");
+    // 5. 発注経路の検証（--test-order / --test-order-sltp 指定時のみ。実際に建玉が立つ）
+    let with_sltp = std::env::args().any(|a| a == "--test-order-sltp");
+    if with_sltp || std::env::args().any(|a| a == "--test-order") {
+        // SL 10 pips / TP 20 pips。相対値は価格の 1/100000 単位（USDJPY は 1 pip = 1,000）
+        let (rel_sl, rel_tp) = if with_sltp { (Some(10_000), Some(20_000)) } else { (None, None) };
+        println!(
+            "[5/5] テスト発注（USDJPY 0.01 lot BUY / {}）:",
+            if with_sltp { "SL 10 pips・TP 20 pips" } else { "SL・TP なし" }
+        );
         let volume = ntrade::ctrader::lots_to_volume(0.01);
-        match service.place_market_order_with_sltp("USDJPY", true, volume, None, None).await {
+        match service.place_market_order_with_sltp("USDJPY", true, volume, rel_sl, rel_tp).await {
             Ok(ev) => {
                 let position_id = ev
                     .position
@@ -141,6 +147,19 @@ async fn main() -> Result<()> {
                     .map(|p| p.position_id)
                     .or_else(|| ev.deal.as_ref().map(|d| d.position_id));
                 println!("  ✓ 発注成功: position_id={position_id:?}");
+                // サーバー側に入った SL/TP を実際の建玉から読み出して確認する
+                if with_sltp {
+                    match service.get_open_positions().await {
+                        Ok(open) => match open.iter().find(|p| Some(p.position_id) == position_id) {
+                            Some(p) => println!(
+                                "    entry={:?} SL={:?} TP={:?}",
+                                p.entry_price, p.stop_loss, p.take_profit
+                            ),
+                            None => println!("    (建玉が reconcile に見つかりませんでした)"),
+                        },
+                        Err(e) => println!("    SL/TP の確認に失敗: {e:#}"),
+                    }
+                }
                 // 検証用の建玉なので即座に決済する
                 if let Some(id) = position_id {
                     println!("  決済中...");
