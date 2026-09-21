@@ -33,7 +33,7 @@ const TAB_IDS = ["overview", "cot", "chart", "trades", "lessons", "replay"];
 
 /** 概要タブに出す直近件数 */
 const RECENT_COUNT = 3;
-const COT_PAGE_SIZE = 10;
+const COT_PAGE_SIZE = 30;
 const TRADE_PAGE_SIZE = 20;
 
 const emptyPage = <T,>(): Page<T> => ({ items: [], total: 0 });
