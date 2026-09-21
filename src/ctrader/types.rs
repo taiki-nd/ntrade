@@ -145,6 +145,9 @@ pub struct AccountSummary {
     pub balance: f64,
     pub leverage: Option<f64>,
     pub is_live: bool,
+    /// 口座側の取引権限（FULL_ACCESS / CLOSE_ONLY / NO_TRADING / NO_LOGIN）
+    #[serde(default)]
+    pub access_rights: Option<String>,
 }
 
 /// ブローカー側の保有ポジション（reconcile の結果）

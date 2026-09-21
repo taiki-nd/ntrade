@@ -29,18 +29,20 @@ function CTraderOAuthCallbackContent() {
   const [accounts, setAccounts] = React.useState<AccountInfo[]>([]);
   const [countdown, setCountdown] = React.useState<number>(3);
 
+  // 認可コードは一度しか使えない。Strict Mode では effect が 2 回走るため、
+  // ガードが無いと 2 回目の交換が Spotware に拒否され（Access denied）、
+  // 連携自体は成功しているのに失敗画面が出てしまう。
+  const exchangedCode = React.useRef<string | null>(null);
+
   React.useEffect(() => {
-    if (errorParam || !code) {
+    if (errorParam || !code || exchangedCode.current === code) {
       return;
     }
-
-    let isMounted = true;
+    exchangedCode.current = code;
 
     async function exchange() {
       try {
         const res = await tradingApi.exchangeOAuthCode(code!);
-        if (!isMounted) return;
-
         if (res.success) {
           setStatus("success");
           setAccounts(res.data || []);
@@ -49,7 +51,6 @@ function CTraderOAuthCallbackContent() {
           setErrorMessage(res.message || "トークンの交換に失敗しました。");
         }
       } catch (err: unknown) {
-        if (!isMounted) return;
         setStatus("error");
         setErrorMessage(
           err instanceof Error
@@ -60,10 +61,6 @@ function CTraderOAuthCallbackContent() {
     }
 
     exchange();
-
-    return () => {
-      isMounted = false;
-    };
   }, [code, errorParam, errorDesc]);
 
   // 成功時の自動カウントダウンリダイレクト

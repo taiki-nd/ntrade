@@ -1,8 +1,9 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use ctrader_rs::proto::common::{
-    ProtoMessage, ProtoOaErrorRes, ProtoOaExecutionEvent, ProtoOaExecutionType, ProtoOaGetTrendbarsReq,
-    ProtoOaGetTrendbarsRes, ProtoOaOrderErrorEvent, ProtoOaPayloadType, ProtoOaTradeSide,
+    ProtoMessage, ProtoOaAccessRights, ProtoOaClosePositionReq, ProtoOaErrorRes, ProtoOaExecutionEvent, ProtoOaExecutionType,
+    ProtoOaGetTrendbarsReq, ProtoOaGetTrendbarsRes, ProtoOaOrderErrorEvent, ProtoOaPayloadType, ProtoOaSymbolByIdReq,
+    ProtoOaSymbolByIdRes, ProtoOaTradeSide, ProtoOaTradingMode,
 };
 use ctrader_rs::{Client, Config};
 use prost::Message as _;
@@ -29,6 +30,18 @@ pub enum OrderOutcome {
         error_code: String,
         description: Option<String>,
     },
+}
+
+/// Access Token の取引権限の判定結果
+#[derive(Debug, Clone, PartialEq)]
+pub enum TradingPermission {
+    /// TRADING_DISABLED は返らなかった（打診に対して返った errorCode を保持）。
+    /// 取引可能であることの確証ではない
+    Granted { error_code: String },
+    /// TRADING_DISABLED。scope が accounts か、口座が取引不可
+    Denied { error_code: String, description: String },
+    /// 判定できなかった（通信エラーなど）
+    Unknown(String),
 }
 
 /// 注文応答を待つ上限。ctrader-rs 側の deadline(5s) を含む余裕を見た値。
@@ -157,6 +170,18 @@ impl CTraderService {
 
         // 4. シンボルリストを初期取得
         service.refresh_symbols().await?;
+
+        // 5. 取引権限の確認（TRADING_DISABLED の切り分け用）
+        match service.get_account_info().await {
+            Ok(info) => match info.access_rights.as_deref() {
+                Some("FULL_ACCESS") => info!("Account access rights: FULL_ACCESS (trading enabled)"),
+                Some(other) => warn!(
+                    "Account access rights: {other} — この口座では新規発注ができません（ブローカー側の口座設定を確認してください）"
+                ),
+                None => warn!("Account access rights unknown (accessRights not returned)"),
+            },
+            Err(e) => warn!("Failed to read account access rights: {e:#}"),
+        }
 
         Ok(service)
     }
@@ -328,12 +353,17 @@ impl CTraderService {
         let t = res.trader;
         let digits = t.money_digits.unwrap_or(2);
         let scale = 10f64.powi(digits as i32);
+        let access_rights = t
+            .access_rights
+            .and_then(|r| ProtoOaAccessRights::try_from(r).ok())
+            .map(|r| r.as_str_name().to_string());
         Ok(AccountSummary {
             account_id: t.ctid_trader_account_id,
             trader_login: t.trader_login,
             balance: t.balance as f64 / scale,
             leverage: t.leverage_in_cents.map(|l| l as f64 / 100.0),
             is_live: self.config.is_live,
+            access_rights,
         })
     }
 
@@ -364,6 +394,80 @@ impl CTraderService {
                     .and_then(|ms| chrono::TimeZone::timestamp_millis_opt(&Utc, ms).single()),
             })
             .collect())
+    }
+
+    /// シンボル単位の取引可否（ENABLED / CLOSE_ONLY_MODE / DISABLED_*）を取得する。
+    ///
+    /// ctrader_rs::symbol_by_id は戻り値の型が Req になっており正しくデコードできないため、
+    /// command を直接呼ぶ。
+    pub async fn get_symbol_trading_mode(&self, symbol_name: &str) -> Result<String> {
+        let symbol_id = self.get_symbol_id(symbol_name).await?;
+        let req = ProtoOaSymbolByIdReq {
+            payload_type: Some(ProtoOaPayloadType::ProtoOaSymbolByIdReq as i32),
+            ctid_trader_account_id: self.config.account_id,
+            symbol_id: vec![symbol_id],
+        };
+        let res: ProtoOaSymbolByIdRes = self
+            .client
+            .command(
+                ProtoOaPayloadType::ProtoOaSymbolByIdReq as u32,
+                req,
+                ProtoOaPayloadType::ProtoOaSymbolByIdRes as u32,
+            )
+            .await
+            .map_err(|e| anyhow!(e).context(format!("Failed to fetch symbol details for {symbol_name}")))?;
+        let sym = res
+            .symbol
+            .first()
+            .ok_or_else(|| anyhow!("cTrader returned no symbol details for {symbol_name}"))?;
+        Ok(sym
+            .trading_mode
+            .and_then(|m| ProtoOaTradingMode::try_from(m).ok())
+            .map(|m| m.as_str_name().to_string())
+            .unwrap_or_else(|| "UNKNOWN".to_string()))
+    }
+
+    /// 建玉を作らずに取引権限を打診する。
+    ///
+    /// 存在しないポジションの決済を要求し、返ってきた errorCode を見る。
+    /// 誤って実在の建玉を決済しないよう、既存のどの position_id とも一致しない ID と
+    /// volume=0 を使う。
+    ///
+    /// 注意: `Granted`（TRADING_DISABLED が返らなかった）は取引可能であることの確証ではない。
+    /// 対象ポジションが存在しないため、権限チェックより先に POSITION_NOT_FOUND で
+    /// 弾かれている可能性がある。`Denied` の場合のみ断定できる。
+    pub async fn probe_trading_permission(&self) -> Result<TradingPermission> {
+        let open = self.get_open_positions().await?;
+        let probe_id = open.iter().map(|p| p.position_id).max().unwrap_or(0).saturating_add(1_000_000_000);
+        // volume=0 なら万一 ID が実在しても決済数量はゼロ
+        let req = ProtoOaClosePositionReq {
+            payload_type: Some(ProtoOaPayloadType::ProtoOaClosePositionReq as i32),
+            ctid_trader_account_id: self.config.account_id,
+            position_id: probe_id,
+            volume: 0,
+        };
+        // 応答は ProtoOAOrderErrorEvent で返る。ctrader_rs::close_position は
+        // ExecutionEvent しか想定しておらず errorCode を捨ててしまうため、直接デコードする。
+        let res: Result<ProtoOaOrderErrorEvent, _> = self
+            .client
+            .command(
+                ProtoOaPayloadType::ProtoOaClosePositionReq as u32,
+                req,
+                ProtoOaPayloadType::ProtoOaOrderErrorEvent as u32,
+            )
+            .await;
+        match res {
+            Ok(ev) if ev.error_code == "TRADING_DISABLED" => Ok(TradingPermission::Denied {
+                error_code: ev.error_code,
+                description: ev.description.unwrap_or_default(),
+            }),
+            Ok(ev) => Ok(TradingPermission::Granted { error_code: ev.error_code }),
+            Err(ctrader_rs::Error::Api { error_code, description }) if error_code == "TRADING_DISABLED" => {
+                Ok(TradingPermission::Denied { error_code, description })
+            }
+            Err(ctrader_rs::Error::Api { error_code, .. }) => Ok(TradingPermission::Granted { error_code }),
+            Err(e) => Ok(TradingPermission::Unknown(e.to_string())),
+        }
     }
 
     /// ポジション ID 指定の決済
@@ -456,8 +560,9 @@ impl CTraderService {
             match outcome {
                 OrderOutcome::OrderError { error_code, description } => {
                     return Err(anyhow!(
-                        "cTrader rejected order: {error_code}{}",
-                        description.map(|d| format!(" ({d})")).unwrap_or_default()
+                        "cTrader rejected order: {error_code}{}{}",
+                        description.map(|d| format!(" ({d})")).unwrap_or_default(),
+                        order_error_hint(&error_code)
                     ));
                 }
                 OrderOutcome::Execution(ev) => {
@@ -476,10 +581,11 @@ impl CTraderService {
                         // 受理のみの通知。約定イベントが続くので待ち続ける
                         Some(ProtoOaExecutionType::OrderAccepted) => continue,
                         Some(ProtoOaExecutionType::OrderRejected) | Some(ProtoOaExecutionType::OrderCancelled) => {
+                            let code = ev.error_code.as_deref().unwrap_or("no error code");
                             return Err(anyhow!(
-                                "cTrader {}: {}",
+                                "cTrader {}: {code}{}",
                                 exec_type.map(|t| t.as_str_name()).unwrap_or("UNKNOWN"),
-                                ev.error_code.as_deref().unwrap_or("no error code")
+                                order_error_hint(code)
                             ));
                         }
                         _ => return Ok(*ev),
@@ -492,6 +598,22 @@ impl CTraderService {
     /// 現在の口座設定を取得
     pub fn config(&self) -> &CTraderConfig {
         &self.config
+    }
+}
+
+/// 注文拒否コードに対する、設定側で取りうる対処のヒント
+///
+/// cTrader の errorCode だけでは原因が口座側かトークン側か分からないため、
+/// 切り分けに必要な情報をエラーメッセージ（＝ダッシュボードの未発注理由）に載せる。
+fn order_error_hint(error_code: &str) -> &'static str {
+    match error_code {
+        "TRADING_DISABLED" => {
+            " / Access Token に取引権限が無い可能性があります。設定画面から再認証し、cTrader の認可画面で scope に『Trading』を選択してください（『View only』では発注できません）"
+        }
+        "NOT_ENOUGH_MONEY" => " / 証拠金が不足しています。ロット数またはレバレッジを確認してください",
+        "MARKET_CLOSED" => " / 市場が閉じています",
+        "POSITION_LOCKED" | "POSITION_NOT_FOUND" => " / 対象ポジションの状態を reconcile で確認してください",
+        _ => "",
     }
 }
 

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use ntrade::ctrader::{BarPeriod, CTraderConfig, CTraderService};
+use ntrade::ctrader::{BarPeriod, CTraderConfig, CTraderService, TradingPermission};
 use tracing::error;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -41,12 +41,47 @@ async fn main() -> Result<()> {
     println!("  ✓ 接続およびアプリケーション/口座認証に成功しました！");
     println!();
 
+    // 2.5 口座状態と取引権限の確認（建玉は作らない）
+    match service.get_account_info().await {
+        Ok(info) => println!(
+            "  口座: #{} | 残高: {:.2} | レバレッジ: {} | 取引権限: {}",
+            info.trader_login.unwrap_or(info.account_id),
+            info.balance,
+            info.leverage.map(|l| format!("1:{l:.0}")).unwrap_or_else(|| "不明".into()),
+            info.access_rights.as_deref().unwrap_or("不明")
+        ),
+        Err(e) => println!("  口座情報の取得に失敗: {e:#}"),
+    }
+    println!();
+
+    println!("[2.5] Access Token の取引権限を確認中（発注はしません）...");
+    match service.probe_trading_permission().await {
+        Ok(TradingPermission::Granted { error_code }) => {
+            println!("  ・TRADING_DISABLED は返りませんでした（打診への応答: {error_code}）");
+            println!("    ※ 存在しない建玉への打診のため、取引可能であることの確証ではありません");
+        }
+        Ok(TradingPermission::Denied { error_code, description }) => {
+            println!("  ✗ 取引権限がありません: {error_code} ({description})");
+            println!("    → 設定画面から再認証し、cTrader の認可画面で scope に『Trading』を選択してください。");
+            println!("    → 認可時は対象口座（CTRADER_ACCOUNT_ID）にも許可を与える必要があります。");
+        }
+        Ok(TradingPermission::Unknown(e)) => println!("  ? 判定できませんでした: {e}"),
+        Err(e) => println!("  ? 判定に失敗しました: {e:#}"),
+    }
+    println!();
+
     // 3. 主要通貨ペアのシンボル解決
     println!("[3/4] 主要シンボル (USDJPY, EURUSD) の確認:");
     let pairs = ["USDJPY", "EURUSD"];
     for pair in &pairs {
         match service.get_symbol_id(pair).await {
-            Ok(id) => println!("  ✓ {} -> Symbol ID: {}", pair, id),
+            Ok(id) => {
+                let mode = match service.get_symbol_trading_mode(pair).await {
+                    Ok(m) => m,
+                    Err(e) => format!("取得失敗: {e}"),
+                };
+                println!("  ✓ {} -> Symbol ID: {} | 取引モード: {}", pair, id, mode);
+            }
             Err(e) => println!("  ✗ {} -> 取得失敗: {}", pair, e),
         }
     }
@@ -90,6 +125,32 @@ async fn main() -> Result<()> {
                     println!("  [{}] 取得エラー: {}", period.as_str(), e);
                 }
             }
+        }
+        println!();
+    }
+
+    // 5. 発注経路の検証（--test-order 指定時のみ。実際に建玉が立つ）
+    if std::env::args().any(|a| a == "--test-order") {
+        println!("[5/5] テスト発注（USDJPY 0.01 lot BUY / SL・TP なし）:");
+        let volume = ntrade::ctrader::lots_to_volume(0.01);
+        match service.place_market_order_with_sltp("USDJPY", true, volume, None, None).await {
+            Ok(ev) => {
+                let position_id = ev
+                    .position
+                    .as_ref()
+                    .map(|p| p.position_id)
+                    .or_else(|| ev.deal.as_ref().map(|d| d.position_id));
+                println!("  ✓ 発注成功: position_id={position_id:?}");
+                // 検証用の建玉なので即座に決済する
+                if let Some(id) = position_id {
+                    println!("  決済中...");
+                    match service.close_position_by_id(id, volume).await {
+                        Ok(_) => println!("  ✓ 決済完了 (position_id={id})"),
+                        Err(e) => println!("  ✗ 決済に失敗しました。cTrader アプリで手動決済してください: {e:#}"),
+                    }
+                }
+            }
+            Err(e) => println!("  ✗ 発注失敗: {e:#}"),
         }
         println!();
     }
