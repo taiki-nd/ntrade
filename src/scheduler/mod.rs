@@ -96,7 +96,14 @@ pub async fn after_cycle(state: &AppState, pair: &str) -> anyhow::Result<()> {
                     if broker.iter().any(|b| b.position_id.to_string() == p.id) {
                         remaining.push(p);
                     } else {
-                        // ブローカー側で決済された
+                        // ブローカー側で決済された。
+                        // FIX 発注時は保護注文（SL/TP）が残っている可能性がある。ネッティング口座では
+                        // 建玉が無い状態で発動すると逆建玉を作るため、必ず取り消す。
+                        if let Some(fix) = state.fix_client.read().await.clone() {
+                            if let Err(e) = fix.cancel_protective_orders(&p.id).await {
+                                warn!("Failed to cancel protective orders for closed position {}: {e:#}", p.id);
+                            }
+                        }
                         let is_buy = p.side == "BUY";
                         let sign = if is_buy { 1.0 } else { -1.0 };
                         let close_price = bar.close;

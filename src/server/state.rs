@@ -6,7 +6,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 use crate::ctrader::{token, CTraderConfig, CTraderService, TokenSet};
-use crate::executor::{CTraderOrderSink, DisconnectedOrderSink, OrderSink, PlanBook};
+use crate::executor::{CTraderOrderSink, DisconnectedOrderSink, FixOrderSink, OrderSink, PlanBook};
 use crate::guard::{GuardConfig, DEFAULT_GUARD_CONFIG_PATH};
 use crate::llm::{LlmClient, LlmClientConfig};
 use crate::snapshot::SnapshotBundle;
@@ -35,8 +35,10 @@ pub struct AppState {
     pub plan_book: Arc<RwLock<PlanBook>>,
     /// LLM 推論クライアント
     pub llm: Arc<LlmClient>,
-    /// 発注先（cTrader 接続時は CTraderOrderSink、未接続時は DisconnectedOrderSink）
+    /// 発注先（FIX 設定時は FixOrderSink、cTrader 接続時は CTraderOrderSink、未接続時は DisconnectedOrderSink）
     pub order_sink: Arc<RwLock<Arc<dyn OrderSink>>>,
+    /// FIX 取引セッション（発注を FIX に委ねている場合のみ。決済時の保護注文取り消しに使う）
+    pub fix_client: Arc<RwLock<Option<Arc<crate::fix::FixTradingClient>>>>,
     /// 判断サイクルの直列化
     pub decide_lock: Arc<tokio::sync::Mutex<()>>,
     /// ブローカー残高の最終同期時刻
@@ -109,6 +111,7 @@ impl AppState {
             plan_book: Arc::new(RwLock::new(PlanBook::default())),
             llm: Arc::new(LlmClient::new(LlmClientConfig::default())),
             order_sink: Arc::new(RwLock::new(Arc::new(DisconnectedOrderSink))),
+            fix_client: Arc::new(RwLock::new(None)),
             decide_lock: Arc::new(tokio::sync::Mutex::new(())),
             last_broker_sync: Arc::new(RwLock::new(None)),
         }
@@ -164,7 +167,7 @@ impl AppState {
         *self.ctrader_service.write().await = Some(service_arc.clone());
         *self.ctrader_config.write().await = Some(cfg.clone());
         info!("cTrader connected: live order sink installed ({})", if cfg.is_live { "LIVE" } else { "DEMO" });
-        *self.order_sink.write().await = Arc::new(CTraderOrderSink::new(service_arc));
+        *self.order_sink.write().await = self.build_order_sink(service_arc).await;
         {
             let mut m_lock = self.metrics.write().await;
             m_lock.connection_status.ctrader = "connected".to_string();
@@ -177,6 +180,62 @@ impl AppState {
         } else {
             self.sync_broker_account().await;
         }
+    }
+
+    /// ブローカー側の建玉を成行で決済する。
+    ///
+    /// FIX 発注を使っている場合は FIX 経由で決済し、併せて保護注文（SL/TP）を取り消す。
+    /// ネッティング口座では、建玉が無くなった後に保護注文が残っていると発動時に
+    /// 逆建玉を作ってしまうため、この取り消しは省略できない。
+    pub async fn close_broker_position(&self, position: &Position) -> Result<()> {
+        let entry_is_buy = position.side == "BUY";
+        let fix = self.fix_client.read().await.clone();
+        let service = self.ctrader_service.read().await.clone();
+        let Some(service) = service else {
+            anyhow::bail!("cTrader is not connected; cannot close position {}", position.id);
+        };
+
+        if let Some(fix) = fix {
+            let symbol_id = service.get_symbol_id(&position.symbol).await?;
+            let units = crate::fix::lots_to_units(position.volume_lots);
+            fix.close_position(&position.id, symbol_id, entry_is_buy, units)
+                .await
+                .with_context(|| format!("Failed to close position {} over FIX", position.id))?;
+            return Ok(());
+        }
+
+        let volume = crate::ctrader::lots_to_volume(position.volume_lots);
+        service
+            .place_market_order_with_sltp(&position.symbol, !entry_is_buy, volume, None, None)
+            .await
+            .with_context(|| format!("Failed to close position {} over Open API", position.id))?;
+        Ok(())
+    }
+
+    /// 発注先を決める。
+    ///
+    /// FIX の接続情報（`CTRADER_FIX_*`）が設定されていればそちらを使う。ブローカーが
+    /// Open API の取引を無効化している（新規注文に TRADING_DISABLED が返る）場合の
+    /// 発注経路で、データ取得・口座情報・ポジション照合は Open API のまま。
+    /// 接続に失敗したときは Open API 発注にフォールバックする。
+    async fn build_order_sink(&self, service: Arc<CTraderService>) -> Arc<dyn OrderSink> {
+        match crate::fix::FixConfig::from_env() {
+            Ok(Some(fix_cfg)) => {
+                info!("FIX credentials found; connecting FIX trading session for order execution");
+                match crate::fix::FixTradingClient::connect(fix_cfg).await {
+                    Ok(fix) => {
+                        info!("FIX session established: orders will be placed over FIX");
+                        *self.fix_client.write().await = Some(Arc::new(fix));
+                        let fix = self.fix_client.read().await.clone().expect("just installed");
+                        return Arc::new(FixOrderSink::new(fix, service));
+                    }
+                    Err(e) => warn!("FIX connection failed ({e:#}); falling back to Open API orders"),
+                }
+            }
+            Ok(None) => debug!("No FIX credentials configured; using Open API for orders"),
+            Err(e) => warn!("Invalid FIX configuration ({e:#}); using Open API for orders"),
+        }
+        Arc::new(CTraderOrderSink::new(service))
     }
 
     /// Refresh Token で Access Token を更新し、SQLite に保存して設定に反映する

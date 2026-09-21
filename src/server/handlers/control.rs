@@ -50,19 +50,15 @@ pub async fn emergency_stop(
     for (idx, p) in positions_lock.drain(..).enumerate() {
         total_pnl += p.pnl_amount;
 
-        // cTrader 接続があれば実ブローカー決済リクエスト送信
-        if let Some(ref ctrader) = ctrader_opt {
-            if let Ok(_pos_id) = p.id.replace("pos-", "").parse::<i64>() {
-                let volume = crate::ctrader::lots_to_volume(p.volume_lots);
-                let sym_clone = p.symbol.clone();
-                let is_buy = p.side != "BUY";
-                let c_clone = ctrader.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = c_clone.place_market_order_with_sltp(&sym_clone, is_buy, volume, None, None).await {
-                        warn!("Failed to send cTrader close order: {:?}", e);
-                    }
-                });
-            }
+        // ブローカー側の決済（FIX 設定時は FIX 経由。保護注文の取り消しも行う）
+        if ctrader_opt.is_some() {
+            let state = state.clone();
+            let position = p.clone();
+            tokio::spawn(async move {
+                if let Err(e) = state.close_broker_position(&position).await {
+                    warn!("Failed to close position {} at broker: {e:#}", position.id);
+                }
+            });
         }
 
         closed.push(TradeHistory {

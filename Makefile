@@ -36,6 +36,10 @@ ctrader: ## cTrader Open API 接続とバーデータ取得のPoCを実行
 	@echo "--> Running cTrader Open API PoC..."
 	cargo run --bin poc_ctrader
 
+fix: ## cTrader FIX API 接続の検証 (発注する場合は ORDER=1)
+	@echo "--> Running cTrader FIX API PoC..."
+	cargo run --bin poc_fix -- $(if $(ORDER),--test-order,)
+
 step4: poc ## (旧名) poc のエイリアス
 
 replay-fetch: ## ヒストリカルバーを cTrader から取得 (FROM=YYYY-MM-DD PAIR=USDJPY)

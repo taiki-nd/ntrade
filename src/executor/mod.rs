@@ -146,6 +146,72 @@ impl OrderSink for CTraderOrderSink {
     }
 }
 
+/// FIX 経由の実発注
+///
+/// ブローカーが Open API の取引を無効化している場合に使う。シンボル ID の解決は
+/// Open API 側のキャッシュを使うため、`CTraderService` も併せて持つ。
+///
+/// cTrader の FIX API は注文に SL/TP を添付できないため、約定後に保護注文として
+/// 張り直す（詳細は [`crate::fix::trading`]）。保護注文を付けられなかった場合は、
+/// 無防備な建玉を残さないようポジションを成行で決済してからエラーを返す。
+pub struct FixOrderSink {
+    fix: std::sync::Arc<crate::fix::FixTradingClient>,
+    ctrader: std::sync::Arc<crate::ctrader::CTraderService>,
+}
+
+impl FixOrderSink {
+    pub fn new(
+        fix: std::sync::Arc<crate::fix::FixTradingClient>,
+        ctrader: std::sync::Arc<crate::ctrader::CTraderService>,
+    ) -> Self {
+        Self { fix, ctrader }
+    }
+}
+
+impl OrderSink for FixOrderSink {
+    fn place_market<'a>(
+        &'a self,
+        req: &'a OrderRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<OrderReceipt>> + Send + 'a>> {
+        Box::pin(async move {
+            let is_buy = req.action == Action::Buy;
+            let symbol_id = self.ctrader.get_symbol_id(&req.pair).await?;
+            let units = crate::fix::lots_to_units(req.volume_lots);
+            info!(pair = %req.pair, ?req.action, units, sl = req.stop_loss, tp = req.take_profit, "LIVE order → cTrader FIX");
+
+            let fill = self.fix.place_market_order(symbol_id, is_buy, units).await?;
+
+            let sl = (req.stop_loss > 0.0).then_some(req.stop_loss);
+            let tp = (req.take_profit > 0.0).then_some(req.take_profit);
+            if sl.is_some() || tp.is_some() {
+                if let Err(e) = self
+                    .fix
+                    .attach_protective_orders(&fill.position_id, symbol_id, is_buy, fill.filled_units, sl, tp)
+                    .await
+                {
+                    // SL の無い建玉を放置しない
+                    let closed = self
+                        .fix
+                        .close_position(&fill.position_id, symbol_id, is_buy, fill.filled_units)
+                        .await;
+                    return Err(match closed {
+                        Ok(_) => e.context(format!(
+                            "protective orders failed; position {} was closed to avoid an unprotected trade",
+                            fill.position_id
+                        )),
+                        Err(close_err) => e.context(format!(
+                            "protective orders failed AND closing position {} failed ({close_err:#}); close it manually",
+                            fill.position_id
+                        )),
+                    });
+                }
+            }
+
+            Ok(OrderReceipt { order_id: fill.position_id, filled_price: fill.avg_px })
+        })
+    }
+}
+
 /// 保持中の条件付きプラン
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PendingPlan {

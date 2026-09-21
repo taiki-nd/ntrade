@@ -40,19 +40,13 @@ pub async fn close_position(
     state.persist_positions().await;
     let now_str = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
-    // cTrader への実発注（接続時）
-    let ctrader_opt = {
-        let lock = state.ctrader_service.read().await;
-        lock.clone()
-    };
-    if let Some(ref ctrader) = ctrader_opt {
-        let is_buy_close = target.side != "BUY";
-        let volume = crate::ctrader::lots_to_volume(target.volume_lots);
-        let c_clone = ctrader.clone();
-        let sym = target.symbol.clone();
+    // ブローカー側の決済（FIX 設定時は FIX 経由。保護注文の取り消しも行う）
+    {
+        let state = state.clone();
+        let target = target.clone();
         tokio::spawn(async move {
-            if let Err(e) = c_clone.place_market_order_with_sltp(&sym, is_buy_close, volume, None, None).await {
-                warn!("Failed to send close order to cTrader: {:?}", e);
+            if let Err(e) = state.close_broker_position(&target).await {
+                warn!("Failed to close position {} at broker: {e:#}", target.id);
             }
         });
     }
