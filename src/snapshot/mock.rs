@@ -13,10 +13,10 @@ pub fn simulate_multi_timeframe(
     base_price: f64,
 ) -> (Vec<CandleBar>, Vec<CandleBar>, Vec<CandleBar>, Vec<CandleBar>) {
     (
-        simulate(now, base_price, 60, 240, 0.35, 0.0015),
-        simulate(now, base_price, 60, 60, 0.18, 0.0008),
-        simulate(now, base_price, 60, 15, 0.09, 0.0004),
-        simulate(now, base_price, 60, 5, 0.05, 0.0002),
+        simulate(now, base_price, 200, 240, 0.35, 0.0015),
+        simulate(now, base_price, 200, 60, 0.18, 0.0008),
+        simulate(now, base_price, 200, 15, 0.09, 0.0004),
+        simulate(now, base_price, 200, 5, 0.05, 0.0002),
     )
 }
 

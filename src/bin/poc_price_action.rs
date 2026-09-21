@@ -128,10 +128,10 @@ async fn fetch_or_simulate_bars(
         info!("Found cTrader credentials, attempting live connection...");
         match CTraderService::connect(config).await {
             Ok(service) => {
-                let b4h = service.get_trendbars(pair, BarPeriod::H4, 60).await?;
-                let b1h = service.get_trendbars(pair, BarPeriod::H1, 60).await?;
-                let b15m = service.get_trendbars(pair, BarPeriod::M15, 60).await?;
-                let b5m = service.get_trendbars(pair, BarPeriod::M5, 60).await?;
+                let b4h = service.get_trendbars(pair, BarPeriod::H4, 200).await?;
+                let b1h = service.get_trendbars(pair, BarPeriod::H1, 200).await?;
+                let b15m = service.get_trendbars(pair, BarPeriod::M15, 200).await?;
+                let b5m = service.get_trendbars(pair, BarPeriod::M5, 200).await?;
                 return Ok((b4h, b1h, b15m, b5m, "cTrader 実データ"));
             }
             Err(e) => warn!("cTrader connection failed ({:?}), falling back to simulation.", e),

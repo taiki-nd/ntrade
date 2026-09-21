@@ -315,7 +315,7 @@ mod tests {
 
     #[test]
     fn plots_single_timeframe_png() {
-        let bars = make_sample_bars(70, 154.0);
+        let bars = make_sample_bars(200, 154.0);
         let levels = vec![
             PriceLevel { price: 154.5, tag: "PDH".into() },
             PriceLevel { price: 153.5, tag: "PDL".into() },
@@ -333,6 +333,23 @@ mod tests {
         assert_eq!(&bytes[0..8], b"\x89PNG\r\n\x1a\n");
         assert!(bytes.len() > 1000);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_ema_fully_populated_across_display_bars() {
+        let bars = make_sample_bars(200, 154.0);
+        let config = ChartPlotterConfig::default();
+        let start_idx = bars.len().saturating_sub(config.bars_to_display);
+        let ema20 = calculate_ema(&bars, 20);
+        let ema50 = calculate_ema(&bars, 50);
+
+        let ema20_slice = &ema20[start_idx..];
+        let ema50_slice = &ema50[start_idx..];
+
+        assert_eq!(ema20_slice.len(), config.bars_to_display);
+        assert_eq!(ema50_slice.len(), config.bars_to_display);
+        assert!(ema20_slice.iter().all(|v| v.is_some()), "EMA20 should be populated for all display bars");
+        assert!(ema50_slice.iter().all(|v| v.is_some()), "EMA50 should be populated for all display bars");
     }
 
     #[test]

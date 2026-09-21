@@ -111,10 +111,10 @@ pub async fn generate_snapshot_internal(state: &AppState, pair: &str) -> anyhow:
     // 実データが取れないときは作らない（模擬データのチャートを LLM の判断や画面に使わないため）
     let ctrader = ctrader_opt.ok_or_else(|| anyhow::anyhow!("cTrader is not connected; snapshot needs live bars"))?;
     info!("Fetching real trendbars from connected cTrader...");
-    let b4h = ctrader.get_trendbars(pair, BarPeriod::H4, 60).await.context("failed to fetch 4H bars")?;
-    let b1h = ctrader.get_trendbars(pair, BarPeriod::H1, 60).await.context("failed to fetch 1H bars")?;
-    let b15m = ctrader.get_trendbars(pair, BarPeriod::M15, 60).await.context("failed to fetch 15M bars")?;
-    let b5m = ctrader.get_trendbars(pair, BarPeriod::M5, 60).await.context("failed to fetch 5M bars")?;
+    let b4h = ctrader.get_trendbars(pair, BarPeriod::H4, 200).await.context("failed to fetch 4H bars")?;
+    let b1h = ctrader.get_trendbars(pair, BarPeriod::H1, 200).await.context("failed to fetch 1H bars")?;
+    let b15m = ctrader.get_trendbars(pair, BarPeriod::M15, 200).await.context("failed to fetch 15M bars")?;
+    let b5m = ctrader.get_trendbars(pair, BarPeriod::M5, 200).await.context("failed to fetch 5M bars")?;
 
     let spread_pips = {
         let m = state.metrics.read().await;

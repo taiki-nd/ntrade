@@ -153,7 +153,7 @@ async fn main() -> Result<()> {
                 limit,
                 label,
                 parallel,
-                bars_per_tf: 60,
+                bars_per_tf: 200,
                 spread_pips: spread,
                 max_bars_to_exit: max_bars,
                 chart_root: PathBuf::from("charts"),
