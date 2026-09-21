@@ -1,23 +1,46 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use ctrader_rs::proto::common::{
-    ProtoMessage, ProtoOaExecutionEvent, ProtoOaGetTrendbarsReq, ProtoOaGetTrendbarsRes,
-    ProtoOaPayloadType, ProtoOaTradeSide,
+    ProtoMessage, ProtoOaErrorRes, ProtoOaExecutionEvent, ProtoOaExecutionType, ProtoOaGetTrendbarsReq,
+    ProtoOaGetTrendbarsRes, ProtoOaOrderErrorEvent, ProtoOaPayloadType, ProtoOaTradeSide,
 };
 use ctrader_rs::{Client, Config};
+use prost::Message as _;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::time::Duration;
+use tokio::sync::{broadcast, RwLock};
+use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use super::config::CTraderConfig;
 use super::types::{volume_to_lots, AccountSummary, BarPeriod, BrokerPosition, CandleBar, SymbolInfo};
+
+/// 注文に対するサーバーからの非同期な応答
+///
+/// cTrader は成行注文の結果を clientMsgId 無しの非請求メッセージとして返すため、
+/// 受信ハンドラでデコードしてここに流し、発注側が対応するものを拾う。
+#[derive(Debug, Clone)]
+pub enum OrderOutcome {
+    /// 約定・受理・拒否などの執行イベント
+    Execution(Box<ProtoOaExecutionEvent>),
+    /// 注文が検証段階で弾かれた
+    OrderError {
+        error_code: String,
+        description: Option<String>,
+    },
+}
+
+/// 注文応答を待つ上限。ctrader-rs 側の deadline(5s) を含む余裕を見た値。
+const ORDER_OUTCOME_TIMEOUT: Duration = Duration::from_secs(12);
 
 /// cTrader Open API サービス
 pub struct CTraderService {
     config: CTraderConfig,
     client: Arc<Client>,
     symbols: Arc<RwLock<HashMap<String, SymbolInfo>>>,
+    /// 非請求メッセージから復元した注文応答の配信元
+    order_events: broadcast::Sender<OrderOutcome>,
 }
 
 impl CTraderService {
@@ -34,9 +57,14 @@ impl CTraderService {
         }
 
         // 1. アプリケーション認証 & 接続 & Heartbeat開始
-        let client = Client::start_with_handler(client_config, Some(Self::handle_unsolicited_event))
-            .await
-            .context("Failed to connect & authenticate application with cTrader")?;
+        let (order_events, _) = broadcast::channel::<OrderOutcome>(64);
+        let handler_tx = order_events.clone();
+        let client = Client::start_with_handler(
+            client_config,
+            Some(move |msg: ProtoMessage| handle_unsolicited_event(msg, &handler_tx)),
+        )
+        .await
+        .context("Failed to connect & authenticate application with cTrader")?;
         let client = Arc::new(client);
 
         // 2. Access Token に紐づく取引口座一覧を取得し、Account ID を自動解決
@@ -124,17 +152,13 @@ impl CTraderService {
             config,
             client,
             symbols: Arc::new(RwLock::new(HashMap::new())),
+            order_events,
         };
 
         // 4. シンボルリストを初期取得
         service.refresh_symbols().await?;
 
         Ok(service)
-    }
-
-    /// イベント受信ハンドラ（約定通知やSpot価格更新など）
-    fn handle_unsolicited_event(msg: ProtoMessage) {
-        debug!("Received unsolicited cTrader message (type={})", msg.payload_type);
     }
 
     /// 利用可能なシンボル一覧をAPIから取得して内部キャッシュを更新
@@ -373,25 +397,94 @@ impl CTraderService {
             symbol_name, trade_side, volume, rel_sl_points, rel_tp_points
         );
 
-        match (rel_sl_points, rel_tp_points) {
+        // 注文フレーム送信より先に購読する（応答を取りこぼさないため）
+        let mut rx = self.order_events.subscribe();
+        let deadline = Instant::now() + ORDER_OUTCOME_TIMEOUT;
+
+        // ctrader-rs 0.1.2 の new_market_order* は応答待ちの実装が欠けており、
+        // 注文フレームを送った後に必ず Error::Timeout を返す。送信自体は成功しているので、
+        // Timeout は無視して非請求イベント側で結果を確定させる。
+        let sent = match (rel_sl_points, rel_tp_points) {
             (Some(sl), Some(tp)) => {
                 self.client
-                    .new_market_order_with_sltp(
-                        self.config.account_id,
-                        symbol_id,
-                        trade_side,
-                        volume,
-                        sl,
-                        tp,
-                    )
+                    .new_market_order_with_sltp(self.config.account_id, symbol_id, trade_side, volume, sl, tp)
                     .await
-                    .context("Failed to place market order with SL/TP")
             }
             _ => {
                 self.client
                     .new_market_order(self.config.account_id, symbol_id, trade_side, volume)
                     .await
-                    .context("Failed to place market order")
+            }
+        };
+        match sent {
+            // 将来ライブラリ側が修正された場合はそのまま結果を使う
+            Ok(ev) => return Ok(ev),
+            Err(ctrader_rs::Error::Timeout) => {
+                debug!("Order response not delivered by ctrader-rs; falling back to execution events");
+            }
+            Err(e) => return Err(anyhow!(e).context("Failed to send market order to cTrader")),
+        }
+
+        self.await_order_outcome(&mut rx, symbol_id, deadline).await
+    }
+
+    /// 発注後、対象シンボルの執行イベント（または注文エラー）が届くまで待つ
+    async fn await_order_outcome(
+        &self,
+        rx: &mut broadcast::Receiver<OrderOutcome>,
+        symbol_id: i64,
+        deadline: Instant,
+    ) -> Result<ProtoOaExecutionEvent> {
+        loop {
+            let outcome = match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Ok(o)) => o,
+                Ok(Err(broadcast::error::RecvError::Lagged(n))) => {
+                    warn!("Missed {n} cTrader events while waiting for order result");
+                    continue;
+                }
+                Ok(Err(broadcast::error::RecvError::Closed)) => {
+                    return Err(anyhow!("cTrader event stream closed while waiting for order result"))
+                }
+                Err(_) => {
+                    return Err(anyhow!(
+                        "No execution event received within {}s; order state at broker is unknown",
+                        ORDER_OUTCOME_TIMEOUT.as_secs()
+                    ))
+                }
+            };
+
+            match outcome {
+                OrderOutcome::OrderError { error_code, description } => {
+                    return Err(anyhow!(
+                        "cTrader rejected order: {error_code}{}",
+                        description.map(|d| format!(" ({d})")).unwrap_or_default()
+                    ));
+                }
+                OrderOutcome::Execution(ev) => {
+                    // 他シンボルの建玉更新などが混ざるのでシンボルで絞る
+                    let ev_symbol = ev
+                        .deal
+                        .as_ref()
+                        .map(|d| d.symbol_id)
+                        .or_else(|| ev.order.as_ref().map(|o| o.trade_data.symbol_id))
+                        .or_else(|| ev.position.as_ref().map(|p| p.trade_data.symbol_id));
+                    if ev_symbol != Some(symbol_id) {
+                        continue;
+                    }
+                    let exec_type = ProtoOaExecutionType::try_from(ev.execution_type).ok();
+                    match exec_type {
+                        // 受理のみの通知。約定イベントが続くので待ち続ける
+                        Some(ProtoOaExecutionType::OrderAccepted) => continue,
+                        Some(ProtoOaExecutionType::OrderRejected) | Some(ProtoOaExecutionType::OrderCancelled) => {
+                            return Err(anyhow!(
+                                "cTrader {}: {}",
+                                exec_type.map(|t| t.as_str_name()).unwrap_or("UNKNOWN"),
+                                ev.error_code.as_deref().unwrap_or("no error code")
+                            ));
+                        }
+                        _ => return Ok(*ev),
+                    }
+                }
             }
         }
     }
@@ -399,5 +492,66 @@ impl CTraderService {
     /// 現在の口座設定を取得
     pub fn config(&self) -> &CTraderConfig {
         &self.config
+    }
+}
+
+/// 非請求メッセージ（約定通知・注文エラー・Spot 価格更新など）の受信ハンドラ
+///
+/// 成行注文の結果は clientMsgId を持たないためライブラリの request/response 機構では
+/// 受け取れない。ここでデコードしてログに残し、発注側へ配信する。
+fn handle_unsolicited_event(msg: ProtoMessage, tx: &broadcast::Sender<OrderOutcome>) {
+    let payload = msg.payload.as_deref().unwrap_or_default();
+    match msg.payload_type {
+        t if t == ProtoOaPayloadType::ProtoOaExecutionEvent as u32 => {
+            match ProtoOaExecutionEvent::decode(payload) {
+                Ok(ev) => {
+                    let exec_type = ProtoOaExecutionType::try_from(ev.execution_type)
+                        .map(|t| t.as_str_name().to_string())
+                        .unwrap_or_else(|_| format!("UNKNOWN({})", ev.execution_type));
+                    info!(
+                        exec_type = %exec_type,
+                        error_code = ?ev.error_code,
+                        position_id = ?ev.position.as_ref().map(|p| p.position_id),
+                        order_id = ?ev.order.as_ref().map(|o| o.order_id),
+                        symbol_id = ?ev.order.as_ref().map(|o| o.trade_data.symbol_id),
+                        "cTrader execution event"
+                    );
+                    let _ = tx.send(OrderOutcome::Execution(Box::new(ev)));
+                }
+                Err(e) => warn!("Failed to decode ProtoOAExecutionEvent: {e}"),
+            }
+        }
+        t if t == ProtoOaPayloadType::ProtoOaOrderErrorEvent as u32 => {
+            match ProtoOaOrderErrorEvent::decode(payload) {
+                Ok(ev) => {
+                    warn!(
+                        error_code = %ev.error_code,
+                        description = ?ev.description,
+                        order_id = ?ev.order_id,
+                        "cTrader rejected an order"
+                    );
+                    let _ = tx.send(OrderOutcome::OrderError {
+                        error_code: ev.error_code,
+                        description: ev.description,
+                    });
+                }
+                Err(e) => warn!("Failed to decode ProtoOAOrderErrorEvent: {e}"),
+            }
+        }
+        t if t == ProtoOaPayloadType::ProtoOaErrorRes as u32 => match ProtoOaErrorRes::decode(payload) {
+            Ok(res) => {
+                warn!(
+                    error_code = %res.error_code,
+                    description = ?res.description,
+                    "cTrader error response (unsolicited)"
+                );
+                let _ = tx.send(OrderOutcome::OrderError {
+                    error_code: res.error_code,
+                    description: res.description,
+                });
+            }
+            Err(e) => warn!("Failed to decode ProtoOAErrorRes: {e}"),
+        },
+        t => debug!("Received unsolicited cTrader message (type={t})"),
     }
 }

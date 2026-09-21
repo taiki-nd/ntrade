@@ -13,7 +13,7 @@ use crate::ctrader::{BarPeriod, CandleBar};
 use crate::reflection;
 use crate::server::handlers::decide::run_decision_cycle;
 use crate::server::state::AppState;
-use crate::server::types::{BotState, CloseReason, LessonLearned, TradeHistory};
+use crate::server::types::{BotState, CloseReason, LessonLearned, Position, TradeHistory};
 
 pub const LESSON_ADOPT_THRESHOLD: usize = 3;
 pub const LESSON_MAX_ACTIVE: usize = 10;
@@ -129,6 +129,40 @@ pub async fn after_cycle(state: &AppState, pair: &str) -> anyhow::Result<()> {
                         });
                     }
                 }
+                // ブローカーにあってローカルに無い建玉（発注は通ったが記録に失敗した等）を取り込む
+                let orphans: Vec<_> = broker
+                    .iter()
+                    .filter(|b| !remaining.iter().any(|p| p.id == b.position_id.to_string()))
+                    .cloned()
+                    .collect();
+                for b in orphans {
+                    let symbol = b.symbol_name.clone().unwrap_or_else(|| format!("symbol-{}", b.symbol_id));
+                    warn!(
+                        position_id = b.position_id,
+                        symbol = %symbol,
+                        "orphan broker position adopted (not tracked locally)"
+                    );
+                    remaining.push(Position {
+                        id: b.position_id.to_string(),
+                        symbol,
+                        side: if b.is_buy { "BUY".into() } else { "SELL".into() },
+                        volume_lots: b.volume_lots,
+                        entry_price: b.entry_price.unwrap_or(bar.close),
+                        current_price: bar.close,
+                        stop_loss: b.stop_loss.unwrap_or_default(),
+                        take_profit: b.take_profit.unwrap_or_default(),
+                        pnl_pips: 0.0,
+                        pnl_amount: 0.0,
+                        open_time: b
+                            .open_time
+                            .unwrap_or(bar.timestamp)
+                            .format("%Y-%m-%d %H:%M:%S")
+                            .to_string(),
+                        invalidation_reason: "ブローカー側から取り込んだ建玉（ntrade の記録に無し）".into(),
+                        cot_log_id: None,
+                    });
+                }
+
                 // 確定足終値で含み損益を更新
                 let pip = crate::snapshot::measures::get_pip_size(pair);
                 let pv = crate::snapshot::measures::pip_value_per_lot(pair);

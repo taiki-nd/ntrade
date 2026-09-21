@@ -105,6 +105,14 @@ impl CTraderOrderSink {
     }
 }
 
+/// エントリー価格から SL/TP までの距離を cTrader の相対値に変換する。
+///
+/// 相対 SL/TP の単位は価格の 1/100000。pip 幅ではなく価格差そのものを換算するため、
+/// USDJPY（1 pip = 0.01）なら 1 pip = 1,000、EURUSD（1 pip = 0.0001）なら 1 pip = 10 になる。
+pub fn relative_points(entry: f64, target: f64) -> i64 {
+    ((entry - target).abs() * 100_000.0).round() as i64
+}
+
 impl OrderSink for CTraderOrderSink {
     fn place_market<'a>(
         &'a self,
@@ -112,12 +120,7 @@ impl OrderSink for CTraderOrderSink {
     ) -> Pin<Box<dyn Future<Output = Result<OrderReceipt>> + Send + 'a>> {
         Box::pin(async move {
             let is_buy = req.action == Action::Buy;
-            let pip_size = crate::snapshot::measures::get_pip_size(&req.pair);
-            // 相対 SL/TP は protocol points（1 pip = 10,000 points）。entry_hint を基準に距離を出す。
-            let rel = |p: f64| {
-                let pips = (req.entry_hint - p).abs() / pip_size;
-                (pips * 10_000.0).round() as i64
-            };
+            let rel = |p: f64| relative_points(req.entry_hint, p);
             let volume = crate::ctrader::lots_to_volume(req.volume_lots);
             info!(pair = %req.pair, ?req.action, volume, sl = req.stop_loss, tp = req.take_profit, "LIVE order → cTrader");
             let ev = self
@@ -242,6 +245,18 @@ mod tests {
 
     fn bar(t: DateTime<Utc>, close: f64) -> CandleBar {
         CandleBar { timestamp: t, open: close, high: close + 0.02, low: close - 0.02, close, volume: 1 }
+    }
+
+    #[test]
+    fn relative_points_uses_price_units_not_pips() {
+        // USDJPY: 11 pips = 0.110 → 11,000
+        assert_eq!(relative_points(157.150, 157.040), 11_000);
+        // USDJPY: 33 pips = 0.330 → 33,000
+        assert_eq!(relative_points(157.150, 157.480), 33_000);
+        // EURUSD: 11 pips = 0.0011 → 110
+        assert_eq!(relative_points(1.08500, 1.08390), 110);
+        // 向きに依らず絶対距離
+        assert_eq!(relative_points(157.040, 157.150), 11_000);
     }
 
     #[test]
