@@ -27,7 +27,7 @@ function fmt(v: number | null | undefined, digits = 1): string {
 
 export function ChartPreview() {
   const [mode, setMode] = React.useState<"tabs" | "grid">("tabs");
-  const [cacheKey, setCacheKey] = React.useState<number>(() => Date.now());
+  const [cacheKey, setCacheKey] = React.useState<number>(0);
   const [snapshot, setSnapshot] = React.useState<MarketSnapshot | null>(null);
   const [isRegenerating, setIsRegenerating] = React.useState<boolean>(false);
   const [errored, setErrored] = React.useState<Record<ChartTimeframe, boolean>>({
@@ -47,6 +47,7 @@ export function ChartPreview() {
   }, []);
 
   React.useEffect(() => {
+    setCacheKey(Date.now());
     let cancelled = false;
     tradingApi
       .getLatestSnapshot()
@@ -60,6 +61,7 @@ export function ChartPreview() {
       cancelled = true;
     };
   }, []);
+
 
   const handleRegenerate = async () => {
     try {
@@ -91,6 +93,10 @@ export function ChartPreview() {
           <ImageIcon className="h-8 w-8 text-muted-foreground mx-auto" />
           <p className="text-sm text-muted-foreground">{tf} の画像がまだありません。</p>
         </div>
+      ) : cacheKey === 0 ? (
+        <div className="text-center p-6 space-y-2">
+          <Loader2 className="h-6 w-6 animate-spin text-muted-foreground mx-auto" />
+        </div>
       ) : (
         // eslint-disable-next-line @next/next/no-img-element
         <img
@@ -102,6 +108,7 @@ export function ChartPreview() {
       )}
     </div>
   );
+
 
   return (
     <Card className="shadow-xs">

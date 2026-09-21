@@ -139,7 +139,7 @@ export default function SettingsPage() {
               </div>
               <Button size="sm" onClick={startOAuth} disabled={linking} className="h-8 gap-1.5 text-xs shrink-0">
                 {linking ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Link2 className="h-3.5 w-3.5" />}
-                {status?.connectionStatus.ctrader === "connected" ? "cTrader を再連携" : "cTrader と連携"}
+                {status?.connectionStatus.ctrader === "connected" ? "cTrader と再連携" : "cTrader と連携"}
               </Button>
             </div>
           </CardHeader>

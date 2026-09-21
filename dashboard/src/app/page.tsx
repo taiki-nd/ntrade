@@ -103,7 +103,7 @@ export default function TradingDashboard() {
         return;
       }
       if (newState === "running") {
-        toast.success("自動売買エンジンを稼働開始しました", {
+        toast.success("自動売買エンジンの稼働を開始しました", {
           description: "5分足確定ごとにLLM推論とリスクチェックが実行されます。",
         });
       } else {
@@ -239,9 +239,9 @@ export default function TradingDashboard() {
 
           {/* 全体概要タブ */}
           <TabsContent value="overview" className="space-y-4">
-            <div className="grid grid-cols-1 xl:grid-cols-12 gap-6">
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
               {/* 左カラム: ポジション + チャート (7/12) */}
-              <div className="xl:col-span-7 space-y-6">
+              <div className="lg:col-span-7 space-y-6">
                 <PositionTable
                   positions={positions}
                   onClosePosition={handleClosePosition}
@@ -250,12 +250,13 @@ export default function TradingDashboard() {
               </div>
 
               {/* 右カラム: 条件付きプラン + LLM思考ログ (5/12) */}
-              <div className="xl:col-span-5 space-y-6">
+              <div className="lg:col-span-5 space-y-6">
                 <PlanMonitor onDecided={syncWithBackend} />
                 <CoTViewer logs={recentCotLogs} />
                 <TradeHistoryTable trades={recentTrades} />
               </div>
             </div>
+
           </TabsContent>
 
           {/* LLM思考ログ タブ */}

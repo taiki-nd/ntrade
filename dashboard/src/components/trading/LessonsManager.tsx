@@ -82,7 +82,7 @@ export function LessonsManager({
             <span>AI 自己反省 & 教訓マネージャー (Lessons Learned)</span>
           </CardTitle>
           <CardDescription className="text-xs">
-            損切り・失敗トレードの自己反省（Self-Reflection）から自動蓄積され、次回の推論プロンプトに注入される厳格ルール
+            損切り・失敗トレードの自己反省（Self-Reflection）から自動蓄積され、次回の推論プロンプトに反映される教訓ルール
           </CardDescription>
         </div>
 
@@ -202,7 +202,7 @@ export function LessonsManager({
                 <div className="flex items-center gap-3 shrink-0">
                   <div className="flex items-center gap-1.5">
                     <span className="text-xs text-muted-foreground">
-                      {lesson.active ? "プロンプト注入中" : "無効"}
+                      {lesson.active ? "プロンプトに適用中" : "無効"}
                     </span>
                     <Switch
                       checked={lesson.active}

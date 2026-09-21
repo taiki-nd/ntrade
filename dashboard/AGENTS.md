@@ -43,7 +43,7 @@ AIが生成しがちな以下の安っぽいデザイン手癖を**固く禁止*
    * トークン浪費、ダークモードの破綻、デザイン崩壊の原因となります。
    * UIコンポーネント側は常にセマンティックトークン（`bg-primary`, `bg-background`, `border-border`, `text-muted-foreground` 等）のみで記述してください。
 
-2. **色・質感の変更は CSS 変数（`globals.css`）または属性属性で完結させること**:
+2. **色・質感の変更は CSS 変数（`globals.css`）または data 属性で完結させること**:
    * ユーザーから指定された色やトーンは、UIのTailwindクラスを書き換えるのではなく、`src/app/globals.css` のセマンティック変数を調整するか、`html` タグに以下のプリセット属性（2大直交軸）を付与することで制御してください：
      * **アクセントカラー軸**: `data-accent-color="blue|emerald|violet|rose|orange"`（ボタン、バッジ、リング、ホバーのティント背景色 `--accent` / `--accent-foreground` も全自動連動）
      * **ベーストーン軸**: `data-base-tone="slate|stone|oled"`（背景、カード、枠線のトーン）

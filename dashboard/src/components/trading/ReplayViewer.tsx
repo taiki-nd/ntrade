@@ -117,7 +117,7 @@ export function ReplayViewer() {
               <span>リプレイ結果</span>
             </CardTitle>
             <CardDescription className="text-xs">
-              過去スナップショットに対する LLM 判断の採点。確信度帯ごとの勝率でガード閾値を較正する。
+              過去スナップショットに対する LLM 判断の採点。確信度帯ごとの勝率でガード閾値を較正。
             </CardDescription>
           </div>
           <Button variant="outline" size="sm" onClick={load} disabled={loading} className="h-8 gap-1.5 text-xs">
@@ -186,8 +186,8 @@ export function ReplayViewer() {
               <span>ガード通過 {report.guard_pass}</span>
               <span>HOLD率 {pct(report.hold_rate)}</span>
               <span>条件付きプラン率 {pct(report.plan_rate)} (成立 {report.plan_triggered})</span>
-              <span>画像未読率 {pct(report.unobserved_rate)}</span>
-              <span>反対材料なし率 {pct(report.conflicts_empty_rate)}</span>
+              <span>画像未参照率 {pct(report.unobserved_rate)}</span>
+              <span>反対材料未記載率 {pct(report.conflicts_empty_rate)}</span>
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">

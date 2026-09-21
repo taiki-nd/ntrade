@@ -83,7 +83,7 @@ export function PlanMonitor({ onDecided }: PlanMonitorProps) {
             <span>条件付きプラン</span>
           </CardTitle>
           <CardDescription className="text-xs">
-            LLM が「待ち」と判断した条件。5M 確定ごとにプログラムが評価し、成立時はガードを通して執行する。
+            LLM が「待ち」と判断した条件。5M 確定ごとにプログラムが評価し、成立時はガードを通して執行。
           </CardDescription>
         </div>
         <Button size="sm" onClick={handleDecide} disabled={deciding} className="h-8 gap-1.5 text-xs">

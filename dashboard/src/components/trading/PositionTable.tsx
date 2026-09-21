@@ -97,28 +97,28 @@ export function PositionTable({ positions, onClosePosition }: PositionTableProps
                           {pos.side}
                         </Badge>
                       </TableCell>
-                      <TableCell className="text-right font-mono text-sm">
+                      <TableCell className="text-right font-mono tabular-nums text-sm">
                         {pos.volumeLots.toFixed(2)} lot
                       </TableCell>
-                      <TableCell className="text-right font-mono text-sm">
+                      <TableCell className="text-right font-mono tabular-nums text-sm">
                         {pos.entryPrice.toFixed(pos.symbol.includes("JPY") ? 3 : 5)}
                       </TableCell>
-                      <TableCell className="text-right font-mono text-sm font-semibold">
+                      <TableCell className="text-right font-mono tabular-nums text-sm font-semibold">
                         {pos.currentPrice.toFixed(pos.symbol.includes("JPY") ? 3 : 5)}
                       </TableCell>
                       <TableCell className="text-right">
                         <div className="flex flex-col items-end gap-0.5">
-                          <span className="font-mono text-xs text-rose-600 dark:text-rose-400">
+                          <span className="font-mono tabular-nums text-xs text-rose-600 dark:text-rose-400">
                             SL: {pos.stopLoss.toFixed(pos.symbol.includes("JPY") ? 3 : 5)}
                           </span>
-                          <span className="font-mono text-xs text-emerald-600 dark:text-emerald-400">
+                          <span className="font-mono tabular-nums text-xs text-emerald-600 dark:text-emerald-400">
                             TP: {pos.takeProfit.toFixed(pos.symbol.includes("JPY") ? 3 : 5)}
                           </span>
                         </div>
                       </TableCell>
                       <TableCell
                         className={cn(
-                          "text-right font-mono text-sm font-semibold",
+                          "text-right font-mono tabular-nums text-sm font-semibold",
                           isPositive
                             ? "text-emerald-600 dark:text-emerald-400"
                             : "text-rose-600 dark:text-rose-400"
@@ -129,7 +129,7 @@ export function PositionTable({ positions, onClosePosition }: PositionTableProps
                       </TableCell>
                       <TableCell
                         className={cn(
-                          "text-right font-mono text-sm font-bold",
+                          "text-right font-mono tabular-nums text-sm font-bold",
                           isPositive
                             ? "text-emerald-600 dark:text-emerald-400"
                             : "text-rose-600 dark:text-rose-400"
@@ -138,6 +138,7 @@ export function PositionTable({ positions, onClosePosition }: PositionTableProps
                         {isPositive ? "+" : ""}
                         {formatCurrency(pos.pnlAmount)}
                       </TableCell>
+
                       <TableCell className="text-center">
                         <Button
                           variant="ghost"

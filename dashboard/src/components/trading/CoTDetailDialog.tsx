@@ -237,6 +237,15 @@ export function CoTDetailDialog({ cotLogId, onClose }: CoTDetailDialogProps) {
               <p className="text-sm leading-relaxed font-medium">{log.orderFlow}</p>
             </div>
 
+            {/* シナリオ無効化価格 (客観的SL理由) */}
+            <div className="space-y-1.5 p-3 rounded-lg border border-rose-500/20 bg-rose-50/30 dark:bg-rose-950/20">
+              <div className="flex items-center gap-2 text-xs font-semibold text-rose-600 dark:text-rose-400">
+                <ShieldCheck className="h-4 w-4" />
+                <span>3. シナリオ無効化ライン（客観的損切り根拠）</span>
+              </div>
+              <p className="text-sm leading-relaxed text-foreground">{log.invalidation}</p>
+            </div>
+
             {/* 反対材料 */}
             {log.conflicts && (
               <div className="space-y-1.5 p-3 rounded-lg border bg-card">
@@ -247,20 +256,11 @@ export function CoTDetailDialog({ cotLogId, onClose }: CoTDetailDialogProps) {
               </div>
             )}
 
-            {/* シナリオ無効化価格 (客観的SL理由) */}
-            <div className="space-y-1.5 p-3 rounded-lg border border-rose-500/20 bg-rose-50/30 dark:bg-rose-950/20">
-              <div className="flex items-center gap-2 text-xs font-semibold text-rose-600 dark:text-rose-400">
-                <ShieldCheck className="h-4 w-4" />
-                <span>3. シナリオ無効化ライン（客観的損切り根拠）</span>
-              </div>
-              <p className="text-sm leading-relaxed text-foreground">{log.invalidation}</p>
-            </div>
-
             {/* 総合思考ロジック (Reasoning全文) */}
             <div className="space-y-1.5 p-3 rounded-lg border bg-muted/30">
               <div className="flex items-center gap-2 text-xs font-semibold text-muted-foreground">
                 <Target className="h-4 w-4 text-indigo-500" />
-                <span>4. LLM 総合判断理由 (CoT Reasoning)</span>
+                <span>5. LLM 総合判断理由 (CoT Reasoning)</span>
               </div>
               <p className="text-sm leading-relaxed text-muted-foreground whitespace-pre-wrap">
                 {log.reasoning}

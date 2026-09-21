@@ -52,3 +52,4 @@ make clean
 - [03. cTrader Open API 連携仕様](./docs/03_ctrader_spec.md)
 - [04. ロードマップ & 確定技術スタック](./docs/04_roadmap_and_tech_stack.md)
 - [05. AI学習プロセス & プロンプト改善サイクル](./docs/05_ai_learning_and_prompt_tuning.md)
+- [06. リプレイ環境（LLM判断の評価・較正基盤）](./docs/06_replay_environment.md)

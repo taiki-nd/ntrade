@@ -105,7 +105,7 @@ function DashboardNavContent({
                   title="サイドバーを縮小"
                 >
                   <PanelLeftClose className="h-4 w-4" />
-                  <span className="sr-only">Toggle sidebar</span>
+                  <span className="sr-only">サイドバーを折りたたむ</span>
                 </Button>
               )}
             </>
@@ -229,7 +229,7 @@ export function DashboardLayout({ children, navItems = defaultNavItems, title = 
             <Sheet open={open} onOpenChange={setOpen}>
               <SheetTrigger className={cn(buttonVariants({ variant: "ghost", size: "icon" }), "md:hidden cursor-pointer")}>
                 <Menu className="h-5 w-5" />
-                <span className="sr-only">Toggle navigation</span>
+                <span className="sr-only">ナビゲーションを開閉</span>
               </SheetTrigger>
               <SheetContent side="left" className="w-64 p-0">
                 <DashboardNavContent
@@ -265,13 +265,14 @@ export function DashboardLayout({ children, navItems = defaultNavItems, title = 
             )}
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 shrink-0">
             <ColorThemeToggle />
             <ThemeToggle />
           </div>
         </header>
 
-        <main className="flex-1 p-4 md:p-6 lg:p-8">{children}</main>
+        <main className="flex-1 p-4 md:p-5 lg:p-6">{children}</main>
+
       </div>
     </div>
   )

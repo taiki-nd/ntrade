@@ -104,7 +104,7 @@ export function TradeHistoryTable({ trades, pagination }: TradeHistoryTableProps
                     colSpan={10}
                     className="h-24 text-center text-muted-foreground text-sm"
                   >
-                    決済済みトレード履歴はありません
+                    決済済みのトレード履歴はありません
                   </TableCell>
                 </TableRow>
               ) : (
@@ -133,18 +133,18 @@ export function TradeHistoryTable({ trades, pagination }: TradeHistoryTableProps
                           {trd.side}
                         </Badge>
                       </TableCell>
-                      <TableCell className="text-right font-mono text-sm">
+                      <TableCell className="text-right font-mono tabular-nums text-sm">
                         {trd.volumeLots.toFixed(2)} lot
                       </TableCell>
-                      <TableCell className="text-right font-mono text-sm">
+                      <TableCell className="text-right font-mono tabular-nums text-sm">
                         {trd.entryPrice.toFixed(trd.symbol.includes("JPY") ? 3 : 5)}
                       </TableCell>
-                      <TableCell className="text-right font-mono text-sm font-medium">
+                      <TableCell className="text-right font-mono tabular-nums text-sm font-medium">
                         {trd.closePrice.toFixed(trd.symbol.includes("JPY") ? 3 : 5)}
                       </TableCell>
                       <TableCell
                         className={cn(
-                          "text-right font-mono text-sm font-semibold",
+                          "text-right font-mono tabular-nums text-sm font-semibold",
                           isPositive
                             ? "text-emerald-600 dark:text-emerald-400"
                             : "text-rose-600 dark:text-rose-400"
@@ -155,7 +155,7 @@ export function TradeHistoryTable({ trades, pagination }: TradeHistoryTableProps
                       </TableCell>
                       <TableCell
                         className={cn(
-                          "text-right font-mono text-sm font-bold",
+                          "text-right font-mono tabular-nums text-sm font-bold",
                           isPositive
                             ? "text-emerald-600 dark:text-emerald-400"
                             : "text-rose-600 dark:text-rose-400"
@@ -167,9 +167,10 @@ export function TradeHistoryTable({ trades, pagination }: TradeHistoryTableProps
                       <TableCell className="text-center">
                         {getCloseReasonBadge(trd.closeReason)}
                       </TableCell>
-                      <TableCell className="text-right text-xs text-muted-foreground font-mono">
+                      <TableCell className="text-right text-xs text-muted-foreground font-mono tabular-nums">
                         {trd.closeTime}
                       </TableCell>
+
                       <TableCell className="text-center">
                         {trd.cotLogId ? (
                           <Button

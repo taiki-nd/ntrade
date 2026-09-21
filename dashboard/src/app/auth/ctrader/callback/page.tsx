@@ -104,7 +104,7 @@ function CTraderOAuthCallbackContent() {
         </div>
 
         <CardTitle className="text-xl">
-          {status === "loading" && "cTrader アカウントを認証中..."}
+          {status === "loading" && "cTrader アカウントと連携中..."}
           {status === "success" && "cTrader 連携が完了しました！"}
           {status === "error" && "連携に失敗しました"}
         </CardTitle>
@@ -122,7 +122,7 @@ function CTraderOAuthCallbackContent() {
         {status === "loading" && (
           <div className="space-y-2 text-center text-sm text-muted-foreground">
             <p>・ 認可コードの検証中...</p>
-            <p>・ トークンを .env に自動保存中...</p>
+            <p>・ トークンをデータベースに保存中...</p>
             <p>・ cTrader Open API ソケットに接続中...</p>
           </div>
         )}

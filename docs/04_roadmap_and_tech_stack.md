@@ -53,7 +53,7 @@ Step 4 で実装した `PriceActionAnalyzer` は、ピンバー・包み足・�
 
 1. **プログラムは客観的事実のみを渡す**: 時間足ごとの画像4枚、15M/5Mの生OHLC、ATR・前日高安・キリ番・スイング価格リスト。パターン判定とラベル付けは削除。
 2. **プログラムの役割は事後ガードと条件執行**: LLM出力の機械的検証と、LLMが出した条件付きプランの監視・発注。入力前の相場観の絞り込みは行わない。
-3. **リプレイ環境を本番稼働より先に用意する**: 裁量をLLMに移すと従来のバックテストが効かないため、過去スナップショットでLLM判断を採点する仕組みが無いとプロンプト改善の良否を判定できない。
+3. **リプレイ環境を本番稼働より先に用意する**: 裁量をLLMに移すと従来のバックテストが効かないため、過去スナップショットでLLM判断を採点する仕組みがないとプロンプト改善の良否を判定できない。
 
 ### Step 1: Rust プロジェクト初期化 & CLI推論PoC (最優先)
 - `Cargo.toml` の作成（`tokio`, `serde`, `serde_json`, `plotters`, `axum` など）。
@@ -84,7 +84,7 @@ Step 4 で実装した `PriceActionAnalyzer` は、ピンバー・包み足・�
   - `/api/lessons` (CRUD): 教訓ルールの取得、新規登録、有効/無効トグル、削除。
   - `/api/chart/latest`, `/api/chart/generate`: 4分割チャートPNG画像配信およびオンデマンド再生成。
 - **アプリ内 OAuth 認証フロー（cTrader ワンクリック連携）**:
-  - 管理画面ヘッダー（`BotControlHeader`）に「cTraderを連携」ボタンおよび認可モーダルを配備。
+  - 管理画面ヘッダー（`BotControlHeader`）に「cTraderと連携」ボタンおよび認可モーダルを配備。
   - `/api/auth/ctrader/url` で Spotware 認可画面URLを生成。
   - コールバック（`/auth/ctrader/callback`）で認可コード（`code`）を受け取り、`/api/auth/ctrader/exchange` で Access/Refresh Token を自動交換・`.env` に保存・cTrader ソケット接続を即時確立。
 - **リアルタイム監視 UI**: Next.js 管理画面から 5 秒ポーリングで全データ（ポジション、履歴、CoT、メトリクス）が常時同期され、手動決済や緊急停止、教訓追加が双方向リアルタイムに連動。

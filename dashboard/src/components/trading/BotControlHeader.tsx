@@ -54,10 +54,10 @@ interface StatProps {
 function Stat({ label, value, sub, valueClassName, title }: StatProps) {
   return (
     <div className="flex flex-col leading-tight" title={title}>
-      <span className="text-[11px] text-muted-foreground">{label}</span>
+      <span className="text-[11px] font-medium text-muted-foreground">{label}</span>
       <span className="flex items-baseline gap-1.5 whitespace-nowrap">
-        <span className={cn("text-sm font-semibold tabular-nums", valueClassName)}>{value}</span>
-        {sub && <span className="text-[11px] tabular-nums text-muted-foreground">{sub}</span>}
+        <span className={cn("text-sm font-semibold font-mono tabular-nums tracking-tight", valueClassName)}>{value}</span>
+        {sub && <span className="text-[11px] font-mono tabular-nums text-muted-foreground">{sub}</span>}
       </span>
     </div>
   );
@@ -110,7 +110,7 @@ export function BotControlHeader({
       case "running":
         return (
           <div className="flex items-center gap-1.5" title="AUTO RUNNING">
-            <span className="h-2 w-2 rounded-full bg-emerald-500" />
+            <span className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse" />
             <span className="text-sm font-semibold text-emerald-600 dark:text-emerald-400">稼働中</span>
           </div>
         );
@@ -144,97 +144,104 @@ export function BotControlHeader({
     .join("\n");
 
   return (
-    <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-5 gap-y-2 py-2">
-      {getStatusBadge()}
+    <>
+      <div className="flex min-w-0 flex-1 items-center justify-between gap-4 py-1.5 overflow-x-auto scrollbar-none">
+        {/* 左側: ステータス + 口座サマリー */}
+        <div className="flex items-center gap-x-4 lg:gap-x-5 min-w-0 shrink-0">
+          <div className="shrink-0">{getStatusBadge()}</div>
 
-      <Separator orientation="vertical" className="hidden h-8 self-center sm:block" />
+          <Separator orientation="vertical" className="hidden h-7 shrink-0 sm:block" />
 
-      {/* 口座サマリー */}
-      <div className="flex flex-wrap items-center gap-x-5 gap-y-1">
-        <Stat label="純資産" value={formatCurrency(metrics.equity)} title={balanceTitle} />
-        <Stat
-          label="本日確定"
-          value={formatCurrency(metrics.dailyPnl, true)}
-          sub={`${metrics.dailyPnl > 0 ? "+" : ""}${metrics.dailyPnlPercent.toFixed(2)}%`}
-          valueClassName={pnlClass(metrics.dailyPnl)}
-        />
-        <Stat
-          label="含み損益"
-          value={formatCurrency(metrics.unrealizedPnl, true)}
-          sub={`証拠金 ${formatCurrency(metrics.margin)}`}
-          valueClassName={pnlClass(metrics.unrealizedPnl)}
-        />
-        <Stat
-          label="本日勝率"
-          value={`${metrics.winRateToday.toFixed(1)}%`}
-          sub={`${metrics.winningTradesToday}勝${metrics.totalTradesToday - metrics.winningTradesToday}敗`}
-        />
-        <Stat
-          label="スプレッド"
-          value={`UJ ${metrics.usdjpySpread} / EU ${metrics.eurusdSpread}`}
-          sub={`日次上限 ${metrics.circuitBreakerThresholdPercent}%`}
-        />
-      </div>
-
-      {/* 接続状態 & コントロール */}
-      <div className="ml-auto flex items-center gap-1.5">
-        <Button
-          variant="ghost"
-          size="sm"
-          onClick={() => setShowOAuthDialog(true)}
-          title={`cTrader連携設定${metrics.connectionStatus.accountNumber ? ` / ${metrics.connectionStatus.accountNumber}` : ""}`}
-          className="gap-1.5 text-xs text-muted-foreground hover:text-foreground cursor-pointer"
-        >
-          <Server className={`h-3.5 w-3.5 ${isCtraderConnected ? "text-emerald-500" : "text-rose-500"}`} />
-          {isCtraderConnected ? (
-            metrics.connectionStatus.pingMs > 0
-              ? `${metrics.connectionStatus.environment} ${metrics.connectionStatus.pingMs}ms`
-              : metrics.connectionStatus.environment
-          ) : (
-            <span className="text-rose-500">cTrader未接続</span>
-          )}
-        </Button>
-
-        <div
-          className="hidden items-center gap-1.5 px-1.5 text-xs text-muted-foreground md:flex"
-          title="LLM Pipeline: claude -p / agy -p"
-        >
-          <Cpu className="h-3.5 w-3.5" />
-          {metrics.connectionStatus.llm}
+          {/* 口座サマリー */}
+          <div className="flex items-center gap-x-4 lg:gap-x-5">
+            <Stat label="純資産" value={formatCurrency(metrics.equity)} title={balanceTitle} />
+            <Stat
+              label="本日確定"
+              value={formatCurrency(metrics.dailyPnl, true)}
+              sub={`${metrics.dailyPnl > 0 ? "+" : ""}${metrics.dailyPnlPercent.toFixed(2)}%`}
+              valueClassName={pnlClass(metrics.dailyPnl)}
+            />
+            <Stat
+              label="含み損益"
+              value={formatCurrency(metrics.unrealizedPnl, true)}
+              sub={`証拠金 ${formatCurrency(metrics.margin)}`}
+              valueClassName={pnlClass(metrics.unrealizedPnl)}
+            />
+            <Stat
+              label="本日勝率"
+              value={`${metrics.winRateToday.toFixed(1)}%`}
+              sub={`${metrics.winningTradesToday}勝${metrics.totalTradesToday - metrics.winningTradesToday}敗`}
+            />
+            <Stat
+              label="スプレッド"
+              value={`UJ ${metrics.usdjpySpread} / EU ${metrics.eurusdSpread}`}
+              sub="pips"
+            />
+          </div>
         </div>
 
-        {botState === "running" ? (
+        {/* 右側: 接続状態 & コントロール */}
+        <div className="ml-auto flex items-center gap-2 shrink-0">
           <Button
             variant="outline"
             size="sm"
-            onClick={() => onStateChange("paused")}
-            className="text-amber-600 border-amber-300 hover:bg-amber-50 dark:border-amber-800 dark:hover:bg-amber-950/40 cursor-pointer"
+            onClick={() => setShowOAuthDialog(true)}
+            title={`cTrader連携設定${metrics.connectionStatus.accountNumber ? ` / ${metrics.connectionStatus.accountNumber}` : ""}`}
+            className="h-8 gap-1.5 text-xs text-muted-foreground hover:text-foreground cursor-pointer"
           >
-            <Pause />
-            一時停止
+            <Server className={`h-3.5 w-3.5 ${isCtraderConnected ? "text-emerald-500" : "text-rose-500"}`} />
+            {isCtraderConnected ? (
+              metrics.connectionStatus.pingMs > 0
+                ? `${metrics.connectionStatus.environment} (${metrics.connectionStatus.pingMs}ms)`
+                : metrics.connectionStatus.environment
+            ) : (
+              <span className="text-rose-500 font-medium">cTrader未接続</span>
+            )}
           </Button>
-        ) : (
-          <Button
-            variant="default"
-            size="sm"
-            onClick={() => onStateChange("running")}
-            className="bg-emerald-600 hover:bg-emerald-700 text-white cursor-pointer"
-          >
-            <Play />
-            自動売買開始
-          </Button>
-        )}
 
-        <Button
-          variant="destructive"
-          size="sm"
-          onClick={() => setShowEmergencyDialog(true)}
-          className="font-semibold cursor-pointer"
-        >
-          <AlertOctagon />
-          緊急全決済
-        </Button>
+          <div
+            className="hidden items-center gap-1.5 px-2 py-1 rounded-md bg-muted/60 text-xs font-mono text-muted-foreground xl:flex"
+            title="LLM Pipeline: claude -p / agy -p"
+          >
+            <Cpu className="h-3.5 w-3.5 text-primary" />
+            <span>{metrics.connectionStatus.llm}</span>
+          </div>
+
+          {botState === "running" ? (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => onStateChange("paused")}
+              className="h-8 text-xs text-amber-600 border-amber-300 hover:bg-amber-50 dark:border-amber-800 dark:hover:bg-amber-950/40 cursor-pointer"
+            >
+              <Pause className="h-3.5 w-3.5" />
+              一時停止
+            </Button>
+          ) : (
+            <Button
+              variant="default"
+              size="sm"
+              onClick={() => onStateChange("running")}
+              className="h-8 text-xs bg-emerald-600 hover:bg-emerald-700 text-white cursor-pointer"
+            >
+              <Play className="h-3.5 w-3.5" />
+              自動売買開始
+            </Button>
+          )}
+
+          <Button
+            variant="destructive"
+            size="sm"
+            onClick={() => setShowEmergencyDialog(true)}
+            className="h-8 text-xs font-semibold cursor-pointer"
+          >
+            <AlertOctagon className="h-3.5 w-3.5" />
+            緊急全決済
+          </Button>
+        </div>
       </div>
+
+
 
       {/* 緊急停止確認ダイアログ */}
       <Dialog open={showEmergencyDialog} onOpenChange={setShowEmergencyDialog}>
@@ -299,7 +306,7 @@ export function BotControlHeader({
               </p>
             </div>
             <p className="text-xs">
-              ※ ボタンをクリックすると Spotware 社の認可画面へ遷移します。ログイン・承認後、本管理画面へ自動で戻り口座が即時同期されます。
+              ※ ボタンをクリックすると Spotware 社の認可画面へ遷移します。ログイン・承認後、本管理画面へ自動で戻り、口座が即時同期されます。
             </p>
           </div>
 
@@ -330,6 +337,7 @@ export function BotControlHeader({
           </DialogFooter>
         </DialogContent>
       </Dialog>
-    </div>
+    </>
   );
 }
+
