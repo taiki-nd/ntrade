@@ -4,6 +4,8 @@ pub mod token;
 pub mod types;
 
 pub use client::{CTraderService, OrderOutcome, TradingPermission};
-pub use config::CTraderConfig;
+pub use config::{symbol_suffix_from_env, CTraderConfig};
 pub use token::TokenSet;
-pub use types::{lots_to_volume, volume_to_lots, AccountSummary, BarPeriod, BrokerPosition, CandleBar, SymbolInfo};
+pub use types::{
+    lots_to_volume, volume_to_lots, AccountSummary, BarPeriod, BrokerPosition, CandleBar, ClosedDeal, SymbolInfo,
+};

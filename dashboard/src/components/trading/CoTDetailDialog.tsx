@@ -4,6 +4,7 @@ import * as React from "react";
 import { ActionType, CoTDetail } from "@/types/trading";
 import { tradingApi } from "@/lib/trading-api";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   Dialog,
@@ -23,6 +24,7 @@ import {
   TrendingUp,
   Receipt,
   ShieldAlert,
+  GitBranch,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -360,27 +362,34 @@ interface CoTDetailDialogProps {
 export function CoTDetailDialog({ cotLogId, onClose }: CoTDetailDialogProps) {
   // 取得結果は ID ごとに持ち、別の判断を開いた直後に前の内容を出さない
   const [loaded, setLoaded] = React.useState<{ id: string; detail?: CoTDetail; error?: string } | null>(null);
+  // 条件付きプランは成立ログと元の判断に分かれるため、同じダイアログ内で行き来する
+  const [viewingId, setViewingId] = React.useState<string | null>(null);
+  const shownId = viewingId ?? cotLogId;
 
   React.useEffect(() => {
-    if (!cotLogId) return;
+    setViewingId(null);
+  }, [cotLogId]);
+
+  React.useEffect(() => {
+    if (!shownId) return;
     let cancelled = false;
     tradingApi
-      .getCoTDetail(cotLogId)
+      .getCoTDetail(shownId)
       .then((res) => {
         if (cancelled) return;
-        if (res.success && res.data) setLoaded({ id: cotLogId, detail: res.data });
-        else setLoaded({ id: cotLogId, error: res.message ?? "判断ログを取得できませんでした" });
+        if (res.success && res.data) setLoaded({ id: shownId, detail: res.data });
+        else setLoaded({ id: shownId, error: res.message ?? "判断ログを取得できませんでした" });
       })
       .catch((err: unknown) => {
         if (cancelled) return;
-        setLoaded({ id: cotLogId, error: err instanceof Error ? err.message : "判断ログを取得できませんでした" });
+        setLoaded({ id: shownId, error: err instanceof Error ? err.message : "判断ログを取得できませんでした" });
       });
     return () => {
       cancelled = true;
     };
-  }, [cotLogId]);
+  }, [shownId]);
 
-  const current = loaded?.id === cotLogId ? loaded : null;
+  const current = loaded?.id === shownId ? loaded : null;
   const detail = current?.detail;
   const error = current?.error;
   const log = detail?.log;
@@ -390,7 +399,7 @@ export function CoTDetailDialog({ cotLogId, onClose }: CoTDetailDialogProps) {
 
   return (
     <Dialog open={!!cotLogId} onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="sm:max-w-2xl max-h-[85vh] overflow-y-auto">
+      <DialogContent className="sm:max-w-2xl max-h-[85vh] overflow-y-auto overflow-x-hidden">
         <DialogHeader>
           <div className="flex items-center justify-between pr-6">
             <DialogTitle className="flex items-center gap-2.5 text-lg flex-wrap">
@@ -409,7 +418,7 @@ export function CoTDetailDialog({ cotLogId, onClose }: CoTDetailDialogProps) {
             </DialogTitle>
           </div>
           <DialogDescription className="text-xs font-mono text-muted-foreground break-all">
-            推論ID: {cotLogId}
+            推論ID: {shownId}
             {log && ` | 時刻: ${log.timestamp} | スプレッド: ${log.spreadPips} pips`}
           </DialogDescription>
         </DialogHeader>
@@ -481,10 +490,10 @@ export function CoTDetailDialog({ cotLogId, onClose }: CoTDetailDialogProps) {
                     : "border-amber-500/30 bg-amber-500/5 dark:bg-amber-950/20"
                 )}
               >
-                <div className="flex items-center justify-between gap-2 flex-wrap">
+                <div className="flex items-start justify-between gap-2 flex-wrap">
                   <div
                     className={cn(
-                      "flex items-center gap-2 text-xs font-semibold",
+                      "flex min-w-0 items-center gap-2 text-xs font-semibold",
                       log.guardResult?.includes("ORDER_FAILED")
                         ? "text-rose-700 dark:text-rose-400"
                         : "text-amber-700 dark:text-amber-400"
@@ -500,7 +509,7 @@ export function CoTDetailDialog({ cotLogId, onClose }: CoTDetailDialogProps) {
                     </span>
                   </div>
                   {log.guardResult && (
-                    <span className="text-[11px] font-mono text-muted-foreground bg-muted/60 px-1.5 py-0.5 rounded border">
+                    <span className="min-w-0 w-full sm:w-auto max-w-full text-[11px] font-mono text-muted-foreground bg-muted/60 px-1.5 py-0.5 rounded border whitespace-pre-wrap break-all">
                       {log.guardResult}
                     </span>
                   )}
@@ -539,7 +548,7 @@ export function CoTDetailDialog({ cotLogId, onClose }: CoTDetailDialogProps) {
                             {reason.code}
                           </Badge>
                         </div>
-                        <p className="text-muted-foreground leading-relaxed whitespace-pre-wrap">
+                        <p className="text-muted-foreground leading-relaxed whitespace-pre-wrap break-words">
                           {reason.description}
                         </p>
                       </div>
@@ -549,6 +558,28 @@ export function CoTDetailDialog({ cotLogId, onClose }: CoTDetailDialogProps) {
                   <p className="text-xs text-muted-foreground leading-relaxed">
                     事後ガードは通過しましたが、注文処理が完了しませんでした（ブローカー未接続または発注処理エラーの可能性があります）。
                   </p>
+                )}
+              </div>
+            )}
+
+            {/* 条件付きプランは「成立ログ（発注した記録）」と「元の判断」に分かれる */}
+            {(detail.origin || viewingId) && (
+              <div className="flex flex-wrap items-center gap-2 p-3 rounded-lg border bg-muted/30">
+                <GitBranch className="h-4 w-4 text-muted-foreground shrink-0" />
+                <span className="text-xs text-muted-foreground">
+                  {detail.origin
+                    ? "条件付きプランの成立記録です。エントリーの根拠は元の判断にあります"
+                    : "条件付きプランを立てた判断です"}
+                </span>
+                {detail.origin && (
+                  <Button variant="outline" size="sm" onClick={() => setViewingId(detail.origin?.id ?? null)}>
+                    元の判断を見る
+                  </Button>
+                )}
+                {viewingId && (
+                  <Button variant="ghost" size="sm" onClick={() => setViewingId(null)}>
+                    戻る
+                  </Button>
                 )}
               </div>
             )}

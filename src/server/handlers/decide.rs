@@ -106,8 +106,6 @@ async fn process_pending_plans(state: &AppState, pair: &str, bundle: &SnapshotBu
             let balance = state.metrics.read().await.balance;
             let sl_pips = (entry - p.plan.stop_loss.unwrap_or(*entry)).abs() / bundle.snapshot.pip_size.max(1e-9);
             let trigger_cot_id = format!("cot-plan-{}", Utc::now().timestamp_millis());
-            // ポジションはプランを立てた LLM 判断に紐付ける（成立ログは機械的な記録のため）
-            let origin_cot_id = p.cot_log_id.clone().unwrap_or_else(|| trigger_cot_id.clone());
             let mut execution_error = None;
             let executed = if verdict.passed {
                 let req = OrderRequest {
@@ -119,7 +117,9 @@ async fn process_pending_plans(state: &AppState, pair: &str, bundle: &SnapshotBu
                     take_profit: p.plan.take_profit.unwrap_or_default(),
                     reason: format!("conditional plan {} triggered: {}", p.id, p.plan.wait_for),
                 };
-                match execute_order(state, req, &p.plan.invalidate_if, &origin_cot_id).await {
+                // ポジションは発注した記録（成立ログ）に紐付ける。
+                // 元の LLM 判断は成立ログの origin_cot_log_id から辿る
+                match execute_order(state, req, &p.plan.invalidate_if, &trigger_cot_id).await {
                     Ok(_) => true,
                     Err(e) => {
                         warn!("Failed to place order for plan {}: {e:#}", p.id);
@@ -158,6 +158,7 @@ async fn process_pending_plans(state: &AppState, pair: &str, bundle: &SnapshotBu
                 reasoning: format!("5M確定足 {} 終値 {:.5} で成立条件を満たした", bar.timestamp.format("%H:%M"), bar.close),
                 executed,
                 spread_pips: bundle.snapshot.spread_pips,
+                origin_cot_log_id: p.cot_log_id.clone(),
             };
             state.record_cot_log(log).await;
         } else {
@@ -257,6 +258,8 @@ pub async fn run_decision_cycle(state: &AppState, pair: &str) -> anyhow::Result<
         reasoning: decision.reasoning.clone(),
         executed,
         spread_pips: bundle.snapshot.spread_pips,
+        // LLM 判断そのものなので元判断は無い
+        origin_cot_log_id: None,
     };
     state.record_cot_log(log).await;
     info!(action = ?decision.action, guard = %verdict.summary(), executed, ?plan_id, "decision cycle done");

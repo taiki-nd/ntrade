@@ -1,6 +1,7 @@
 import {
   AccountMetrics,
   BotState,
+  CloseReason,
   CoTDetail,
   CoTLog,
   LessonLearned,
@@ -65,12 +66,114 @@ async function request<T>(
 export interface PageParams {
   limit?: number;
   offset?: number;
+  /** フリーワード検索（CoT ログのみ・本文の部分一致） */
+  q?: string;
 }
 
 function toQuery(params: PageParams): string {
   const q = new URLSearchParams();
   if (params.limit !== undefined) q.set("limit", String(params.limit));
   if (params.offset !== undefined) q.set("offset", String(params.offset));
+  if (params.q) q.set("q", params.q);
+  const s = q.toString();
+  return s ? `?${s}` : "";
+}
+
+/** 決済履歴の並び替えキー（Rust 側 TradeSort と対応） */
+export type TradeSortKey =
+  | "closeTime"
+  | "openTime"
+  | "pnlPips"
+  | "pnlAmount"
+  | "volumeLots"
+  | "symbol";
+
+/** 決済履歴の検索条件。未指定の項目は絞り込まない */
+export interface TradeQueryParams {
+  limit?: number;
+  offset?: number;
+  /** 銘柄・売買・決済理由・時刻・判断IDのフリーワード部分一致 */
+  q?: string;
+  cotLogId?: string;
+  symbol?: string;
+  side?: "BUY" | "SELL";
+  closeReason?: CloseReason;
+  /** 勝ちトレードのみ / 負けトレードのみ */
+  result?: "win" | "loss";
+  /** 決済時刻の下限（"YYYY-MM-DD" 可） */
+  from?: string;
+  /** 決済時刻の上限（"YYYY-MM-DD" 指定時はその日の終わりまで） */
+  to?: string;
+  minPnlPips?: number;
+  maxPnlPips?: number;
+  sort?: TradeSortKey;
+  /** true で昇順（既定は降順） */
+  asc?: boolean;
+}
+
+/** 決済履歴の検索フォームの状態（入力中の値をそのまま持つので文字列） */
+export interface TradeFilterState {
+  q: string;
+  symbol: string;
+  side: "" | "BUY" | "SELL";
+  closeReason: "" | CloseReason;
+  result: "" | "win" | "loss";
+  from: string;
+  to: string;
+  minPnlPips: string;
+  maxPnlPips: string;
+  sort: TradeSortKey;
+  asc: boolean;
+}
+
+export const EMPTY_TRADE_FILTER: TradeFilterState = {
+  q: "",
+  symbol: "",
+  side: "",
+  closeReason: "",
+  result: "",
+  from: "",
+  to: "",
+  minPnlPips: "",
+  maxPnlPips: "",
+  sort: "closeTime",
+  asc: false,
+};
+
+/** フリーワード・並び順を除く、実際に絞り込んでいる条件の数（バッジ表示用） */
+export function countActiveTradeFilters(f: TradeFilterState): number {
+  return [f.symbol, f.side, f.closeReason, f.result, f.from, f.to, f.minPnlPips, f.maxPnlPips].filter(
+    (v) => v !== ""
+  ).length;
+}
+
+/** フォームの状態を API のクエリに変換する（空欄・不正な数値は条件から外す） */
+export function toTradeQueryParams(f: TradeFilterState): TradeQueryParams {
+  const num = (v: string) => {
+    const n = Number(v);
+    return v.trim() !== "" && Number.isFinite(n) ? n : undefined;
+  };
+  return {
+    q: f.q.trim() || undefined,
+    symbol: f.symbol || undefined,
+    side: f.side || undefined,
+    closeReason: f.closeReason || undefined,
+    result: f.result || undefined,
+    from: f.from || undefined,
+    to: f.to || undefined,
+    minPnlPips: num(f.minPnlPips),
+    maxPnlPips: num(f.maxPnlPips),
+    sort: f.sort,
+    asc: f.asc,
+  };
+}
+
+function toTradeQuery(params: TradeQueryParams): string {
+  const q = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value === undefined || value === null || value === "" || value === false) continue;
+    q.set(key, String(value));
+  }
   const s = q.toString();
   return s ? `?${s}` : "";
 }
@@ -119,10 +222,29 @@ export const tradingApi = {
   },
 
   /**
-   * 決済履歴の取得（新しい順・ページング）
+   * 決済履歴の取得（既定は新しい順・ページング / 各種条件で絞り込み可）
    */
-  async getTrades(params: PageParams = {}): Promise<ApiResponse<Page<TradeHistory>>> {
-    return await request<ApiResponse<Page<TradeHistory>>>(`/api/trades${toQuery(params)}`);
+  async getTrades(params: TradeQueryParams = {}): Promise<ApiResponse<Page<TradeHistory>>> {
+    return await request<ApiResponse<Page<TradeHistory>>>(`/api/trades${toTradeQuery(params)}`);
+  },
+
+  /**
+   * 決済履歴を1件削除（記録の削除のみ。ブローカー側の約定には影響しない）
+   */
+  async deleteTrade(id: string): Promise<ApiResponse<void>> {
+    return await request<ApiResponse<void>>(`/api/trades/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    });
+  },
+
+  /**
+   * 決済履歴をまとめて削除。削除できた件数を返す
+   */
+  async deleteTrades(ids: string[]): Promise<ApiResponse<number>> {
+    return await request<ApiResponse<number>>("/api/trades/delete", {
+      method: "POST",
+      body: JSON.stringify({ ids }),
+    });
   },
 
   /**

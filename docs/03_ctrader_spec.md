@@ -112,78 +112,56 @@ $$\text{ロット数} = \frac{\text{口座資金} \times \text{リスク率 (例
 
 ---
 
-## 6. FIX API（発注経路の代替）
+## 6. 口座固有のシンボルサフィックス
 
-### 6.1 なぜ必要か
+### 6.1 症状
 
-cTrader Open API の利用可否は**ブローカーごとに設定できる**。口座の `accessRights` が
-`FULL_ACCESS`、シンボルの `tradingMode` が `ENABLED`、アクセストークンの scope が `trading`
-であっても、ブローカーが API 取引を無効化していると新規注文に `TRADING_DISABLED`
-（"Trading is disabled"）が返る。
+口座の `accessRights` が `FULL_ACCESS`、シンボルの `tradingMode` が `ENABLED`、
+アクセストークンの scope が `trading` であっても、新規注文に `TRADING_DISABLED`
+（"Trading is disabled"）が返ることがある。
 
-実測（2026-09-21・同一アプリ / 同一アクセストークン / 同一コード）:
+実測（2026-09-24〜25・同一アプリ / 同一アクセストークン / 同一コード）:
 
-| 口座 | 発注 |
+| 口座 | `USDJPY` での発注 |
 |---|---|
-| AXIORY デモ #8069118 | `TRADING_DISABLED` |
+| AXIORY デモ #8069118（ゼロ口座） | `TRADING_DISABLED` |
 | Spotware デモ #5914722 | 約定成功 |
 
-この場合の発注手段が FIX API になる。
+### 6.2 原因
 
-### 6.2 ハイブリッド構成
+**ゼロ口座（スプレッド 0・手数料方式）で取引できるのは `_z` が付いた銘柄だけ**で、
+`USDJPY` ではなく `USDJPY_z` を指定する必要がある。
 
-FIX API には公式に以下の制限がある。
+厄介なのは、素の `USDJPY` も以下をすべて満たしてしまう点である。
 
-1. ヒストリカルデータを取得できない
-2. 口座情報（残高・レバレッジ・証拠金）を取得できない
+- `ProtoOASymbolsListReq` のシンボル一覧に含まれる
+- `ProtoOASymbolByIdReq` の `tradingMode` が `ENABLED`
+- 当該シンボルでバーデータを取得できる
 
-ntrade は Snapshot のチャート生成に 5M/15M/1H/4H の履歴を、リスク計算に残高を使うため、
-FIX 単独では成立しない。一方、API 取引が無効な口座でも**データ取得と口座情報の参照は
-Open API で正常に動く**（拒否されるのは取引操作のみ）。したがって構成は次のように分ける。
+つまり**発注するまで区別が付かない**。エラーコードも `TRADING_DISABLED` という
+口座権限を示唆する名前のため、トークンの scope 不足やブローカー側の API 取引無効化と
+誤診しやすい。サフィックスの有無はブローカーと口座種別で変わる（`_z` / `.pro` / `m` 等）。
 
-| 用途 | 経路 |
-|---|---|
-| バーデータ・シンボル・口座情報・ポジション照合 | Open API |
-| 新規発注・決済・SL/TP | FIX API |
+### 6.3 実装
 
-`CTRADER_FIX_HOST` が設定されている場合のみ FIX を使い、未設定なら従来どおり
-Open API で発注する（`AppState::build_order_sink`）。FIX の接続に失敗した場合も
-Open API 発注にフォールバックする。
+`CTRADER_SYMBOL_SUFFIX` に設定すると、シンボル解決時にサフィックス付きを優先する。
 
-### 6.3 SL/TP の扱いが Open API と異なる
+```
+CTRADER_SYMBOL_SUFFIX="_z"    # USDJPY -> USDJPY_z
+```
 
-FIX の `NewOrderSingle(35=D)` には **SL/TP を添付できない**。`AbsoluteSL`(1002) /
-`RelativeSL`(1003) などのタグは `ExecutionReport` と `PositionReport` 側にしか定義が無い。
-そのため約定後に、反対サイドの Stop 注文（SL）と Limit 注文（TP）を保護注文として張る。
+- 解決は `CTraderService::get_symbol_id` に一本化されているため、発注・バー取得・
+  取引モード確認のすべてに一括で効く
+- サフィックス付きが見つからない場合は警告を出して素の名前にフォールバックする
+- 逆に建玉の照合（`get_open_positions`）ではサフィックスを剥がし、アプリ内では
+  常に素の銘柄名（`USDJPY`）で扱う
 
-**ネッティング口座では、建玉が無い状態で保護注文が発動すると決済ではなく新規の逆建玉が立つ。**
-したがって以下の3点は省略できない。
-
-1. **OCO 管理** — 片方が約定したらもう片方を取り消す（`fix::trading` の OCO 監視タスク）
-2. **決済時の取り消し** — `AppState::close_broker_position` が決済前に取り消す
-3. **手動決済の検出** — reconcile でブローカー側から建玉が消えたら取り消す（`scheduler::after_cycle`）
-
-また、保護注文の発注に失敗した場合は、SL の無い建玉を残さないよう**ポジションを成行で決済**してから
-エラーを返す（`FixOrderSink::place_market`）。
-
-### 6.4 セッション仕様
-
-| 項目 | 値 |
-|---|---|
-| FIX バージョン | 4.4 |
-| TargetCompID(56) | `CSERVER` |
-| TargetSubID(57) | `TRADE`（価格用の `QUOTE` セッションは使わない） |
-| SenderCompID(49) | `<環境>.<BrokerUID>.<ログイン番号>` 例: `demo.axiory.8069118` |
-| Username(553) | 数値のログイン番号 |
-| ポート | SSL 5212 / 平文 5202 |
-| シーケンス番号 | セッション確立ごとにリセット（Logon で `ResetSeqNumFlag=Y`） |
-| OrderQty(38) | **units**（0.01 lot = 1,000）。Open API の cents とは異なる |
-
-認証情報は cTrader デスクトップ/Web 版の「設定 → FIX API」から取得する。
-
-### 6.5 検証
+### 6.4 検証
 
 ```bash
-make fix            # 接続と Logon のみ
-make fix ORDER=1    # 0.01 lot の成行 + SL/TP を張って即決済
+make ctrader                                    # 接続・データ取得のみ
+cargo run --bin poc_ctrader -- --test-order-sltp  # 0.01 lot 成行 + SL/TP を張って即決済
 ```
+
+発注が通ると `symbol_id` がサフィックス付きのもの（AXIORY デモでは `USDJPY` = 4 に対し
+`USDJPY_z` = 228）になっていることをログで確認できる。

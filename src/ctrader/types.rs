@@ -164,6 +164,26 @@ pub struct BrokerPosition {
     pub open_time: Option<DateTime<Utc>>,
 }
 
+/// ブローカー側で確定した決済（closing deal）。
+///
+/// 決済価格と実現損益をローカルの足から推定せず、約定そのものから確定させるために使う。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ClosedDeal {
+    pub position_id: i64,
+    pub deal_id: i64,
+    /// 決済の約定価格
+    pub close_price: f64,
+    pub close_time: DateTime<Utc>,
+    /// ブローカーが決済時に確定した建値
+    pub entry_price: f64,
+    /// 実現損益（口座通貨。スワップ・手数料込み。cTrader の「純額」に相当）
+    pub net_profit: f64,
+    pub gross_profit: f64,
+    pub swap: f64,
+    pub commission: f64,
+    pub volume_lots: f64,
+}
+
 /// シンボル（通貨ペア）情報
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolInfo {

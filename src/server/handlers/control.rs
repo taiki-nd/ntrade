@@ -47,10 +47,10 @@ pub async fn emergency_stop(
     let mut total_pnl = 0.0;
     let mut closed = Vec::with_capacity(count);
 
-    for (idx, p) in positions_lock.drain(..).enumerate() {
+    for p in positions_lock.drain(..) {
         total_pnl += p.pnl_amount;
 
-        // ブローカー側の決済（FIX 設定時は FIX 経由。保護注文の取り消しも行う）
+        // ブローカー側の決済
         if ctrader_opt.is_some() {
             let state = state.clone();
             let position = p.clone();
@@ -62,7 +62,8 @@ pub async fn emergency_stop(
         }
 
         closed.push(TradeHistory {
-            id: format!("trd-emerg-{}-{}", Utc::now().timestamp_millis(), idx),
+            // ID は建玉に対して一意にしておく（照合が実際の約定で同じ行を上書きできるように）
+            id: format!("trd-{}", p.id),
             symbol: p.symbol,
             side: p.side,
             volume_lots: p.volume_lots,

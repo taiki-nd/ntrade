@@ -15,7 +15,7 @@ use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use super::config::CTraderConfig;
-use super::types::{volume_to_lots, AccountSummary, BarPeriod, BrokerPosition, CandleBar, SymbolInfo};
+use super::types::{volume_to_lots, AccountSummary, BarPeriod, BrokerPosition, CandleBar, ClosedDeal, SymbolInfo};
 
 /// 注文に対するサーバーからの非同期な応答
 ///
@@ -210,10 +210,35 @@ impl CTraderService {
         Ok(())
     }
 
+    /// ブローカー側の銘柄名から口座固有のサフィックスを取り除く（`USDJPY_z` → `USDJPY`）
+    fn strip_symbol_suffix(&self, name: &str) -> String {
+        match &self.config.symbol_suffix {
+            Some(suffix) => name.strip_suffix(suffix.as_str()).unwrap_or(name).to_string(),
+            None => name.to_string(),
+        }
+    }
+
     /// 通貨ペア名（例: "USDJPY", "EURUSD"）から symbol_id を解決
     pub async fn get_symbol_id(&self, symbol_name: &str) -> Result<i64> {
         let norm_name = symbol_name.replace("/", "").to_uppercase();
         let symbols = self.symbols.read().await;
+
+        // ゼロ口座のように、取引できるのがサフィックス付き銘柄（例: USDJPY_z）だけの
+        // 口座がある。素の銘柄もシンボル一覧に存在し tradingMode は ENABLED に見えるが、
+        // 発注すると TRADING_DISABLED で拒否されるため、サフィックス付きを優先して解決する。
+        if let Some(suffix) = &self.config.symbol_suffix {
+            let suffixed = format!("{}{}", norm_name, suffix.to_uppercase());
+            match symbols.get(&suffixed) {
+                Some(info) => {
+                    debug!("Resolved symbol '{}' -> '{}' (id {})", symbol_name, suffixed, info.symbol_id);
+                    return Ok(info.symbol_id);
+                }
+                None => warn!(
+                    "Symbol '{}' not found (CTRADER_SYMBOL_SUFFIX={}); falling back to '{}'",
+                    suffixed, suffix, norm_name
+                ),
+            }
+        }
 
         if let Some(info) = symbols.get(&norm_name) {
             return Ok(info.symbol_id);
@@ -382,7 +407,8 @@ impl CTraderService {
             .map(|p| BrokerPosition {
                 position_id: p.position_id,
                 symbol_id: p.trade_data.symbol_id,
-                symbol_name: by_id.get(&p.trade_data.symbol_id).cloned(),
+                // アプリ内では素の銘柄名（USDJPY）で扱うため、口座固有のサフィックスは剥がす
+                symbol_name: by_id.get(&p.trade_data.symbol_id).map(|n| self.strip_symbol_suffix(n)),
                 is_buy: p.trade_data.trade_side == ProtoOaTradeSide::Buy as i32,
                 volume_lots: volume_to_lots(p.trade_data.volume),
                 entry_price: p.price,
@@ -393,6 +419,74 @@ impl CTraderService {
                     .open_timestamp
                     .and_then(|ms| chrono::TimeZone::timestamp_millis_opt(&Utc, ms).single()),
             })
+            .collect())
+    }
+
+    /// 指定ポジションの決済（closing deal）をブローカーの約定履歴から取得する。
+    ///
+    /// SL/TP はブローカー側で執行されるため、ntrade から見ると「ポジションが消えた」ことしか分からない。
+    /// 決済価格・決済時刻・実現損益をローカルの足から推定すると cTrader の履歴とずれるので、
+    /// 約定そのものから確定させる。分割決済された場合は最後の決済約定を採用する。
+    pub async fn get_position_close(
+        &self,
+        position_id: i64,
+        from: chrono::DateTime<Utc>,
+    ) -> Result<Option<ClosedDeal>> {
+        let res = self
+            .client
+            .deal_list_by_position(
+                self.config.account_id,
+                position_id,
+                Some(from.timestamp_millis()),
+                Some(Utc::now().timestamp_millis()),
+            )
+            .await
+            .with_context(|| format!("Failed to fetch deals for position {position_id}"))?;
+
+        let deal = res
+            .deal
+            .iter()
+            .filter(|d| d.close_position_detail.is_some())
+            .max_by_key(|d| d.execution_timestamp);
+        let Some(d) = deal else { return Ok(None) };
+        let detail = d.close_position_detail.as_ref().expect("filtered above");
+
+        // 金額は 10^money_digits 倍の整数で返る
+        let scale = 10f64.powi(detail.money_digits.unwrap_or(2) as i32);
+        let gross_profit = detail.gross_profit as f64 / scale;
+        let swap = detail.swap as f64 / scale;
+        let commission = detail.commission as f64 / scale;
+        let conversion_fee = detail.pnl_conversion_fee.unwrap_or(0) as f64 / scale;
+        let close_time = chrono::TimeZone::timestamp_millis_opt(&Utc, d.execution_timestamp)
+            .single()
+            .unwrap_or_else(Utc::now);
+
+        Ok(Some(ClosedDeal {
+            position_id,
+            deal_id: d.deal_id,
+            close_price: d.execution_price.unwrap_or(detail.entry_price),
+            close_time,
+            entry_price: detail.entry_price,
+            net_profit: gross_profit + swap + commission + conversion_fee,
+            gross_profit,
+            swap,
+            commission,
+            volume_lots: volume_to_lots(detail.closed_volume.unwrap_or(d.filled_volume)),
+        }))
+    }
+
+    /// 保有ポジションごとの含み損益（口座通貨）。ブローカー側の確定値なので手数料込みで一致する。
+    pub async fn get_unrealized_pnl(&self) -> Result<HashMap<i64, f64>> {
+        let res = self
+            .client
+            .position_unrealized_pnl(self.config.account_id)
+            .await
+            .context("Failed to fetch unrealized PnL from cTrader")?;
+        let scale = 10f64.powi(res.money_digits as i32);
+        Ok(res
+            .position_unrealized_pn_l
+            .iter()
+            .map(|p| (p.position_id, p.net_unrealized_pn_l as f64 / scale))
             .collect())
     }
 
@@ -471,11 +565,24 @@ impl CTraderService {
     }
 
     /// ポジション ID 指定の決済
+    ///
+    /// 発注と同様、ctrader-rs は決済結果（非請求の執行イベント）を拾えず Timeout を返すため、
+    /// 執行イベント側で結果を確定させる。
     pub async fn close_position_by_id(&self, position_id: i64, volume: i64) -> Result<ProtoOaExecutionEvent> {
-        self.client
-            .close_position(self.config.account_id, position_id, volume)
-            .await
-            .with_context(|| format!("Failed to close position {position_id}"))
+        let mut rx = self.order_events.subscribe();
+        let deadline = Instant::now() + ORDER_OUTCOME_TIMEOUT;
+        match self.client.close_position(self.config.account_id, position_id, volume).await {
+            Ok(ev) => return Ok(ev),
+            Err(ctrader_rs::Error::Timeout) => {
+                debug!("Close response not delivered by ctrader-rs; falling back to execution events");
+            }
+            Err(e) => return Err(anyhow!(e).context(format!("Failed to close position {position_id}"))),
+        }
+        self.await_order_outcome(&mut rx, deadline, |ev| {
+            ev.position.as_ref().map(|p| p.position_id) == Some(position_id)
+                || ev.deal.as_ref().map(|d| d.position_id) == Some(position_id)
+        })
+        .await
     }
 
     /// サーバーサイドSL/TP付き成行注文の発行（デモ検証・本番兼用）
@@ -529,15 +636,25 @@ impl CTraderService {
             Err(e) => return Err(anyhow!(e).context("Failed to send market order to cTrader")),
         }
 
-        self.await_order_outcome(&mut rx, symbol_id, deadline).await
+        self.await_order_outcome(&mut rx, deadline, |ev| {
+            // 他シンボルの建玉更新などが混ざるのでシンボルで絞る
+            let ev_symbol = ev
+                .deal
+                .as_ref()
+                .map(|d| d.symbol_id)
+                .or_else(|| ev.order.as_ref().map(|o| o.trade_data.symbol_id))
+                .or_else(|| ev.position.as_ref().map(|p| p.trade_data.symbol_id));
+            ev_symbol == Some(symbol_id)
+        })
+        .await
     }
 
-    /// 発注後、対象シンボルの執行イベント（または注文エラー）が届くまで待つ
+    /// 発注・決済後、対象の執行イベント（または注文エラー）が届くまで待つ
     async fn await_order_outcome(
         &self,
         rx: &mut broadcast::Receiver<OrderOutcome>,
-        symbol_id: i64,
         deadline: Instant,
+        matches: impl Fn(&ProtoOaExecutionEvent) -> bool,
     ) -> Result<ProtoOaExecutionEvent> {
         loop {
             let outcome = match tokio::time::timeout_at(deadline, rx.recv()).await {
@@ -566,14 +683,7 @@ impl CTraderService {
                     ));
                 }
                 OrderOutcome::Execution(ev) => {
-                    // 他シンボルの建玉更新などが混ざるのでシンボルで絞る
-                    let ev_symbol = ev
-                        .deal
-                        .as_ref()
-                        .map(|d| d.symbol_id)
-                        .or_else(|| ev.order.as_ref().map(|o| o.trade_data.symbol_id))
-                        .or_else(|| ev.position.as_ref().map(|p| p.trade_data.symbol_id));
-                    if ev_symbol != Some(symbol_id) {
+                    if !matches(&ev) {
                         continue;
                     }
                     let exec_type = ProtoOaExecutionType::try_from(ev.execution_type).ok();

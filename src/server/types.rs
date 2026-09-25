@@ -90,6 +90,13 @@ pub struct CoTLog {
     pub reasoning: String,
     pub executed: bool,
     pub spread_pips: f64,
+    /// 条件付きプランの成立ログの場合、そのプランを立てた LLM 判断の ID。
+    ///
+    /// プランは HOLD 判断と一緒に出る（「今は入らないが、条件成立時に売る」）ため、
+    /// 「発注した記録」と「根拠になった判断」は別のログになる。取引はこの成立ログに紐づき、
+    /// 根拠はここから辿る。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_cot_log_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -179,6 +186,8 @@ pub struct PageQuery {
     pub symbol: Option<String>,
     /// 判断 ID で絞り込む（決済履歴のみ）
     pub cot_log_id: Option<String>,
+    /// 本文のフリーワード検索（CoT ログのみ）
+    pub q: Option<String>,
 }
 
 impl PageQuery {
@@ -191,6 +200,97 @@ impl PageQuery {
     }
 }
 
+/// 決済履歴の並び順（列名は固定値としてSQLへ埋め込む）
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TradeSort {
+    #[default]
+    CloseTime,
+    OpenTime,
+    PnlPips,
+    PnlAmount,
+    VolumeLots,
+    Symbol,
+}
+
+impl TradeSort {
+    pub fn column(self) -> &'static str {
+        match self {
+            Self::CloseTime => "close_time",
+            Self::OpenTime => "open_time",
+            Self::PnlPips => "pnl_pips",
+            Self::PnlAmount => "pnl_amount",
+            Self::VolumeLots => "volume_lots",
+            Self::Symbol => "symbol",
+        }
+    }
+}
+
+/// 決済履歴の検索条件（`None` の項目は絞り込まない）
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TradeQuery {
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    /// 本文（銘柄・売買・決済理由・時刻・判断ID）のフリーワード部分一致
+    pub q: Option<String>,
+    /// 判断 ID で絞り込む
+    pub cot_log_id: Option<String>,
+    pub symbol: Option<String>,
+    /// "BUY" | "SELL"
+    pub side: Option<String>,
+    pub close_reason: Option<CloseReason>,
+    /// "win" = 損益 >= 0 のみ / "loss" = 損益 < 0 のみ
+    pub result: Option<String>,
+    /// 決済時刻の下限（"YYYY-MM-DD" または "YYYY-MM-DD HH:MM:SS"）
+    pub from: Option<String>,
+    /// 決済時刻の上限（日付のみの場合はその日の終わりまで）
+    pub to: Option<String>,
+    pub min_pnl_pips: Option<f64>,
+    pub max_pnl_pips: Option<f64>,
+    #[serde(default)]
+    pub sort: TradeSort,
+    /// true で昇順（既定は降順）
+    #[serde(default)]
+    pub asc: bool,
+}
+
+impl TradeQuery {
+    pub fn limit(&self) -> usize {
+        self.limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT)
+    }
+
+    pub fn offset(&self) -> usize {
+        self.offset.unwrap_or(0)
+    }
+
+    /// 判断 ID 指定だけの既定クエリ（CoT 詳細などの内部用）
+    pub fn by_cot_log(cot_log_id: Option<&str>, limit: usize, offset: usize) -> Self {
+        Self {
+            limit: Some(limit),
+            offset: Some(offset),
+            cot_log_id: cot_log_id.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    /// Some(true) = 勝ちのみ / Some(false) = 負けのみ
+    pub fn win_only(&self) -> Option<bool> {
+        match self.result.as_deref().map(str::trim) {
+            Some("win") => Some(true),
+            Some("loss") => Some(false),
+            _ => None,
+        }
+    }
+}
+
+/// 決済履歴の一括削除リクエスト
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteTradesRequest {
+    pub ids: Vec<String>,
+}
+
 /// 1件の判断と、そこから生まれた取引
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -200,6 +300,9 @@ pub struct CoTDetail {
     pub trades: Vec<TradeHistory>,
     /// 保有中のポジション
     pub open_positions: Vec<Position>,
+    /// 成立ログの場合、そのプランを立てた元の LLM 判断
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<CoTLog>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -63,6 +63,11 @@ export interface CoTLog {
   reasoning: string;
   executed: boolean;
   spreadPips: number;
+  /**
+   * 条件付きプランの成立ログの場合、そのプランを立てた LLM 判断の ID。
+   * プランは HOLD 判断と一緒に出るため、発注した記録と根拠の判断は別ログになる。
+   */
+  originCotLogId?: string;
 }
 
 export interface AccountMetrics {
@@ -118,4 +123,6 @@ export interface CoTDetail {
   trades: TradeHistory[];
   /** 保有中のポジション */
   openPositions: Position[];
+  /** 成立ログの場合、そのプランを立てた元の LLM 判断 */
+  origin?: CoTLog;
 }

@@ -313,4 +313,12 @@ html.dark[data-base-tone="oled"],
   html {
     @apply font-sans;
   }
+  /* 本文スクロールが末端に達したときに、スクロール連鎖でヘッダー／サイドバーごと
+     ドキュメントが動いてしまうのを防ぐ */
+  html,
+  body {
+    height: 100%;
+    overflow: hidden;
+    overscroll-behavior: none;
+  }
 }

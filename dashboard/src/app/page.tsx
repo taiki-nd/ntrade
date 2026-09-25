@@ -22,7 +22,12 @@ import {
   LessonLearned,
   Page,
 } from "@/types/trading";
-import { tradingApi } from "@/lib/trading-api";
+import {
+  EMPTY_TRADE_FILTER,
+  TradeFilterState,
+  toTradeQueryParams,
+  tradingApi,
+} from "@/lib/trading-api";
 import { useHash } from "@/hooks/use-hash";
 import { toast } from "sonner";
 import { PlugZap } from "lucide-react";
@@ -38,8 +43,26 @@ const TRADE_PAGE_SIZE = 20;
 
 const emptyPage = <T,>(): Page<T> => ({ items: [], total: 0 });
 
+/** 常時更新が要るもの（口座状況・保有ポジション）の取得間隔 */
+const LIVE_INTERVAL = 5000;
+/** 表示中のタブでしか使わない一覧系の取得間隔 */
+const LIST_INTERVAL = 30000;
+
 const errorMessage = (err: unknown) =>
   err instanceof Error ? err.message : "エンジンが起動しているか確認してください。";
+
+/**
+ * `enabled` の間だけ `fetcher` を即時実行し、以降 `intervalMs` ごとに繰り返す。
+ * `fetcher` の同一性が変われば（ページ送り・検索条件の変更）その場で取得し直す。
+ */
+function usePolling(fetcher: () => void, intervalMs: number, enabled: boolean) {
+  React.useEffect(() => {
+    if (!enabled) return;
+    fetcher();
+    const interval = setInterval(fetcher, intervalMs);
+    return () => clearInterval(interval);
+  }, [fetcher, intervalMs, enabled]);
+}
 
 export default function TradingDashboard() {
   const [engineStatus, setEngineStatus] = React.useState<EngineStatus>("connecting");
@@ -52,47 +75,126 @@ export default function TradingDashboard() {
   const [tradesPage, setTradesPage] = React.useState<Page<TradeHistory>>(emptyPage);
   const [cotPage, setCotPage] = React.useState(1);
   const [cotLogsPage, setCotLogsPage] = React.useState<Page<CoTLog>>(emptyPage);
+  // 思考ログの検索キーワード（入力中は打鍵ごとに取得しないよう遅延させる）
+  const [cotQuery, setCotQuery] = React.useState("");
+  const [cotQueryDebounced, setCotQueryDebounced] = React.useState("");
+  // 約定履歴の検索条件（入力中は打鍵ごとに取得しないよう遅延させる）
+  const [tradeFilter, setTradeFilter] = React.useState<TradeFilterState>(EMPTY_TRADE_FILTER);
+  const [tradeFilterDebounced, setTradeFilterDebounced] = React.useState<TradeFilterState>(EMPTY_TRADE_FILTER);
+  // 銘柄プルダウンの選択肢（エンジンの稼働設定から取得）
+  const [pairs, setPairs] = React.useState<string[]>([]);
   const [lessons, setLessons] = React.useState<LessonLearned[]>([]);
   // 表示するビューは URL ハッシュで決まる（サイドバーの `/#cot` などから切り替える）
   const hash = useHash();
   const activeTab = TAB_IDS.includes(hash) ? hash : "overview";
 
-  // バックエンドからの全データ取得同期
-  const syncWithBackend = React.useCallback(async () => {
+  // 口座状況と保有ポジションだけは常時最新に保つ（エンジン疎通の判定もここで行う）
+  const fetchLive = React.useCallback(async () => {
     try {
-      const [m, pRes, rtRes, rcRes, tRes, cRes, lRes] = await Promise.all([
-        tradingApi.getStatus(),
-        tradingApi.getPositions(),
-        tradingApi.getTrades({ limit: RECENT_COUNT }),
-        tradingApi.getCoTLogs({ limit: RECENT_COUNT }),
-        tradingApi.getTrades({ limit: TRADE_PAGE_SIZE, offset: (tradePage - 1) * TRADE_PAGE_SIZE }),
-        tradingApi.getCoTLogs({ limit: COT_PAGE_SIZE, offset: (cotPage - 1) * COT_PAGE_SIZE }),
-        tradingApi.getLessons(),
-      ]);
-
+      const [m, pRes] = await Promise.all([tradingApi.getStatus(), tradingApi.getPositions()]);
       setMetrics(m);
       if (pRes.success && pRes.data) setPositions(pRes.data);
-      if (rtRes.success && rtRes.data) setRecentTrades(rtRes.data.items);
-      if (rcRes.success && rcRes.data) setRecentCotLogs(rcRes.data.items);
-      if (tRes.success && tRes.data) setTradesPage(tRes.data);
-      if (cRes.success && cRes.data) setCotLogsPage(cRes.data);
-      if (lRes.success && lRes.data) setLessons(lRes.data);
       setEngineStatus("online");
     } catch {
       setEngineStatus("offline");
     }
-  }, [tradePage, cotPage]);
+  }, []);
 
-  // 初回マウント・ページ切り替え時 & 5秒ごとの定期ポーリング同期（setState はタイマーコールバック内でのみ行う）
-  React.useEffect(() => {
-    const initial = setTimeout(syncWithBackend, 0);
-    const interval = setInterval(syncWithBackend, 5000);
+  // 概要タブの「直近◯件」
+  const fetchRecent = React.useCallback(async () => {
+    try {
+      const [rtRes, rcRes] = await Promise.all([
+        tradingApi.getTrades({ limit: RECENT_COUNT }),
+        tradingApi.getCoTLogs({ limit: RECENT_COUNT }),
+      ]);
+      if (rtRes.success && rtRes.data) setRecentTrades(rtRes.data.items);
+      if (rcRes.success && rcRes.data) setRecentCotLogs(rcRes.data.items);
+    } catch {
+      // 疎通エラーは fetchLive 側で表示するのでここでは握りつぶす
+    }
+  }, []);
 
-    return () => {
-      clearTimeout(initial);
-      clearInterval(interval);
+  // 約定履歴タブの一覧（ページ・絞り込み条件が変われば即時取得し直す）
+  const fetchTrades = React.useCallback(async () => {
+    try {
+      const res = await tradingApi.getTrades({
+        ...toTradeQueryParams(tradeFilterDebounced),
+        limit: TRADE_PAGE_SIZE,
+        offset: (tradePage - 1) * TRADE_PAGE_SIZE,
+      });
+      if (res.success && res.data) setTradesPage(res.data);
+    } catch {
+      // 同上
+    }
+  }, [tradePage, tradeFilterDebounced]);
+
+  // 思考ログタブの一覧（ページ・検索キーワードが変われば即時取得し直す）
+  const fetchCotLogs = React.useCallback(async () => {
+    try {
+      const res = await tradingApi.getCoTLogs({
+        limit: COT_PAGE_SIZE,
+        offset: (cotPage - 1) * COT_PAGE_SIZE,
+        q: cotQueryDebounced || undefined,
+      });
+      if (res.success && res.data) setCotLogsPage(res.data);
+    } catch {
+      // 同上
+    }
+  }, [cotPage, cotQueryDebounced]);
+
+  // 教訓は画面側の操作でしか変わらないためポーリングせず、タブを開いたときだけ取得する
+  const fetchLessons = React.useCallback(async () => {
+    try {
+      const res = await tradingApi.getLessons();
+      if (res.success && res.data) setLessons(res.data);
+    } catch {
+      // 同上
+    }
+  }, []);
+
+  // 手動リフレッシュや発注・決済の直後に、常時更新分と表示中タブの分だけを取り直す
+  const refresh = React.useCallback(async () => {
+    const byTab: Record<string, () => Promise<void>> = {
+      overview: fetchRecent,
+      trades: fetchTrades,
+      cot: fetchCotLogs,
+      lessons: fetchLessons,
     };
-  }, [syncWithBackend]);
+    await Promise.all([fetchLive(), byTab[activeTab]?.()]);
+  }, [activeTab, fetchLive, fetchRecent, fetchTrades, fetchCotLogs, fetchLessons]);
+
+  // 入力が落ち着いてから検索を実行する
+  React.useEffect(() => {
+    const t = setTimeout(() => setCotQueryDebounced(cotQuery.trim()), 300);
+    return () => clearTimeout(t);
+  }, [cotQuery]);
+
+  React.useEffect(() => {
+    const t = setTimeout(() => setTradeFilterDebounced(tradeFilter), 300);
+    return () => clearTimeout(t);
+  }, [tradeFilter]);
+
+  // 銘柄の選択肢は起動後に一度だけ取得する
+  React.useEffect(() => {
+    tradingApi
+      .getRuntime()
+      .then((res) => {
+        if (res.success && res.data) setPairs(res.data.pairs);
+      })
+      .catch(() => undefined);
+  }, []);
+
+  // タブに関係なく常時ポーリングするのはこれだけ
+  usePolling(fetchLive, LIVE_INTERVAL, true);
+  // 一覧系は表示中のタブの分だけを、ゆるめの間隔で更新する
+  usePolling(fetchRecent, LIST_INTERVAL, activeTab === "overview");
+  usePolling(fetchTrades, LIST_INTERVAL, activeTab === "trades");
+  usePolling(fetchCotLogs, LIST_INTERVAL, activeTab === "cot");
+
+  React.useEffect(() => {
+    if (activeTab !== "lessons") return;
+    fetchLessons();
+  }, [activeTab, fetchLessons]);
 
   // ボット稼働トグル切り替え
   const handleStateChange = async (newState: BotState) => {
@@ -114,7 +216,7 @@ export default function TradingDashboard() {
     } catch (err) {
       toast.error("ボット状態の更新に失敗しました", { description: errorMessage(err) });
     } finally {
-      syncWithBackend();
+      refresh();
     }
   };
 
@@ -128,7 +230,7 @@ export default function TradingDashboard() {
     } catch (err) {
       toast.error("緊急全決済の送信に失敗しました", { description: errorMessage(err) });
     } finally {
-      syncWithBackend();
+      refresh();
     }
   };
 
@@ -146,7 +248,23 @@ export default function TradingDashboard() {
     } catch (err) {
       toast.error("ポジションの決済に失敗しました", { description: errorMessage(err) });
     } finally {
-      syncWithBackend();
+      refresh();
+    }
+  };
+
+  // 約定履歴の削除（1件でも複数でも同じ導線）
+  const handleDeleteTrades = async (ids: string[]) => {
+    try {
+      const res = ids.length === 1 ? await tradingApi.deleteTrade(ids[0]) : await tradingApi.deleteTrades(ids);
+      if (res.success) {
+        toast.info(res.message || `約定履歴を ${ids.length} 件削除しました`);
+      } else {
+        toast.error("約定履歴の削除に失敗しました", { description: res.message });
+      }
+    } catch (err) {
+      toast.error("約定履歴の削除に失敗しました", { description: errorMessage(err) });
+    } finally {
+      refresh();
     }
   };
 
@@ -212,7 +330,7 @@ export default function TradingDashboard() {
             metrics={metrics}
             onStateChange={handleStateChange}
             onEmergencyStop={handleEmergencyStop}
-            onRefresh={syncWithBackend}
+            onRefresh={refresh}
           />
         ) : (
           <Skeleton className="h-9 flex-1 rounded-lg" />
@@ -251,7 +369,7 @@ export default function TradingDashboard() {
 
               {/* 右カラム: 条件付きプラン + LLM思考ログ (5/12) */}
               <div className="lg:col-span-5 space-y-6">
-                <PlanMonitor onDecided={syncWithBackend} />
+                <PlanMonitor onDecided={refresh} />
                 <CoTViewer logs={recentCotLogs} />
                 <TradeHistoryTable trades={recentTrades} />
               </div>
@@ -268,6 +386,13 @@ export default function TradingDashboard() {
                 pageSize: COT_PAGE_SIZE,
                 total: cotLogsPage.total,
                 onPageChange: setCotPage,
+              }}
+              search={{
+                value: cotQuery,
+                onChange: (value) => {
+                  setCotQuery(value);
+                  setCotPage(1);
+                },
               }}
             />
           </TabsContent>
@@ -287,6 +412,15 @@ export default function TradingDashboard() {
                 total: tradesPage.total,
                 onPageChange: setTradePage,
               }}
+              filter={{
+                value: tradeFilter,
+                symbols: pairs,
+                onChange: (value) => {
+                  setTradeFilter(value);
+                  setTradePage(1);
+                },
+              }}
+              onDelete={handleDeleteTrades}
             />
           </TabsContent>
 

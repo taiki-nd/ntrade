@@ -200,7 +200,7 @@ export function DashboardLayout({ children, navItems = defaultNavItems, title = 
       {/* Desktop Sidebar (Collapsible: w-64 <-> w-16) */}
       <aside
         className={cn(
-          "hidden border-r bg-background md:block h-full sticky top-0 overflow-y-auto overflow-x-hidden shrink-0 transition-[width] duration-300 ease-in-out z-20",
+          "hidden border-r bg-background md:block h-full sticky top-0 overflow-y-auto overflow-x-hidden overscroll-contain shrink-0 transition-[width] duration-300 ease-in-out z-20",
           sidebarCollapsed ? "w-16" : "w-64"
         )}
       >
@@ -214,7 +214,7 @@ export function DashboardLayout({ children, navItems = defaultNavItems, title = 
       </aside>
 
       {/* Main Content Area */}
-      <div className="flex flex-1 flex-col h-full overflow-y-auto min-w-0" onScroll={handleScroll}>
+      <div className="flex flex-1 flex-col h-full overflow-y-auto overscroll-contain min-w-0" onScroll={handleScroll}>
         <header
           className={cn(
             "sticky top-0 z-30 flex min-h-14 shrink-0 items-center justify-between gap-3 px-4 transition-all duration-300 md:px-6",

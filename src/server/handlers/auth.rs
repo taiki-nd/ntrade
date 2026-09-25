@@ -174,6 +174,7 @@ pub async fn exchange_oauth_code(
         refresh_token: None,
         token_expires_at: None,
         is_live,
+        symbol_suffix: crate::ctrader::symbol_suffix_from_env(),
     }
     .with_tokens(&tokens);
 

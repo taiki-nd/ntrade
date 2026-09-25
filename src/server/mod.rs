@@ -32,6 +32,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/positions/{id}/close", post(handlers::positions::close_position))
         // 4. 約定・決済履歴
         .route("/api/trades", get(handlers::trades::get_trades))
+        .route("/api/trades/delete", post(handlers::trades::delete_trades))
+        .route("/api/trades/{id}", delete(handlers::trades::delete_trade))
         // 5. LLM思考ログ (CoT)
         .route("/api/cot", get(handlers::cot::get_cot_logs))
         .route("/api/cot/{id}", get(handlers::cot::get_cot_detail))

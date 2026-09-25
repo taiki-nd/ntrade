@@ -1,18 +1,21 @@
 use anyhow::{Context, Result};
+use chrono::{TimeZone, Utc};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-use crate::ctrader::{token, CTraderConfig, CTraderService, TokenSet};
-use crate::executor::{CTraderOrderSink, DisconnectedOrderSink, FixOrderSink, OrderSink, PlanBook};
+use crate::ctrader::{token, BarPeriod, CTraderConfig, CTraderService, TokenSet};
+use crate::executor::{CTraderOrderSink, DisconnectedOrderSink, OrderSink, PlanBook};
 use crate::guard::{GuardConfig, DEFAULT_GUARD_CONFIG_PATH};
 use crate::llm::{LlmClient, LlmClientConfig};
+use crate::snapshot::measures;
 use crate::snapshot::SnapshotBundle;
 use crate::storage::Db;
 use super::types::{
-    AccountInfo, AccountMetrics, BotState, ConnectionStatus, CoTLog, Position, TradeHistory,
+    AccountInfo, AccountMetrics, BotState, CloseReason, ConnectionStatus, CoTLog, Position, TradeHistory,
 };
 
 #[derive(Clone)]
@@ -35,14 +38,144 @@ pub struct AppState {
     pub plan_book: Arc<RwLock<PlanBook>>,
     /// LLM 推論クライアント
     pub llm: Arc<LlmClient>,
-    /// 発注先（FIX 設定時は FixOrderSink、cTrader 接続時は CTraderOrderSink、未接続時は DisconnectedOrderSink）
+    /// 発注先（cTrader 接続時は CTraderOrderSink、未接続時は DisconnectedOrderSink）
     pub order_sink: Arc<RwLock<Arc<dyn OrderSink>>>,
-    /// FIX 取引セッション（発注を FIX に委ねている場合のみ。決済時の保護注文取り消しに使う）
-    pub fix_client: Arc<RwLock<Option<Arc<crate::fix::FixTradingClient>>>>,
     /// 判断サイクルの直列化
     pub decide_lock: Arc<tokio::sync::Mutex<()>>,
     /// ブローカー残高の最終同期時刻
     pub last_broker_sync: Arc<RwLock<Option<std::time::Instant>>>,
+    /// ブローカーとの建玉照合の直列化（常駐ループと判断サイクル後の照合が重ならないように）
+    reconcile_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// ブローカー側で決済された建玉を決済履歴に変換する。
+///
+/// 決済価格・決済時刻・実現損益は cTrader の約定（closing deal）から取る。ローカルの足終値から
+/// 推定すると、決済から検知までの間に価格が動いた分だけ cTrader の履歴とずれるため。
+/// 約定が引けなかった場合のみ、最後に把握していた価格からの概算にフォールバックする。
+async fn closed_trade(ctrader: &CTraderService, p: Position) -> TradeHistory {
+    let deal = match p.id.parse::<i64>() {
+        Ok(position_id) => {
+            let from = crate::storage::parse_ts(&p.open_time)
+                .ok()
+                .and_then(|s| Utc.timestamp_opt(s, 0).single())
+                .unwrap_or_else(|| Utc::now() - chrono::Duration::days(30))
+                - chrono::Duration::hours(1);
+            match ctrader.get_position_close(position_id, from).await {
+                Ok(Some(d)) => Some(d),
+                Ok(None) => {
+                    warn!(position = %p.id, "no closing deal found; falling back to last known price");
+                    None
+                }
+                Err(e) => {
+                    warn!(position = %p.id, "failed to fetch closing deal: {e:#}");
+                    None
+                }
+            }
+        }
+        Err(_) => None,
+    };
+
+    let pip = measures::get_pip_size(&p.symbol);
+    let sign = if p.side == "BUY" { 1.0 } else { -1.0 };
+    let (entry_price, close_price, close_time, pnl_amount) = match &deal {
+        Some(d) => (
+            d.entry_price,
+            d.close_price,
+            d.close_time.format("%Y-%m-%d %H:%M:%S").to_string(),
+            d.net_profit,
+        ),
+        None => {
+            let pnl_pips = (p.current_price - p.entry_price) * sign / pip;
+            (
+                p.entry_price,
+                p.current_price,
+                Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                (pnl_pips * measures::pip_value_per_lot(&p.symbol) * p.volume_lots).round(),
+            )
+        }
+    };
+    let pnl_pips = ((close_price - entry_price) * sign / pip * 10.0).round() / 10.0;
+
+    let is_buy = p.side == "BUY";
+    let close_reason = if p.stop_loss > 0.0 && ((is_buy && close_price <= p.stop_loss) || (!is_buy && close_price >= p.stop_loss)) {
+        CloseReason::StopLoss
+    } else if p.take_profit > 0.0 && ((is_buy && close_price >= p.take_profit) || (!is_buy && close_price <= p.take_profit)) {
+        CloseReason::TakeProfit
+    } else {
+        CloseReason::Manual
+    };
+
+    if let Some(d) = &deal {
+        info!(
+            position = %p.id, deal = d.deal_id, close_price, gross = d.gross_profit,
+            swap = d.swap, commission = d.commission, net = d.net_profit,
+            "closing deal resolved from broker"
+        );
+    }
+
+    TradeHistory {
+        id: format!("trd-{}", p.id),
+        symbol: p.symbol,
+        side: p.side,
+        volume_lots: deal.as_ref().map(|d| d.volume_lots).filter(|v| *v > 0.0).unwrap_or(p.volume_lots),
+        entry_price,
+        close_price,
+        stop_loss: p.stop_loss,
+        take_profit: p.take_profit,
+        pnl_pips,
+        pnl_amount,
+        close_reason,
+        open_time: p.open_time,
+        close_time,
+        cot_log_id: p.cot_log_id,
+    }
+}
+
+/// 保有中の建玉の現在値と含み損益を更新する。含み損益はブローカーの確定値（手数料込み）を使い、
+/// 取れなかった場合のみ pip 換算にフォールバックする。
+async fn refresh_unrealized(ctrader: &CTraderService, positions: &mut [Position]) {
+    if positions.is_empty() {
+        return;
+    }
+    let broker_pnl: HashMap<i64, f64> = match ctrader.get_unrealized_pnl().await {
+        Ok(m) => m,
+        Err(e) => {
+            warn!("failed to fetch unrealized PnL; estimating from price: {e:#}");
+            HashMap::new()
+        }
+    };
+
+    let mut prices: HashMap<String, f64> = HashMap::new();
+    let symbols: Vec<String> = {
+        let mut s: Vec<String> = positions.iter().map(|p| p.symbol.clone()).collect();
+        s.sort();
+        s.dedup();
+        s
+    };
+    for symbol in symbols {
+        match ctrader.get_trendbars(&symbol, BarPeriod::M1, 1).await {
+            Ok(bars) => {
+                if let Some(bar) = bars.last() {
+                    prices.insert(symbol, bar.close);
+                }
+            }
+            Err(e) => warn!(%symbol, "failed to fetch latest price for open position: {e:#}"),
+        }
+    }
+
+    for p in positions.iter_mut() {
+        if let Some(price) = prices.get(&p.symbol) {
+            p.current_price = *price;
+        }
+        let sign = if p.side == "BUY" { 1.0 } else { -1.0 };
+        let pip = measures::get_pip_size(&p.symbol);
+        p.pnl_pips = ((p.current_price - p.entry_price) * sign / pip * 10.0).round() / 10.0;
+        p.pnl_amount = match p.id.parse::<i64>().ok().and_then(|id| broker_pnl.get(&id)) {
+            Some(v) => *v,
+            None => (p.pnl_pips * measures::pip_value_per_lot(&p.symbol) * p.volume_lots).round(),
+        };
+    }
 }
 
 /// 前回終了時の保有ポジション（ペーパー決済の継続と判断ログとの対応付けのため）
@@ -111,9 +244,9 @@ impl AppState {
             plan_book: Arc::new(RwLock::new(PlanBook::default())),
             llm: Arc::new(LlmClient::new(LlmClientConfig::default())),
             order_sink: Arc::new(RwLock::new(Arc::new(DisconnectedOrderSink))),
-            fix_client: Arc::new(RwLock::new(None)),
             decide_lock: Arc::new(tokio::sync::Mutex::new(())),
             last_broker_sync: Arc::new(RwLock::new(None)),
+            reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -184,57 +317,28 @@ impl AppState {
 
     /// ブローカー側の建玉を成行で決済する。
     ///
-    /// FIX 発注を使っている場合は FIX 経由で決済し、併せて保護注文（SL/TP）を取り消す。
-    /// ネッティング口座では、建玉が無くなった後に保護注文が残っていると発動時に
-    /// 逆建玉を作ってしまうため、この取り消しは省略できない。
+    /// 反対売買の新規成行ではなく position_id 指定の決済を使う。反対売買では
+    /// ヘッジ口座で建玉が相殺されず、SL/TP を抱えた元の建玉が残ってしまうため。
     pub async fn close_broker_position(&self, position: &Position) -> Result<()> {
-        let entry_is_buy = position.side == "BUY";
-        let fix = self.fix_client.read().await.clone();
         let service = self.ctrader_service.read().await.clone();
         let Some(service) = service else {
             anyhow::bail!("cTrader is not connected; cannot close position {}", position.id);
         };
-
-        if let Some(fix) = fix {
-            let symbol_id = service.get_symbol_id(&position.symbol).await?;
-            let units = crate::fix::lots_to_units(position.volume_lots);
-            fix.close_position(&position.id, symbol_id, entry_is_buy, units)
-                .await
-                .with_context(|| format!("Failed to close position {} over FIX", position.id))?;
-            return Ok(());
-        }
+        let position_id: i64 = position
+            .id
+            .parse()
+            .with_context(|| format!("Position id {} is not a cTrader position id", position.id))?;
 
         let volume = crate::ctrader::lots_to_volume(position.volume_lots);
         service
-            .place_market_order_with_sltp(&position.symbol, !entry_is_buy, volume, None, None)
+            .close_position_by_id(position_id, volume)
             .await
             .with_context(|| format!("Failed to close position {} over Open API", position.id))?;
         Ok(())
     }
 
     /// 発注先を決める。
-    ///
-    /// FIX の接続情報（`CTRADER_FIX_*`）が設定されていればそちらを使う。ブローカーが
-    /// Open API の取引を無効化している（新規注文に TRADING_DISABLED が返る）場合の
-    /// 発注経路で、データ取得・口座情報・ポジション照合は Open API のまま。
-    /// 接続に失敗したときは Open API 発注にフォールバックする。
     async fn build_order_sink(&self, service: Arc<CTraderService>) -> Arc<dyn OrderSink> {
-        match crate::fix::FixConfig::from_env() {
-            Ok(Some(fix_cfg)) => {
-                info!("FIX credentials found; connecting FIX trading session for order execution");
-                match crate::fix::FixTradingClient::connect(fix_cfg).await {
-                    Ok(fix) => {
-                        info!("FIX session established: orders will be placed over FIX");
-                        *self.fix_client.write().await = Some(Arc::new(fix));
-                        let fix = self.fix_client.read().await.clone().expect("just installed");
-                        return Arc::new(FixOrderSink::new(fix, service));
-                    }
-                    Err(e) => warn!("FIX connection failed ({e:#}); falling back to Open API orders"),
-                }
-            }
-            Ok(None) => debug!("No FIX credentials configured; using Open API for orders"),
-            Err(e) => warn!("Invalid FIX configuration ({e:#}); using Open API for orders"),
-        }
         Arc::new(CTraderOrderSink::new(service))
     }
 
@@ -351,6 +455,158 @@ impl AppState {
             .unwrap_or(true);
         if stale {
             self.sync_broker_account().await;
+        }
+    }
+
+    // ------------------------------------------------------------- 建玉の照合
+
+    /// ブローカーとの建玉照合。判断サイクルとは独立に呼べるようにしてある。
+    ///
+    /// SL/TP はブローカー側で執行されるため、決済は「ブローカーから建玉が消えたこと」でしか
+    /// 検知できない。判断サイクルの後にしか照合しないと、停止中・サイクル間・再起動直後の決済を
+    /// 取りこぼし、決済済みの建玉が残って純資産がずれる。
+    ///
+    /// 戻り値は今回はじめて確定した決済（自己反省の対象）。
+    pub async fn reconcile_positions(&self) -> Result<Vec<TradeHistory>> {
+        let _serial = self.reconcile_lock.lock().await;
+        let Some(ctrader) = self.ctrader_service.read().await.clone() else {
+            return Ok(Vec::new());
+        };
+
+        self.sync_broker_account().await;
+        let broker = ctrader.get_open_positions().await.context("Failed to reconcile positions")?;
+
+        // 1. ローカルにあってブローカーに無い建玉 = 決済済み
+        let local = self.positions.read().await.clone();
+        let mut remaining: Vec<Position> = Vec::new();
+        let mut closed: Vec<TradeHistory> = Vec::new();
+        for p in local {
+            if broker.iter().any(|b| b.position_id.to_string() == p.id) {
+                remaining.push(p);
+            } else {
+                closed.push(closed_trade(&ctrader, p).await);
+            }
+        }
+
+        // 2. ブローカーにあってローカルに無い建玉（発注は通ったが記録に失敗した等）を取り込む
+        let orphans: Vec<_> = broker
+            .iter()
+            .filter(|b| !remaining.iter().any(|p| p.id == b.position_id.to_string()))
+            .cloned()
+            .collect();
+        for b in orphans {
+            let symbol = b.symbol_name.clone().unwrap_or_else(|| format!("symbol-{}", b.symbol_id));
+            warn!(position_id = b.position_id, symbol = %symbol, "orphan broker position adopted (not tracked locally)");
+            let entry = b.entry_price.unwrap_or_default();
+            remaining.push(Position {
+                id: b.position_id.to_string(),
+                symbol,
+                side: if b.is_buy { "BUY".into() } else { "SELL".into() },
+                volume_lots: b.volume_lots,
+                entry_price: entry,
+                current_price: entry,
+                stop_loss: b.stop_loss.unwrap_or_default(),
+                take_profit: b.take_profit.unwrap_or_default(),
+                pnl_pips: 0.0,
+                pnl_amount: 0.0,
+                open_time: b.open_time.unwrap_or_else(Utc::now).format("%Y-%m-%d %H:%M:%S").to_string(),
+                invalidation_reason: "ブローカー側から取り込んだ建玉（ntrade の記録に無し）".into(),
+                cot_log_id: None,
+            });
+        }
+
+        // 3. 残った建玉の含み損益をブローカーの値で更新する
+        refresh_unrealized(&ctrader, &mut remaining).await;
+
+        *self.positions.write().await = remaining;
+        self.persist_positions().await;
+
+        Ok(self.record_closed_trades(closed).await)
+    }
+
+    /// 単一建玉の手動成行決済。ブローカーの約定を待ってから決済履歴を確定させるので、
+    /// 決済に失敗した場合は建玉をローカルから消さない。
+    pub async fn close_position_now(&self, id: &str) -> Result<TradeHistory> {
+        let target = self
+            .positions
+            .read()
+            .await
+            .iter()
+            .find(|p| p.id == id)
+            .cloned()
+            .with_context(|| format!("Position {id} not found"))?;
+
+        self.close_broker_position(&target).await?;
+
+        let ctrader = self
+            .ctrader_service
+            .read()
+            .await
+            .clone()
+            .context("cTrader is not connected")?;
+        let trade = closed_trade(&ctrader, target).await;
+
+        self.positions.write().await.retain(|p| p.id != id);
+        self.persist_positions().await;
+        Ok(self.record_closed_trades(vec![trade.clone()]).await.into_iter().next().unwrap_or(trade))
+    }
+
+    /// 決済履歴を SQLite に記録し、まだ記録されていなかったものだけを返す。
+    /// 同じ決済を複数回照合しても口座メトリクスを二重計上しないため。
+    pub async fn record_closed_trades(&self, trades: Vec<TradeHistory>) -> Vec<TradeHistory> {
+        if trades.is_empty() {
+            return Vec::new();
+        }
+        let fresh = self
+            .with_db(move |db| {
+                let mut fresh = Vec::new();
+                for t in trades {
+                    let already_known = db.trade(&t.id)?.is_some();
+                    db.insert_trade(&t)?;
+                    if !already_known {
+                        fresh.push(t);
+                    }
+                }
+                Ok(fresh)
+            })
+            .await;
+        let fresh = match fresh {
+            Ok(fresh) => fresh,
+            Err(e) => {
+                error!("Failed to record trades to SQLite: {e:#}");
+                return Vec::new();
+            }
+        };
+
+        let mut metrics = self.metrics.write().await;
+        for t in &fresh {
+            metrics.daily_pnl += t.pnl_amount;
+            metrics.daily_pnl_percent =
+                if metrics.balance > 0.0 { metrics.daily_pnl / metrics.balance * 100.0 } else { 0.0 };
+            metrics.total_trades_today += 1;
+            if t.pnl_amount > 0.0 {
+                metrics.winning_trades_today += 1;
+            }
+            metrics.win_rate_today = if metrics.total_trades_today > 0 {
+                metrics.winning_trades_today as f64 / metrics.total_trades_today as f64 * 100.0
+            } else {
+                0.0
+            };
+            info!(id = %t.id, ?t.close_reason, pnl_pips = t.pnl_pips, pnl = t.pnl_amount, "position closed on broker");
+        }
+        drop(metrics);
+        fresh
+    }
+
+    /// 建玉照合の常駐ループ。判断サイクルや bot の稼働状態に依存せず決済を取り込む。
+    pub async fn run_reconcile_loop(self) {
+        const INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+        loop {
+            tokio::time::sleep(INTERVAL).await;
+            match self.reconcile_positions().await {
+                Ok(closed) => crate::scheduler::reflect_on_closed(&self, closed).await,
+                Err(e) => warn!("reconcile failed: {e:#}"),
+            }
         }
     }
 

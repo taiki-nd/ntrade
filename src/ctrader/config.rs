@@ -12,6 +12,17 @@ pub struct CTraderConfig {
     /// Access Token の失効時刻（unix 秒）。.env 由来で不明なら None
     pub token_expires_at: Option<i64>,
     pub is_live: bool,
+    /// 取引可能な銘柄名のサフィックス（例: ゼロ口座の "_z"）。
+    /// 素の銘柄名もシンボル一覧には存在するが発注は拒否されるため、解決時に優先する。
+    pub symbol_suffix: Option<String>,
+}
+
+/// `CTRADER_SYMBOL_SUFFIX` を読む。未設定・空なら None
+pub fn symbol_suffix_from_env() -> Option<String> {
+    env::var("CTRADER_SYMBOL_SUFFIX")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 impl CTraderConfig {
@@ -43,6 +54,7 @@ impl CTraderConfig {
             refresh_token,
             token_expires_at: None,
             is_live,
+            symbol_suffix: symbol_suffix_from_env(),
         })
     }
 
