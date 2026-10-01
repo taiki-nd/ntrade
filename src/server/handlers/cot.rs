@@ -23,8 +23,8 @@ pub async fn get_cot_logs(
 /// GET /api/cot/{id}
 /// 判断1件と、その判断から建てたポジション・決済履歴を返却
 ///
-/// 条件付きプランは「発注した記録（成立ログ）」と「根拠になった LLM 判断」が別ログに分かれる。
-/// 取引は成立ログに紐づくので、元の判断を開いたときも成立ログ経由の取引を拾えるようにする。
+/// 条件付きプランは「プランを立てた判断」と「成立を受けた再判断（旧データは機械的な成立ログ）」が
+/// 別ログに分かれ、取引は後者に紐づく。プランを立てた判断を開いたときも、後者経由の取引を拾えるようにする。
 pub async fn get_cot_detail(State(state): State<AppState>, Path(id): Path<String>) -> Json<ApiResponse<CoTDetail>> {
     let key = id.clone();
     let res = state
@@ -114,6 +114,7 @@ mod tests {
             open_time: "2026-09-15 09:05:00".into(),
             invalidation_reason: "i".into(),
             cot_log_id: Some("cot-1".into()),
+            close_stop: None,
         }];
         state.persist_positions().await;
         state

@@ -13,41 +13,54 @@ use crate::ctrader::BarPeriod;
 use crate::server::state::AppState;
 use crate::server::types::ApiResponse;
 use crate::snapshot::{
-    AccountState, MarketSnapshot, OpenPositionSummary, RecentDecision, SnapshotInput, SnapshotPipeline,
+    AccountState, MarketSnapshot, OpenPositionSummary, RecentDecision, SnapshotBundle, SnapshotInput, SnapshotPipeline,
 };
 
 #[derive(Debug, Deserialize)]
 pub struct ChartQuery {
     /// 4H / 1H / 15M / 5M（省略時は 5M）
     pub tf: Option<String>,
+    /// 通貨ペア（省略時は設定の先頭ペア）
+    pub pair: Option<String>,
 }
 
-/// GET /api/chart/latest?tf=5M
+#[derive(Debug, Deserialize)]
+pub struct PairQuery {
+    /// 通貨ペア（省略時は設定の先頭ペア）
+    pub pair: Option<String>,
+}
+
+/// 指定ペアの直近 Snapshot。まだ無ければその場で生成する
+async fn snapshot_or_generate(state: &AppState, pair: &str) -> anyhow::Result<SnapshotBundle> {
+    if let Some(b) = state.latest_snapshots.read().await.get(pair) {
+        return Ok(b.clone());
+    }
+    info!(pair, "No snapshot yet, generating on demand...");
+    generate_snapshot_internal(state, pair).await
+}
+
+/// GET /api/chart/latest?tf=5M&pair=USDJPY
 /// 直近 Snapshot の時間足別チャートPNGを配信
 pub async fn get_latest_chart(
     State(state): State<AppState>,
     Query(q): Query<ChartQuery>,
 ) -> Response {
     let tf = q.tf.unwrap_or_else(|| "5M".to_string());
+    let pair = state.resolve_pair(q.pair.as_deref()).await;
 
-    if state.latest_snapshot.read().await.is_none() {
-        info!("No snapshot yet, generating on demand...");
-        if let Err(e) = generate_snapshot_internal(&state, "USDJPY").await {
-            warn!("On-demand snapshot generation failed: {:?}", e);
+    let path = match snapshot_or_generate(&state, &pair).await {
+        Ok(b) => b.charts.by_timeframe(&tf).map(|p| p.to_path_buf()),
+        Err(e) => {
+            warn!(pair, "On-demand snapshot generation failed: {e:#}");
+            None
         }
-    }
-
-    let path = {
-        let lock = state.latest_snapshot.read().await;
-        lock.as_ref()
-            .and_then(|b| b.charts.by_timeframe(&tf).map(|p| p.to_path_buf()))
     };
 
     let Some(path) = path else {
         return (
             StatusCode::NOT_FOUND,
             [("Content-Type", "text/plain")],
-            format!("No chart for timeframe {tf}"),
+            format!("No chart for {pair} timeframe {tf}"),
         )
             .into_response();
     };
@@ -74,35 +87,35 @@ pub async fn get_latest_chart(
     }
 }
 
-/// POST /api/chart/generate
+/// POST /api/chart/generate?pair=USDJPY
 /// Snapshot（画像4枚 + 客観的事実）を再生成
-pub async fn generate_chart(State(state): State<AppState>) -> Json<ApiResponse<String>> {
-    info!("Triggering snapshot regeneration for USDJPY...");
-    match generate_snapshot_internal(&state, "USDJPY").await {
-        Ok(dir) => Json(ApiResponse::ok_msg(dir, "Snapshot（4H/1H/15M/5M 画像 + 事実JSON）を再生成しました")),
+pub async fn generate_chart(State(state): State<AppState>, Query(q): Query<PairQuery>) -> Json<ApiResponse<String>> {
+    let pair = state.resolve_pair(q.pair.as_deref()).await;
+    info!("Triggering snapshot regeneration for {pair}...");
+    match generate_snapshot_internal(&state, &pair).await {
+        Ok(b) => Json(ApiResponse::ok_msg(
+            b.charts.dir.to_string_lossy().to_string(),
+            format!("{pair} の Snapshot（4H/1H/15M/5M 画像 + 事実JSON）を再生成しました"),
+        )),
         Err(e) => Json(ApiResponse::err(format!("Failed to generate snapshot: {:?}", e))),
     }
 }
 
-/// GET /api/snapshot/latest
+/// GET /api/snapshot/latest?pair=USDJPY
 /// 直近 Snapshot の客観的事実 JSON
 pub async fn get_latest_snapshot(
     State(state): State<AppState>,
+    Query(q): Query<PairQuery>,
 ) -> Json<ApiResponse<MarketSnapshot>> {
-    if state.latest_snapshot.read().await.is_none() {
-        if let Err(e) = generate_snapshot_internal(&state, "USDJPY").await {
-            return Json(ApiResponse::err(format!("Failed to generate snapshot: {:?}", e)));
-        }
-    }
-    let lock = state.latest_snapshot.read().await;
-    match lock.as_ref() {
-        Some(b) => Json(ApiResponse::ok(b.snapshot.clone())),
-        None => Json(ApiResponse::err("No snapshot available")),
+    let pair = state.resolve_pair(q.pair.as_deref()).await;
+    match snapshot_or_generate(&state, &pair).await {
+        Ok(b) => Json(ApiResponse::ok(b.snapshot)),
+        Err(e) => Json(ApiResponse::err(format!("Failed to generate snapshot: {:?}", e))),
     }
 }
 
-/// 内部用: バー取得 → Snapshot 生成 → 状態更新。生成先ディレクトリを返す。
-pub async fn generate_snapshot_internal(state: &AppState, pair: &str) -> anyhow::Result<String> {
+/// 内部用: バー取得 → Snapshot 生成 → ペア別の直近 Snapshot を更新。生成した Snapshot を返す。
+pub async fn generate_snapshot_internal(state: &AppState, pair: &str) -> anyhow::Result<SnapshotBundle> {
     let ctrader_opt = {
         let lock = state.ctrader_service.read().await;
         lock.clone()
@@ -110,16 +123,13 @@ pub async fn generate_snapshot_internal(state: &AppState, pair: &str) -> anyhow:
 
     // 実データが取れないときは作らない（模擬データのチャートを LLM の判断や画面に使わないため）
     let ctrader = ctrader_opt.ok_or_else(|| anyhow::anyhow!("cTrader is not connected; snapshot needs live bars"))?;
-    info!("Fetching real trendbars from connected cTrader...");
+    info!(pair, "Fetching real trendbars from connected cTrader...");
     let b4h = ctrader.get_trendbars(pair, BarPeriod::H4, 200).await.context("failed to fetch 4H bars")?;
     let b1h = ctrader.get_trendbars(pair, BarPeriod::H1, 200).await.context("failed to fetch 1H bars")?;
     let b15m = ctrader.get_trendbars(pair, BarPeriod::M15, 200).await.context("failed to fetch 15M bars")?;
     let b5m = ctrader.get_trendbars(pair, BarPeriod::M5, 200).await.context("failed to fetch 5M bars")?;
 
-    let spread_pips = {
-        let m = state.metrics.read().await;
-        if pair.to_uppercase().contains("JPY") { m.usdjpy_spread } else { m.eurusd_spread }
-    };
+    let spread_pips = state.metrics.read().await.spreads.get(pair).copied().unwrap_or_default();
 
     // 口座状態: 保有ポジションと直近の判断（フリップフロップ防止のため LLM に渡す）
     let recent_cot = {
@@ -141,7 +151,8 @@ pub async fn generate_snapshot_internal(state: &AppState, pair: &str) -> anyhow:
                 .map(|p| OpenPositionSummary {
                     side: p.side.clone(),
                     entry_price: p.entry_price,
-                    stop_loss: Some(p.stop_loss),
+                    // LLM に見せるのは自分が決めた損切りライン。終値判定の建玉ではハードSLではなくそちら
+                    stop_loss: Some(p.close_stop.unwrap_or(p.stop_loss)),
                     take_profit: Some(p.take_profit),
                     open_time: p.open_time.clone(),
                 })
@@ -154,6 +165,8 @@ pub async fn generate_snapshot_internal(state: &AppState, pair: &str) -> anyhow:
                     summary: c.order_flow.chars().take(120).collect(),
                 })
                 .collect(),
+            // 成立したプランは判断サイクルがプラン評価の後で差し込む
+            triggered_plan: None,
         }
     };
 
@@ -170,11 +183,7 @@ pub async fn generate_snapshot_internal(state: &AppState, pair: &str) -> anyhow:
         account_state,
     })?;
 
-    let dir = bundle.charts.dir.to_string_lossy().to_string();
-    {
-        let mut lock = state.latest_snapshot.write().await;
-        *lock = Some(bundle);
-    }
-    info!("Snapshot generated at {}", dir);
-    Ok(dir)
+    info!(pair, "Snapshot generated at {}", bundle.charts.dir.display());
+    state.latest_snapshots.write().await.insert(pair.to_string(), bundle.clone());
+    Ok(bundle)
 }

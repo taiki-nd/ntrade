@@ -84,6 +84,7 @@ const CLOSE_REASON_LABELS: Record<string, string> = {
   "": "すべて",
   TAKE_PROFIT: "利確 (TP)",
   STOP_LOSS: "損切り (SL)",
+  INVALIDATED: "損切り (終値)",
   MANUAL: "手動決済",
   CIRCUIT_BREAKER: "強制停止",
 };
@@ -150,6 +151,13 @@ export function TradeHistoryTable({ trades, pagination, filter, onDelete }: Trad
           <Badge className="bg-rose-600/15 text-rose-700 dark:text-rose-400 border-rose-500/30 gap-1 text-[11px]">
             <AlertTriangle className="h-3 w-3" />
             損切り (SL)
+          </Badge>
+        );
+      case "INVALIDATED":
+        return (
+          <Badge className="bg-rose-600/15 text-rose-700 dark:text-rose-400 border-rose-500/30 gap-1 text-[11px]">
+            <AlertTriangle className="h-3 w-3" />
+            損切り (終値)
           </Badge>
         );
       case "MANUAL":

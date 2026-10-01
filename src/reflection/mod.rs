@@ -52,6 +52,7 @@ pub fn build_reflection_prompt(trade: &TradeHistory, cot: Option<&CoTLog>, post_
         .unwrap_or_else(|| "（エントリー時の判断ログなし）".to_string());
     let reason = match trade.close_reason {
         CloseReason::StopLoss => "損切り（SL到達）",
+        CloseReason::Invalidated => "損切り（5M確定足の終値が無効化ラインを越えた）",
         CloseReason::TakeProfit => "利確（TP到達）",
         CloseReason::Manual => "手動決済",
         CloseReason::CircuitBreaker => "サーキットブレーカー",

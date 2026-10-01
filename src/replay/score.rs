@@ -24,6 +24,10 @@ pub enum Outcome {
     PlanInvalidated,
     /// 条件付きプランに構造化条件が無く評価不能
     PlanUnstructured,
+    /// 条件付きプランは成立したが、再判断で LLM が入らなかった（HOLD）
+    PlanDeclined,
+    /// 条件付きプランは成立し、再判断で入ろうとしたが事後ガードで止まった
+    PlanRejected,
     /// BUY/SELL なのに SL/TP が無い
     NoSlTp,
     /// 採点に使う将来の足が無い（期間末尾）
@@ -41,6 +45,8 @@ impl Outcome {
             Outcome::PlanExpired => "PLAN_EXPIRED",
             Outcome::PlanInvalidated => "PLAN_INVALIDATED",
             Outcome::PlanUnstructured => "PLAN_UNSTRUCTURED",
+            Outcome::PlanDeclined => "PLAN_DECLINED",
+            Outcome::PlanRejected => "PLAN_REJECTED",
             Outcome::NoSlTp => "NO_SL_TP",
             Outcome::NoData => "NO_DATA",
         }
@@ -70,6 +76,58 @@ impl ScoreResult {
     }
 }
 
+/// SL の判定方法（本番の執行と同じ定義を使う）
+pub use crate::guard::StopMode;
+
+/// 決済ルール。LLM の判断はそのままに、SL の執行方法だけを変えて採点するためのもの。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ExitRule {
+    pub stop_mode: StopMode,
+    /// SL を ATR(5M,14) の何倍だけ外側へずらすか
+    pub sl_buffer_atr: f64,
+    /// `Close` のときのハードSL: バッファ込みの SL からさらに ATR(5M,14) の何倍外側に置くか
+    pub hard_stop_atr: f64,
+}
+
+impl Default for ExitRule {
+    fn default() -> Self {
+        Self { stop_mode: StopMode::Touch, sl_buffer_atr: 0.0, hard_stop_atr: 2.0 }
+    }
+}
+
+impl ExitRule {
+    /// `touch`, `touch:0.5`, `close:0.5:2` の形式を解釈する（数値は ATR 倍率）
+    pub fn parse(s: &str) -> Option<Self> {
+        let mut it = s.split(':');
+        let stop_mode = match it.next()?.trim() {
+            "touch" => StopMode::Touch,
+            "close" => StopMode::Close,
+            _ => return None,
+        };
+        let mut rule = Self { stop_mode, ..Self::default() };
+        if let Some(v) = it.next() {
+            rule.sl_buffer_atr = v.trim().parse().ok().filter(|x: &f64| *x >= 0.0)?;
+        }
+        if let Some(v) = it.next() {
+            if stop_mode != StopMode::Close {
+                return None;
+            }
+            rule.hard_stop_atr = v.trim().parse().ok().filter(|x: &f64| *x >= 0.0)?;
+        }
+        if it.next().is_some() {
+            return None;
+        }
+        Some(rule)
+    }
+
+    pub fn label(&self) -> String {
+        match self.stop_mode {
+            StopMode::Touch => format!("touch:{}", self.sl_buffer_atr),
+            StopMode::Close => format!("close:{}:{}", self.sl_buffer_atr, self.hard_stop_atr),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ScoreConfig {
     pub pip_size: f64,
@@ -77,6 +135,9 @@ pub struct ScoreConfig {
     pub spread_pips: f64,
     /// 何本以内に決着しなければ TIMEOUT にするか
     pub max_bars: usize,
+    pub exit: ExitRule,
+    /// 判断時刻の ATR(5M,14)（価格単位）。取れない場合は 0 とし、バッファとハードSLの幅は 0 になる
+    pub atr: f64,
 }
 
 /// 成行エントリーの採点。`bars` は判断時刻以降の5M足（昇順）。
@@ -105,20 +166,29 @@ fn score_from(bars: &[CandleBar], action: Action, entry: f64, sl: f64, tp: f64, 
         Action::Hold => return ScoreResult::flat(Outcome::Hold),
     };
     let pnl = |exit: f64| ((exit - entry) * sign) / cfg.pip_size - cfg.spread_pips;
+    let done = |outcome: Outcome, exit: f64, i: usize| ScoreResult {
+        outcome,
+        pnl_pips: Some(pnl(exit)),
+        bars_to_exit: Some(i + 1),
+        entry_price: Some(entry),
+    };
+
+    // SL は建値の反対側にあるので、「外側へずらす」は BUY なら下、SELL なら上
+    let stop = sl - sign * cfg.exit.sl_buffer_atr * cfg.atr;
+    let close_mode = cfg.exit.stop_mode == StopMode::Close;
+    let hard = if close_mode { stop - sign * cfg.exit.hard_stop_atr * cfg.atr } else { stop };
 
     for (i, b) in bars.iter().take(cfg.max_bars).enumerate() {
-        let hit_sl = if sign > 0.0 { b.low <= sl } else { b.high >= sl };
+        let hit_hard = if sign > 0.0 { b.low <= hard } else { b.high >= hard };
         let hit_tp = if sign > 0.0 { b.high >= tp } else { b.low <= tp };
-        match (hit_sl, hit_tp) {
-            (true, true) => {
-                return ScoreResult { outcome: Outcome::SameBar, pnl_pips: Some(pnl(sl)), bars_to_exit: Some(i + 1), entry_price: Some(entry) }
-            }
-            (true, false) => {
-                return ScoreResult { outcome: Outcome::SlHit, pnl_pips: Some(pnl(sl)), bars_to_exit: Some(i + 1), entry_price: Some(entry) }
-            }
-            (false, true) => {
-                return ScoreResult { outcome: Outcome::TpHit, pnl_pips: Some(pnl(tp)), bars_to_exit: Some(i + 1), entry_price: Some(entry) }
-            }
+        let closed_out = close_mode && if sign > 0.0 { b.close < stop } else { b.close > stop };
+        // 同一足内の順序は分からないので、TP と損切りが重なったら不利側に倒す
+        match (hit_hard, hit_tp, closed_out) {
+            (true, true, _) => return done(Outcome::SameBar, hard, i),
+            (true, false, _) => return done(Outcome::SlHit, hard, i),
+            (false, true, true) => return done(Outcome::SameBar, b.close, i),
+            (false, true, false) => return done(Outcome::TpHit, tp, i),
+            (false, false, true) => return done(Outcome::SlHit, b.close, i),
             _ => {}
         }
     }
@@ -139,36 +209,59 @@ fn score_from(bars: &[CandleBar], action: Action, entry: f64, sl: f64, tp: f64, 
     }
 }
 
-/// 条件付きプランの評価。`bars` は判断時刻以降の5M足（昇順）。
-/// 本番の Executor と同じ `step_plan` で各確定足を評価し、成立したら次の足からトレードとして採点する。
-pub fn evaluate_plan(bars: &[CandleBar], plan: &ConditionalPlan, cfg: &ScoreConfig) -> ScoreResult {
+/// 条件付きプランを判断時刻以降の5M足（昇順）で進め、成立した足の位置を返す。
+/// 成立しなければ、その結末（期限切れ・破棄・評価不能・データ切れ）を返す。
+/// 本番の Executor と同じ `step_plan` で各確定足を評価する。
+pub fn plan_trigger_index(bars: &[CandleBar], plan: &ConditionalPlan) -> Result<usize, Outcome> {
     use crate::executor::{step_plan, PlanStep};
 
     if !plan.is_structured() {
-        return ScoreResult::flat(Outcome::PlanUnstructured);
+        return Err(Outcome::PlanUnstructured);
     }
     for (i, b) in bars.iter().enumerate() {
         match step_plan(plan, b) {
             PlanStep::Waiting => {}
-            PlanStep::Expired => return ScoreResult::flat(Outcome::PlanExpired),
-            PlanStep::Invalidated => return ScoreResult::flat(Outcome::PlanInvalidated),
-            PlanStep::Unstructured => return ScoreResult::flat(Outcome::PlanUnstructured),
-            PlanStep::Triggered { action, entry } => {
-                let (Some(sl), Some(tp)) = (plan.stop_loss, plan.take_profit) else {
-                    return ScoreResult::flat(Outcome::NoSlTp);
-                };
-                let rest = &bars[i + 1..];
-                if rest.is_empty() {
-                    return ScoreResult::flat(Outcome::NoData);
-                }
-                let mut r = score_from(rest, action, entry, sl, tp, cfg);
-                r.bars_to_exit = r.bars_to_exit.map(|n| n + i + 1);
-                return r;
-            }
+            PlanStep::Expired => return Err(Outcome::PlanExpired),
+            PlanStep::Invalidated => return Err(Outcome::PlanInvalidated),
+            PlanStep::Unstructured => return Err(Outcome::PlanUnstructured),
+            PlanStep::Triggered { .. } => return Ok(i),
         }
     }
     // 期限前にデータが尽きた
-    ScoreResult::flat(Outcome::NoData)
+    Err(Outcome::NoData)
+}
+
+/// 条件付きプランを機械的に執行したとみなす採点（成立足の終値で入り、プランの SL/TP を使う）。
+/// 本番は成立時に LLM が判断し直すので、それと比べるための旧方式。
+pub fn evaluate_plan(bars: &[CandleBar], plan: &ConditionalPlan, cfg: &ScoreConfig) -> ScoreResult {
+    let i = match plan_trigger_index(bars, plan) {
+        Ok(i) => i,
+        Err(outcome) => return ScoreResult::flat(outcome),
+    };
+    let (Some(sl), Some(tp)) = (plan.stop_loss, plan.take_profit) else {
+        return ScoreResult::flat(Outcome::NoSlTp);
+    };
+    let rest = &bars[i + 1..];
+    if rest.is_empty() {
+        return ScoreResult::flat(Outcome::NoData);
+    }
+    let mut r = score_from(rest, plan.then_action, bars[i].close, sl, tp, cfg);
+    r.bars_to_exit = r.bars_to_exit.map(|n| n + i + 1);
+    r
+}
+
+/// プラン成立時の再判断の採点。`bars` は再判断の時刻（成立足の確定時刻）以降の5M足。
+/// `offset` はプランを立てた判断から成立足までの本数で、`bars_to_exit` に足し込む。
+pub fn score_followup(bars: &[CandleBar], followup: &TradeDecision, guard_passed: bool, offset: usize, cfg: &ScoreConfig) -> ScoreResult {
+    if followup.action == Action::Hold {
+        return ScoreResult::flat(Outcome::PlanDeclined);
+    }
+    if !guard_passed {
+        return ScoreResult::flat(Outcome::PlanRejected);
+    }
+    let mut r = score_trade(bars, followup.action, followup.entry_price, followup.stop_loss, followup.take_profit, cfg);
+    r.bars_to_exit = r.bars_to_exit.map(|n| n + offset);
+    r
 }
 
 /// TradeDecision 全体の採点
@@ -212,7 +305,76 @@ mod tests {
     }
 
     fn cfg() -> ScoreConfig {
-        ScoreConfig { pip_size: 0.01, spread_pips: 0.2, max_bars: 4 }
+        ScoreConfig { pip_size: 0.01, spread_pips: 0.2, max_bars: 4, exit: ExitRule::default(), atr: 0.0 }
+    }
+
+    fn cfg_with(exit: &str, atr: f64) -> ScoreConfig {
+        ScoreConfig { exit: ExitRule::parse(exit).unwrap(), atr, ..cfg() }
+    }
+
+    #[test]
+    fn exit_rule_parse_and_label() {
+        assert_eq!(ExitRule::parse("touch"), Some(ExitRule::default()));
+        let r = ExitRule::parse("close:0.5:3").unwrap();
+        assert_eq!((r.stop_mode, r.sl_buffer_atr, r.hard_stop_atr), (StopMode::Close, 0.5, 3.0));
+        assert_eq!(ExitRule::parse(&r.label()), Some(r));
+        assert_eq!(ExitRule::parse("touch:0.5:2"), None);
+        assert_eq!(ExitRule::parse("touch:-1"), None);
+        assert_eq!(ExitRule::parse("wick"), None);
+    }
+
+    #[test]
+    fn sl_buffer_survives_a_wick() {
+        // SELL 154.20 / SL 154.30 / TP 154.00。1本目の高値 154.31 がヒゲで SL を刺し、2本目で TP
+        let b = bars(&[(154.31, 154.15, 154.20), (154.22, 153.98, 154.00)]);
+        assert_eq!(score_trade(&b, Action::Sell, Some(154.20), Some(154.30), Some(154.00), &cfg()).outcome, Outcome::SlHit);
+
+        // ATR 0.04 の 0.5 倍 = 2pips 外側へずらすと SL は 154.32 になり、ヒゲを耐える
+        let r = score_trade(&b, Action::Sell, Some(154.20), Some(154.30), Some(154.00), &cfg_with("touch:0.5", 0.04));
+        assert_eq!(r.outcome, Outcome::TpHit);
+
+        // ずらした先で刺さった場合の損失はバッファ分だけ大きい
+        let b = bars(&[(154.33, 154.15, 154.20)]);
+        let r = score_trade(&b, Action::Sell, Some(154.20), Some(154.30), Some(154.00), &cfg_with("touch:0.5", 0.04));
+        assert_eq!(r.outcome, Outcome::SlHit);
+        assert!((r.pnl_pips.unwrap() - (-12.0 - 0.2)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn close_mode_ignores_wicks_and_exits_at_close() {
+        let exit = "close:0:2"; // ハードSL = 154.30 + 2 × 0.04 = 154.38
+        // ヒゲで SL を越えても終値が内側なら続行し、TP に届く
+        let b = bars(&[(154.35, 154.15, 154.25), (154.22, 153.98, 154.00)]);
+        let r = score_trade(&b, Action::Sell, Some(154.20), Some(154.30), Some(154.00), &cfg_with(exit, 0.04));
+        assert_eq!(r.outcome, Outcome::TpHit);
+
+        // 終値が SL を越えたら、その足の終値で決済
+        let b = bars(&[(154.36, 154.15, 154.34)]);
+        let r = score_trade(&b, Action::Sell, Some(154.20), Some(154.30), Some(154.00), &cfg_with(exit, 0.04));
+        assert_eq!(r.outcome, Outcome::SlHit);
+        assert!((r.pnl_pips.unwrap() - (-14.0 - 0.2)).abs() < 1e-6);
+
+        // ハードSLに触れたら終値を待たずにハードSL価格で決済
+        let b = bars(&[(154.40, 154.15, 154.25)]);
+        let r = score_trade(&b, Action::Sell, Some(154.20), Some(154.30), Some(154.00), &cfg_with(exit, 0.04));
+        assert_eq!(r.outcome, Outcome::SlHit);
+        assert!((r.pnl_pips.unwrap() - (-18.0 - 0.2)).abs() < 1e-6);
+
+        // TP に触れた足の終値が SL の外なら、順序不明として不利側（終値決済）に倒す
+        let b = bars(&[(154.36, 153.98, 154.33)]);
+        let r = score_trade(&b, Action::Sell, Some(154.20), Some(154.30), Some(154.00), &cfg_with(exit, 0.04));
+        assert_eq!(r.outcome, Outcome::SameBar);
+        assert!((r.pnl_pips.unwrap() - (-13.0 - 0.2)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn close_mode_buy_side() {
+        // BUY 154.20 / SL 154.10 / TP 154.40。安値 154.05 のヒゲは耐え、終値 154.08 で決済
+        let b = bars(&[(154.25, 154.05, 154.15), (154.20, 154.06, 154.08)]);
+        let r = score_trade(&b, Action::Buy, Some(154.20), Some(154.10), Some(154.40), &cfg_with("close:0:2", 0.04));
+        assert_eq!(r.outcome, Outcome::SlHit);
+        assert_eq!(r.bars_to_exit, Some(2));
+        assert!((r.pnl_pips.unwrap() - (-12.0 - 0.2)).abs() < 1e-6);
     }
 
     #[test]
@@ -289,5 +451,31 @@ mod tests {
         let mut p = plan();
         p.trigger_price = None;
         assert_eq!(evaluate_plan(&b, &p, &cfg()).outcome, Outcome::PlanUnstructured);
+    }
+
+    #[test]
+    fn plan_trigger_index_points_at_the_triggering_bar() {
+        let b = bars(&[(154.22, 154.15, 154.20), (154.30, 154.18, 154.26), (154.65, 154.25, 154.60)]);
+        assert_eq!(plan_trigger_index(&b, &plan()), Ok(1));
+        assert_eq!(plan_trigger_index(&b[..1], &plan()), Err(Outcome::NoData));
+    }
+
+    /// 再判断が HOLD なら見送り、ガードで止まれば不成立。入るなら再判断の価格と SL/TP で採点する
+    #[test]
+    fn followup_is_scored_with_its_own_levels() {
+        let mut d = TradeDecision::fallback_hold("t");
+        assert_eq!(score_followup(&[], &d, true, 2, &cfg()).outcome, Outcome::PlanDeclined);
+
+        d.action = Action::Buy;
+        d.entry_price = Some(154.30);
+        d.stop_loss = Some(154.10);
+        d.take_profit = Some(154.60);
+        assert_eq!(score_followup(&[], &d, false, 2, &cfg()).outcome, Outcome::PlanRejected);
+
+        let b = bars(&[(154.40, 154.25, 154.35), (154.65, 154.30, 154.60)]);
+        let r = score_followup(&b, &d, true, 2, &cfg());
+        assert_eq!(r.outcome, Outcome::TpHit);
+        assert_eq!(r.entry_price, Some(154.30));
+        assert_eq!(r.bars_to_exit, Some(4));
     }
 }

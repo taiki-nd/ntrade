@@ -1,7 +1,7 @@
 SHELL := /bin/zsh
 export PATH := $(HOME)/.local/bin:$(HOME)/.nodenv/shims:$(PATH)
 
-.PHONY: help install dev ui engine test poc ctrader build clean step4 replay-fetch replay-check replay-run replay-report replay-list
+.PHONY: help install dev ui engine test poc ctrader build clean step4 replay-fetch replay-check replay-run replay-rescore replay-report replay-list
 
 help: ## コマンド一覧を表示
 	@echo "ntrade - LLM駆動型 FX自動売買システム"
@@ -44,8 +44,11 @@ replay-fetch: ## ヒストリカルバーを cTrader から取得 (FROM=YYYY-MM-
 replay-check: ## 未来漏れ検証 (Snapshot に t より後のデータが無いこと)
 	cargo run --bin replay -- check-leak --pair $(or $(PAIR),USDJPY) --samples $(or $(SAMPLES),50)
 
-replay-run: ## リプレイ実行 (FROM= TO= LIMIT= LABEL= STEP=)
-	cargo run --bin replay -- run --pair $(or $(PAIR),USDJPY) --from $(FROM) --to $(TO) --step $(or $(STEP),15) $(if $(LIMIT),--limit $(LIMIT),) --label "$(LABEL)"
+replay-run: ## リプレイ実行 (FROM= TO= LIMIT= LABEL= STEP= EXIT=)
+	cargo run --bin replay -- run --pair $(or $(PAIR),USDJPY) --from $(FROM) --to $(TO) --step $(or $(STEP),15) $(if $(LIMIT),--limit $(LIMIT),) --label "$(LABEL)" $(if $(EXIT),--exit $(EXIT),)
+
+replay-rescore: ## 保存済み run を別の決済ルールで再採点 (RUN=<id> EXITS="touch:0.5 close:0:2")
+	cargo run --bin replay -- rescore --run $(RUN) $(foreach e,$(or $(EXITS),touch touch:0.5 touch:1 close:0:2),--exit $(e))
 
 replay-report: ## リプレイ集計 (RUN=<id>)
 	cargo run --bin replay -- report --run $(RUN)

@@ -60,6 +60,9 @@ pub struct ReplayDecisionRow {
     pub session: String,
     pub confidence: f64,
     pub action: String,
+    /// 条件付きプランが成立したときの再判断（`replay::PlanFollowup` の JSON）。成立しなければ None
+    #[serde(default)]
+    pub followup_json: Option<String>,
 }
 
 impl Db {
@@ -117,6 +120,7 @@ impl Db {
               session       TEXT NOT NULL,
               confidence    REAL NOT NULL,
               action        TEXT NOT NULL,
+              followup_json TEXT,
               PRIMARY KEY (run_id, t)
             );
             CREATE TABLE IF NOT EXISTS oauth_tokens (
@@ -126,9 +130,36 @@ impl Db {
               expires_at    INTEGER,
               updated_at    INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS app_settings (
+              key           TEXT PRIMARY KEY,
+              value         TEXT NOT NULL,
+              updated_at    INTEGER NOT NULL
+            );
             "#,
         )?;
+        // 既存 DB への列追加（既にあればエラーになるので無視する）
+        let _ = self.conn.execute("ALTER TABLE replay_decisions ADD COLUMN followup_json TEXT", []);
         self.migrate_journal()?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------ settings
+
+    /// 画面から変更できる設定（JSON で保存）。未保存なら None
+    pub fn load_setting<T: serde::de::DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row("SELECT value FROM app_settings WHERE key = ?1", params![key], |r| r.get(0))
+            .optional()?;
+        raw.map(|s| serde_json::from_str(&s).with_context(|| format!("invalid setting {key}")))
+            .transpose()
+    }
+
+    pub fn save_setting<T: serde::Serialize>(&self, key: &str, value: &T) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO app_settings (key, value, updated_at) VALUES (?1, ?2, ?3)",
+            params![key, serde_json::to_string(value)?, Utc::now().timestamp()],
+        )?;
         Ok(())
     }
 
@@ -283,8 +314,8 @@ impl Db {
     pub fn insert_decision(&self, row: &ReplayDecisionRow) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO replay_decisions
-             (run_id, t, decision_json, guard_result, outcome, pnl_pips, bars_to_exit, chart_dir, session, confidence, action)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             (run_id, t, decision_json, guard_result, outcome, pnl_pips, bars_to_exit, chart_dir, session, confidence, action, followup_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 row.run_id,
                 parse_ts(&row.t)?,
@@ -296,7 +327,8 @@ impl Db {
                 row.chart_dir,
                 row.session,
                 row.confidence,
-                row.action
+                row.action,
+                row.followup_json
             ],
         )?;
         Ok(())
@@ -345,7 +377,7 @@ impl Db {
 
     pub fn decisions(&self, run_id: i64) -> Result<Vec<ReplayDecisionRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT run_id, t, decision_json, guard_result, outcome, pnl_pips, bars_to_exit, chart_dir, session, confidence, action
+            "SELECT run_id, t, decision_json, guard_result, outcome, pnl_pips, bars_to_exit, chart_dir, session, confidence, action, followup_json
              FROM replay_decisions WHERE run_id = ?1 ORDER BY t ASC",
         )?;
         let rows = stmt
@@ -362,6 +394,7 @@ impl Db {
                     session: r.get(8)?,
                     confidence: r.get(9)?,
                     action: r.get(10)?,
+                    followup_json: r.get(11)?,
                 })
             })?
             .collect::<std::result::Result<_, _>>()?;
@@ -446,6 +479,7 @@ mod tests {
             session: "LONDON".into(),
             confidence: 0.8,
             action: "BUY".into(),
+            followup_json: None,
         })
         .unwrap();
         let runs = db.list_runs().unwrap();
@@ -465,5 +499,14 @@ mod tests {
         t.expires_at = None;
         db.save_ctrader_tokens(&t).unwrap();
         assert_eq!(db.load_ctrader_tokens().unwrap(), Some(t));
+    }
+
+    #[test]
+    fn settings_roundtrip() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(db.load_setting::<Vec<String>>("pairs").unwrap().is_none());
+        db.save_setting("pairs", &vec!["USDJPY".to_string()]).unwrap();
+        db.save_setting("pairs", &vec!["USDJPY".to_string(), "EURUSD".to_string()]).unwrap();
+        assert_eq!(db.load_setting::<Vec<String>>("pairs").unwrap().unwrap(), ["USDJPY", "EURUSD"]);
     }
 }

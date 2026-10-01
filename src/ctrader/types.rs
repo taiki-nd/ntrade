@@ -148,6 +148,9 @@ pub struct AccountSummary {
     /// 口座側の取引権限（FULL_ACCESS / CLOSE_ONLY / NO_TRADING / NO_LOGIN）
     #[serde(default)]
     pub access_rights: Option<String>,
+    /// 口座通貨（JPY など）。資産一覧から引けなかった場合は None
+    #[serde(default)]
+    pub deposit_currency: Option<String>,
 }
 
 /// ブローカー側の保有ポジション（reconcile の結果）
@@ -191,6 +194,41 @@ pub struct SymbolInfo {
     pub symbol_name: String,
     pub digits: i32,
     pub pip_position: i32,
+    /// 基軸通貨（EURUSD なら EUR）。ブローカーの資産一覧から引けなかった場合は None
+    #[serde(default)]
+    pub base_asset: Option<String>,
+    /// 建値通貨（EURUSD なら USD）。ブローカーの資産一覧から引けなかった場合は None
+    #[serde(default)]
+    pub quote_asset: Option<String>,
+}
+
+/// ブローカーが持つ銘柄の取引仕様（ProtoOASymbol）
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SymbolSpec {
+    /// 1 pip = 10^-pip_position
+    pub pip_position: i32,
+    pub digits: i32,
+    /// 1 lot あたりの数量（通貨単位。FX は通常 100,000）
+    pub lot_units: f64,
+}
+
+impl SymbolSpec {
+    pub fn pip_size(&self) -> f64 {
+        10f64.powi(-self.pip_position)
+    }
+
+    /// 1 lot・1 pip あたりの損益（口座通貨）。
+    /// `quote_to_account` は建値通貨 1 単位を口座通貨に換算するレート（同じ通貨なら 1.0）。
+    pub fn pip_value_per_lot(&self, quote_to_account: f64) -> f64 {
+        self.pip_size() * self.lot_units * quote_to_account
+    }
+}
+
+/// 6文字の通貨ペア名から建値通貨を推定する（資産一覧が引けないときの代替）
+pub fn quote_currency_from_name(pair: &str) -> Option<String> {
+    let p = pair.replace('/', "").to_uppercase();
+    let letters: String = p.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+    (letters.len() == 6).then(|| letters[3..].to_string())
 }
 
 impl SymbolInfo {
@@ -210,6 +248,33 @@ impl SymbolInfo {
             symbol_name,
             digits,
             pip_position,
+            base_asset: None,
+            quote_asset: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pip_value_follows_pip_position_lot_size_and_conversion() {
+        let usdjpy = SymbolSpec { pip_position: 2, digits: 3, lot_units: 100_000.0 };
+        // JPY 口座で JPY 建て: 0.01 * 100,000 = 1,000 円
+        assert!((usdjpy.pip_value_per_lot(1.0) - 1000.0).abs() < 1e-6);
+        let eurusd = SymbolSpec { pip_position: 4, digits: 5, lot_units: 100_000.0 };
+        // JPY 口座で USD 建て: 10 USD * USDJPY 150 = 1,500 円
+        assert!((eurusd.pip_value_per_lot(150.0) - 1500.0).abs() < 1e-6);
+        // USD 口座で JPY 建て: 1,000 円 / USDJPY 150
+        assert!((usdjpy.pip_value_per_lot(1.0 / 150.0) - 6.666_666).abs() < 1e-3);
+    }
+
+    #[test]
+    fn quote_currency_is_inferred_from_six_letter_names() {
+        assert_eq!(quote_currency_from_name("EURUSD").as_deref(), Some("USD"));
+        assert_eq!(quote_currency_from_name("gbp/jpy").as_deref(), Some("JPY"));
+        assert_eq!(quote_currency_from_name("USDJPY_z").as_deref(), Some("JPY"));
+        assert_eq!(quote_currency_from_name("US30"), None);
     }
 }

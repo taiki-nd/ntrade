@@ -362,7 +362,7 @@ interface CoTDetailDialogProps {
 export function CoTDetailDialog({ cotLogId, onClose }: CoTDetailDialogProps) {
   // 取得結果は ID ごとに持ち、別の判断を開いた直後に前の内容を出さない
   const [loaded, setLoaded] = React.useState<{ id: string; detail?: CoTDetail; error?: string } | null>(null);
-  // 条件付きプランは成立ログと元の判断に分かれるため、同じダイアログ内で行き来する
+  // 条件付きプランは「成立を受けた再判断（旧データは成立ログ）」と「プランを立てた判断」に分かれるため、同じダイアログ内で行き来する
   const [viewingId, setViewingId] = React.useState<string | null>(null);
   const shownId = viewingId ?? cotLogId;
 
@@ -562,18 +562,21 @@ export function CoTDetailDialog({ cotLogId, onClose }: CoTDetailDialogProps) {
               </div>
             )}
 
-            {/* 条件付きプランは「成立ログ（発注した記録）」と「元の判断」に分かれる */}
+            {/* 条件付きプランは「プランを立てた判断」と「成立を受けた再判断」に分かれる。
+                cot-plan-* は再判断を導入する前の、LLM を通さずに発注した成立ログ */}
             {(detail.origin || viewingId) && (
               <div className="flex flex-wrap items-center gap-2 p-3 rounded-lg border bg-muted/30">
                 <GitBranch className="h-4 w-4 text-muted-foreground shrink-0" />
                 <span className="text-xs text-muted-foreground">
-                  {detail.origin
-                    ? "条件付きプランの成立記録です。エントリーの根拠は元の判断にあります"
-                    : "条件付きプランを立てた判断です"}
+                  {!detail.origin
+                    ? "条件付きプランを立てた判断です"
+                    : detail.log.id.startsWith("cot-plan-")
+                      ? "条件付きプランの成立記録です。エントリーの根拠は元の判断にあります"
+                      : "条件付きプランの成立を受けて、入るかを判断し直した記録です"}
                 </span>
                 {detail.origin && (
                   <Button variant="outline" size="sm" onClick={() => setViewingId(detail.origin?.id ?? null)}>
-                    元の判断を見る
+                    プランを立てた判断を見る
                   </Button>
                 )}
                 {viewingId && (

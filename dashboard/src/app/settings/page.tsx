@@ -5,11 +5,12 @@ import { DashboardLayout } from "@/components/layouts/dashboard-layout";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Table, TableBody, TableCell, TableRow } from "@/components/ui/table";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Settings, ShieldCheck, Cpu, RefreshCw, Loader2, TriangleAlert, Link2 } from "lucide-react";
+import { Settings, Cpu, RefreshCw, Loader2, TriangleAlert, Link2 } from "lucide-react";
 import { toast } from "sonner";
-import { tradingApi, type RuntimeInfo, type GuardConfig } from "@/lib/trading-api";
+import { tradingApi, type RuntimeInfo } from "@/lib/trading-api";
+import { TradingSettingsForm } from "@/components/trading/TradingSettingsForm";
 import type { AccountMetrics } from "@/types/trading";
 
 function Row({ label, value }: { label: string; value: React.ReactNode }) {
@@ -23,7 +24,6 @@ function Row({ label, value }: { label: string; value: React.ReactNode }) {
 
 export default function SettingsPage() {
   const [runtime, setRuntime] = React.useState<RuntimeInfo | null>(null);
-  const [guard, setGuard] = React.useState<GuardConfig | null>(null);
   const [status, setStatus] = React.useState<AccountMetrics | null>(null);
   const [loading, setLoading] = React.useState(false);
   const [offline, setOffline] = React.useState(false);
@@ -31,9 +31,8 @@ export default function SettingsPage() {
   const load = React.useCallback(async () => {
     setLoading(true);
     try {
-      const [r, g, s] = await Promise.all([tradingApi.getRuntime(), tradingApi.getGuardConfig(), tradingApi.getStatus()]);
+      const [r, s] = await Promise.all([tradingApi.getRuntime(), tradingApi.getStatus()]);
       if (r.success && r.data) setRuntime(r.data);
-      if (g.success && g.data) setGuard(g.data);
       setStatus(s);
       setOffline(false);
     } catch {
@@ -71,7 +70,7 @@ export default function SettingsPage() {
       <div className="space-y-6 max-w-4xl">
         <div className="flex items-center justify-between">
           <p className="text-sm text-muted-foreground">
-            設定は環境変数（<code className="font-mono text-xs">.env</code>）と <code className="font-mono text-xs">config/guard.toml</code> で行い、ここでは現在値を確認します。変更後はエンジンの再起動が必要です。
+            対象ペアとガードはこの画面の「取引設定」で変更できます（SQLite に保存・再起動不要）。それ以外は環境変数（<code className="font-mono text-xs">.env</code>）で設定し、変更後はエンジンの再起動が必要です。
           </p>
           <Button variant="outline" size="sm" onClick={load} disabled={loading} className="h-8 gap-1.5 text-xs">
             {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
@@ -109,10 +108,10 @@ export default function SettingsPage() {
                     }
                   />
                   <Row label="スケジューラ (NTRADE_SCHEDULER)" value={runtime.schedulerEnabled ? "有効（5分足確定ごと）" : "無効"} />
-                  <Row label="対象ペア (NTRADE_PAIRS)" value={runtime.pairs.join(", ")} />
-                  <Row label="足確定後の待ち秒数 (NTRADE_BAR_DELAY_SECS)" value={`${runtime.barDelaySecs} 秒`} />
+                  <Row label="対象ペア（並行に判断）" value={runtime.pairs.join(", ")} />
+                  <Row label="足確定後の待ち秒数" value={`${runtime.barDelaySecs} 秒`} />
                   <Row label="LLM CLI" value={`${runtime.llmCli} (timeout ${runtime.llmTimeoutSecs}s)`} />
-                  <Row label="ガード設定ファイル" value={runtime.guardConfigPath} />
+                  <Row label="取引設定の保存先" value={runtime.guardConfigPath} />
                   <Row label="SQLite" value={runtime.dbPath} />
                   <Row label=".env" value={runtime.envFilePresent ? "あり" : "なし（.env.example をコピーしてください）"} />
                 </TableBody>
@@ -180,48 +179,8 @@ export default function SettingsPage() {
           </CardContent>
         </Card>
 
-        {/* ガード設定 */}
-        <Card className="shadow-xs">
-          <CardHeader className="pb-3">
-            <CardTitle className="text-base font-semibold flex items-center gap-2">
-              <ShieldCheck className="h-5 w-5 text-primary" />
-              事後ガード (config/guard.toml)
-            </CardTitle>
-            <CardDescription className="text-xs">LLM の判断を発注前に機械的に検証する閾値。判断ロジックではなくリスク管理。</CardDescription>
-          </CardHeader>
-          <CardContent>
-            {guard ? (
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead className="text-xs">項目</TableHead>
-                    <TableHead className="text-xs">値</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  <Row label="観測整合チェック" value={guard.observed_check ? "有効" : "無効"} />
-                  <Row label="確信度の下限" value={guard.min_confidence.toFixed(2)} />
-                  <Row label="リスクリワード下限" value={guard.min_rr.toFixed(2)} />
-                  <Row label="SL 幅 (5M ATR 比)" value={`${guard.sl_atr_min} 〜 ${guard.sl_atr_max}`} />
-                  <Row label="SL 最小幅" value={`${guard.sl_min_pips} pips`} />
-                  <Row label="ポジション上限" value={`ペアごと ${guard.max_positions_per_pair} / 全体 ${guard.max_positions_total}`} />
-                  <Row label="日次損失上限" value={`${guard.daily_loss_limit_pct}%`} />
-                  <Row label="条件付きプラン最長" value={`${guard.plan_max_hours} 時間`} />
-                  <Row label="ロット" value={guard.risk_pct ? `リスク ${guard.risk_pct}% から算出` : `固定 ${guard.fixed_volume_lots} lot`} />
-                  <Row
-                    label="スプレッド上限"
-                    value={Object.entries(guard.max_spread_pips)
-                      .map(([k, v]) => `${k}: ${v}`)
-                      .join(", ")}
-                  />
-                  <Row label="指標ブラックアウト" value={guard.news_blackout.length === 0 ? "なし" : guard.news_blackout.map((b) => `${b.label || ""} ${b.time} (-${b.before_min}/+${b.after_min}分)`).join(" / ")} />
-                </TableBody>
-              </Table>
-            ) : (
-              <p className="text-sm text-muted-foreground">読み込み中...</p>
-            )}
-          </CardContent>
-        </Card>
+        {/* 取引設定（対象ペア・ガード）: SQLite に保存し再起動なしで反映 */}
+        <TradingSettingsForm />
       </div>
     </DashboardLayout>
   );

@@ -7,6 +7,7 @@ pub mod reflection;
 pub mod replay;
 pub mod scheduler;
 pub mod server;
+pub mod settings;
 pub mod snapshot;
 pub mod storage;
 pub mod strategy;

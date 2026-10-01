@@ -1,9 +1,9 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use ctrader_rs::proto::common::{
-    ProtoMessage, ProtoOaAccessRights, ProtoOaClosePositionReq, ProtoOaErrorRes, ProtoOaExecutionEvent, ProtoOaExecutionType,
-    ProtoOaGetTrendbarsReq, ProtoOaGetTrendbarsRes, ProtoOaOrderErrorEvent, ProtoOaPayloadType, ProtoOaSymbolByIdReq,
-    ProtoOaSymbolByIdRes, ProtoOaTradeSide, ProtoOaTradingMode,
+    ProtoMessage, ProtoOaAccessRights, ProtoOaAssetListReq, ProtoOaAssetListRes, ProtoOaClosePositionReq, ProtoOaErrorRes,
+    ProtoOaExecutionEvent, ProtoOaExecutionType, ProtoOaGetTrendbarsReq, ProtoOaGetTrendbarsRes, ProtoOaOrderErrorEvent,
+    ProtoOaPayloadType, ProtoOaSymbol, ProtoOaSymbolByIdReq, ProtoOaSymbolByIdRes, ProtoOaTradeSide, ProtoOaTradingMode,
 };
 use ctrader_rs::{Client, Config};
 use prost::Message as _;
@@ -15,7 +15,10 @@ use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use super::config::CTraderConfig;
-use super::types::{volume_to_lots, AccountSummary, BarPeriod, BrokerPosition, CandleBar, ClosedDeal, SymbolInfo};
+use super::types::{
+    quote_currency_from_name, volume_to_lots, AccountSummary, BarPeriod, BrokerPosition, CandleBar, ClosedDeal, SymbolInfo,
+    SymbolSpec,
+};
 
 /// 注文に対するサーバーからの非同期な応答
 ///
@@ -52,6 +55,12 @@ pub struct CTraderService {
     config: CTraderConfig,
     client: Arc<Client>,
     symbols: Arc<RwLock<HashMap<String, SymbolInfo>>>,
+    /// 資産 ID → 通貨名（JPY, USD など）
+    assets: Arc<RwLock<HashMap<i64, String>>>,
+    /// 口座通貨（get_account_info のたびに更新）
+    account_currency: Arc<RwLock<Option<String>>>,
+    /// symbol_id → 取引仕様（pip 位置・lot サイズ）。銘柄仕様は取引中に変わらないのでキャッシュする
+    specs: Arc<RwLock<HashMap<i64, SymbolSpec>>>,
     /// 非請求メッセージから復元した注文応答の配信元
     order_events: broadcast::Sender<OrderOutcome>,
 }
@@ -165,6 +174,9 @@ impl CTraderService {
             config,
             client,
             symbols: Arc::new(RwLock::new(HashMap::new())),
+            assets: Arc::new(RwLock::new(HashMap::new())),
+            account_currency: Arc::new(RwLock::new(None)),
+            specs: Arc::new(RwLock::new(HashMap::new())),
             order_events,
         };
 
@@ -188,6 +200,13 @@ impl CTraderService {
 
     /// 利用可能なシンボル一覧をAPIから取得して内部キャッシュを更新
     pub async fn refresh_symbols(&self) -> Result<()> {
+        // 建値通貨・口座通貨の名前解決に使う。取れなくても銘柄名からの推定で動くので致命的にはしない
+        match self.fetch_assets().await {
+            Ok(assets) => *self.assets.write().await = assets,
+            Err(e) => warn!("Failed to fetch asset list; quote currencies will be inferred from symbol names: {e:#}"),
+        }
+        let assets = self.assets.read().await.clone();
+
         info!("Fetching symbol list from cTrader...");
         let res = self
             .client
@@ -198,7 +217,9 @@ impl CTraderService {
         let mut symbols_map = HashMap::new();
         for sym in res.symbol {
             if let Some(name) = sym.symbol_name {
-                let info = SymbolInfo::new_with_defaults(sym.symbol_id, name.clone());
+                let mut info = SymbolInfo::new_with_defaults(sym.symbol_id, name.clone());
+                info.base_asset = sym.base_asset_id.and_then(|id| assets.get(&id).cloned());
+                info.quote_asset = sym.quote_asset_id.and_then(|id| assets.get(&id).cloned());
                 symbols_map.insert(name.to_uppercase(), info);
             }
         }
@@ -210,53 +231,159 @@ impl CTraderService {
         Ok(())
     }
 
-    /// ブローカー側の銘柄名から口座固有のサフィックスを取り除く（`USDJPY_z` → `USDJPY`）
-    fn strip_symbol_suffix(&self, name: &str) -> String {
-        match &self.config.symbol_suffix {
-            Some(suffix) => name.strip_suffix(suffix.as_str()).unwrap_or(name).to_string(),
-            None => name.to_string(),
+    /// 銘柄名（例: "USDJPY_z"）から symbol_id を解決する。
+    ///
+    /// ブローカーの銘柄名との完全一致（大文字小文字は無視）だけを許す。ゼロ口座では素の USDJPY も
+    /// 一覧に存在し tradingMode も ENABLED に見えるが、発注すると TRADING_DISABLED で拒否される。
+    /// 名前を補ったり前方一致で探したりすると、意図しない銘柄で取引しうるため推測はしない。
+    pub async fn get_symbol_id(&self, symbol_name: &str) -> Result<i64> {
+        let symbols = self.symbols.read().await;
+        match symbols.get(&symbol_name.trim().to_uppercase()) {
+            Some(info) => Ok(info.symbol_id),
+            None => Err(anyhow!("{}", unknown_symbol_message(symbol_name, &symbols))),
         }
     }
 
-    /// 通貨ペア名（例: "USDJPY", "EURUSD"）から symbol_id を解決
-    pub async fn get_symbol_id(&self, symbol_name: &str) -> Result<i64> {
-        let norm_name = symbol_name.replace("/", "").to_uppercase();
+    /// ブローカー上の正式な銘柄名（大文字小文字も含めて一覧どおり）。`usdjpy_z` → `USDJPY_z`
+    pub async fn canonical_symbol(&self, symbol_name: &str) -> Result<String> {
         let symbols = self.symbols.read().await;
-
-        // ゼロ口座のように、取引できるのがサフィックス付き銘柄（例: USDJPY_z）だけの
-        // 口座がある。素の銘柄もシンボル一覧に存在し tradingMode は ENABLED に見えるが、
-        // 発注すると TRADING_DISABLED で拒否されるため、サフィックス付きを優先して解決する。
-        if let Some(suffix) = &self.config.symbol_suffix {
-            let suffixed = format!("{}{}", norm_name, suffix.to_uppercase());
-            match symbols.get(&suffixed) {
-                Some(info) => {
-                    debug!("Resolved symbol '{}' -> '{}' (id {})", symbol_name, suffixed, info.symbol_id);
-                    return Ok(info.symbol_id);
-                }
-                None => warn!(
-                    "Symbol '{}' not found (CTRADER_SYMBOL_SUFFIX={}); falling back to '{}'",
-                    suffixed, suffix, norm_name
-                ),
-            }
+        match symbols.get(&symbol_name.trim().to_uppercase()) {
+            Some(info) => Ok(info.symbol_name.clone()),
+            None => Err(anyhow!("{}", unknown_symbol_message(symbol_name, &symbols))),
         }
+    }
 
-        if let Some(info) = symbols.get(&norm_name) {
-            return Ok(info.symbol_id);
+    /// 資産一覧（資産 ID → 通貨名）。ctrader_rs::asset_list は戻り値の型が誤っているため command を直接呼ぶ
+    async fn fetch_assets(&self) -> Result<HashMap<i64, String>> {
+        let req = ProtoOaAssetListReq {
+            payload_type: Some(ProtoOaPayloadType::ProtoOaAssetListReq as i32),
+            ctid_trader_account_id: self.config.account_id,
+        };
+        let res: ProtoOaAssetListRes = self
+            .client
+            .command(
+                ProtoOaPayloadType::ProtoOaAssetListReq as u32,
+                req,
+                ProtoOaPayloadType::ProtoOaAssetListRes as u32,
+            )
+            .await
+            .map_err(|e| anyhow!(e).context("Failed to fetch asset list"))?;
+        Ok(res.asset.into_iter().map(|a| (a.asset_id, a.name.to_uppercase())).collect())
+    }
+
+    /// `from` を基軸・`to` を建値とする銘柄名。資産一覧から引き、無ければ素の名前（FROMTO）で探す。
+    /// レートを読むだけなので、同じ通貨の組み合わせの銘柄が複数あれば（USDJPY と USDJPY_z）どれでもよい
+    async fn find_currency_pair(&self, from: &str, to: &str) -> Option<String> {
+        let symbols = self.symbols.read().await;
+        let by_assets = symbols
+            .values()
+            .filter(|s| s.base_asset.as_deref() == Some(from) && s.quote_asset.as_deref() == Some(to))
+            .min_by_key(|s| s.symbol_name.len())
+            .map(|s| s.symbol_name.clone());
+        by_assets.or_else(|| symbols.get(&format!("{from}{to}")).map(|s| s.symbol_name.clone()))
+    }
+
+    /// 銘柄の詳細（ProtoOASymbol）。ctrader_rs::symbol_by_id は戻り値の型が Req になっており
+    /// 正しくデコードできないため、command を直接呼ぶ。
+    async fn fetch_symbol_details(&self, symbol_name: &str) -> Result<ProtoOaSymbol> {
+        let symbol_id = self.get_symbol_id(symbol_name).await?;
+        let req = ProtoOaSymbolByIdReq {
+            payload_type: Some(ProtoOaPayloadType::ProtoOaSymbolByIdReq as i32),
+            ctid_trader_account_id: self.config.account_id,
+            symbol_id: vec![symbol_id],
+        };
+        let res: ProtoOaSymbolByIdRes = self
+            .client
+            .command(
+                ProtoOaPayloadType::ProtoOaSymbolByIdReq as u32,
+                req,
+                ProtoOaPayloadType::ProtoOaSymbolByIdRes as u32,
+            )
+            .await
+            .map_err(|e| anyhow!(e).context(format!("Failed to fetch symbol details for {symbol_name}")))?;
+        res.symbol
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("cTrader returned no symbol details for {symbol_name}"))
+    }
+
+    /// 銘柄の取引仕様（pip 位置・lot サイズ）
+    pub async fn symbol_spec(&self, symbol_name: &str) -> Result<SymbolSpec> {
+        let symbol_id = self.get_symbol_id(symbol_name).await?;
+        if let Some(spec) = self.specs.read().await.get(&symbol_id) {
+            return Ok(*spec);
         }
+        let sym = self.fetch_symbol_details(symbol_name).await?;
+        let spec = SymbolSpec {
+            pip_position: sym.pip_position,
+            digits: sym.digits,
+            // lotSize は数量の 1/100 単位（FX の 1 lot = 100,000 通貨 → 10,000,000）
+            lot_units: sym.lot_size.filter(|v| *v > 0).map(|v| v as f64 / 100.0).unwrap_or(100_000.0),
+        };
+        debug!(symbol = symbol_name, ?spec, "symbol spec resolved");
+        self.specs.write().await.insert(symbol_id, spec);
+        Ok(spec)
+    }
 
-        // 見つからない場合は前方一致（ブローカー固有のサフィックス等対応: EURUSD.pro, EURUSDm等）
-        for (name, info) in symbols.iter() {
-            if name.starts_with(&norm_name) {
-                info!("Matched symbol '{}' for query '{}'", name, symbol_name);
-                return Ok(info.symbol_id);
-            }
+    /// 口座通貨（JPY など）
+    pub async fn account_currency(&self) -> Result<String> {
+        if let Some(c) = self.account_currency.read().await.clone() {
+            return Ok(c);
         }
+        self.get_account_info()
+            .await?
+            .deposit_currency
+            .ok_or_else(|| anyhow!("account deposit currency is unknown (asset list unavailable)"))
+    }
 
-        Err(anyhow!(
-            "Symbol '{}' not found in cTrader symbols list. (Total available: {})",
-            symbol_name,
-            symbols.len()
-        ))
+    /// 銘柄の建値通貨（EURUSD なら USD）
+    async fn quote_currency(&self, symbol_name: &str) -> Result<String> {
+        let symbol_id = self.get_symbol_id(symbol_name).await?;
+        let from_assets = self
+            .symbols
+            .read()
+            .await
+            .values()
+            .find(|s| s.symbol_id == symbol_id)
+            .and_then(|s| s.quote_asset.clone());
+        from_assets
+            .or_else(|| quote_currency_from_name(symbol_name))
+            .ok_or_else(|| anyhow!("cannot determine the quote currency of {symbol_name}"))
+    }
+
+    /// 直近の 1 分足終値
+    pub async fn latest_price(&self, symbol_name: &str) -> Result<f64> {
+        self.get_trendbars(symbol_name, BarPeriod::M1, 1)
+            .await?
+            .last()
+            .map(|b| b.close)
+            .filter(|p| *p > 0.0)
+            .ok_or_else(|| anyhow!("no recent price for {symbol_name}"))
+    }
+
+    /// `from` 通貨 1 単位を `to` 通貨に換算するレート。直接の銘柄（FROM/TO）か逆の銘柄（TO/FROM）の
+    /// 直近価格から求める。どちらも無い通貨の組み合わせはエラー（呼び出し側で概算に倒す）。
+    pub async fn conversion_rate(&self, from: &str, to: &str) -> Result<f64> {
+        let (from, to) = (from.to_uppercase(), to.to_uppercase());
+        if from == to {
+            return Ok(1.0);
+        }
+        if let Some(direct) = self.find_currency_pair(&from, &to).await {
+            return self.latest_price(&direct).await;
+        }
+        if let Some(inverse) = self.find_currency_pair(&to, &from).await {
+            return Ok(1.0 / self.latest_price(&inverse).await?);
+        }
+        Err(anyhow!("no symbol to convert {from} into {to}"))
+    }
+
+    /// 1 lot・1 pip あたりの損益（口座通貨）。ブローカーの銘柄仕様と直近レートから求める
+    pub async fn pip_value_per_lot(&self, symbol_name: &str) -> Result<f64> {
+        let spec = self.symbol_spec(symbol_name).await?;
+        let quote = self.quote_currency(symbol_name).await?;
+        let account = self.account_currency().await?;
+        let rate = self.conversion_rate(&quote, &account).await?;
+        Ok(spec.pip_value_per_lot(rate))
     }
 
     /// 過去のローソク足（Trendbars）を取得
@@ -382,6 +509,10 @@ impl CTraderService {
             .access_rights
             .and_then(|r| ProtoOaAccessRights::try_from(r).ok())
             .map(|r| r.as_str_name().to_string());
+        let deposit_currency = self.assets.read().await.get(&t.deposit_asset_id).cloned();
+        if deposit_currency.is_some() {
+            *self.account_currency.write().await = deposit_currency.clone();
+        }
         Ok(AccountSummary {
             account_id: t.ctid_trader_account_id,
             trader_login: t.trader_login,
@@ -389,6 +520,7 @@ impl CTraderService {
             leverage: t.leverage_in_cents.map(|l| l as f64 / 100.0),
             is_live: self.config.is_live,
             access_rights,
+            deposit_currency,
         })
     }
 
@@ -407,8 +539,8 @@ impl CTraderService {
             .map(|p| BrokerPosition {
                 position_id: p.position_id,
                 symbol_id: p.trade_data.symbol_id,
-                // アプリ内では素の銘柄名（USDJPY）で扱うため、口座固有のサフィックスは剥がす
-                symbol_name: by_id.get(&p.trade_data.symbol_id).map(|n| self.strip_symbol_suffix(n)),
+                // 設定・発注と同じく、ブローカーの銘柄名（USDJPY_z など）のまま扱う
+                symbol_name: by_id.get(&p.trade_data.symbol_id).cloned(),
                 is_buy: p.trade_data.trade_side == ProtoOaTradeSide::Buy as i32,
                 volume_lots: volume_to_lots(p.trade_data.volume),
                 entry_price: p.price,
@@ -491,29 +623,8 @@ impl CTraderService {
     }
 
     /// シンボル単位の取引可否（ENABLED / CLOSE_ONLY_MODE / DISABLED_*）を取得する。
-    ///
-    /// ctrader_rs::symbol_by_id は戻り値の型が Req になっており正しくデコードできないため、
-    /// command を直接呼ぶ。
     pub async fn get_symbol_trading_mode(&self, symbol_name: &str) -> Result<String> {
-        let symbol_id = self.get_symbol_id(symbol_name).await?;
-        let req = ProtoOaSymbolByIdReq {
-            payload_type: Some(ProtoOaPayloadType::ProtoOaSymbolByIdReq as i32),
-            ctid_trader_account_id: self.config.account_id,
-            symbol_id: vec![symbol_id],
-        };
-        let res: ProtoOaSymbolByIdRes = self
-            .client
-            .command(
-                ProtoOaPayloadType::ProtoOaSymbolByIdReq as u32,
-                req,
-                ProtoOaPayloadType::ProtoOaSymbolByIdRes as u32,
-            )
-            .await
-            .map_err(|e| anyhow!(e).context(format!("Failed to fetch symbol details for {symbol_name}")))?;
-        let sym = res
-            .symbol
-            .first()
-            .ok_or_else(|| anyhow!("cTrader returned no symbol details for {symbol_name}"))?;
+        let sym = self.fetch_symbol_details(symbol_name).await?;
         Ok(sym
             .trading_mode
             .and_then(|m| ProtoOaTradingMode::try_from(m).ok())
@@ -581,6 +692,37 @@ impl CTraderService {
         self.await_order_outcome(&mut rx, deadline, |ev| {
             ev.position.as_ref().map(|p| p.position_id) == Some(position_id)
                 || ev.deal.as_ref().map(|d| d.position_id) == Some(position_id)
+        })
+        .await
+    }
+
+    /// 建玉の SL/TP を絶対価格で付け替える。
+    ///
+    /// 成行注文の SL/TP は「約定価格からの相対距離」でしか指定できないため、発注時点では
+    /// 意図した価格に置けない（約定価格が事前には分からない）。約定後にここで絶対価格へ
+    /// 直すことで、ブローカー側の SL/TP と ntrade の記録を一致させる。
+    pub async fn amend_position_sltp(
+        &self,
+        position_id: i64,
+        stop_loss: Option<f64>,
+        take_profit: Option<f64>,
+    ) -> Result<ProtoOaExecutionEvent> {
+        info!("Amending SL/TP: position={position_id}, sl={stop_loss:?}, tp={take_profit:?}");
+        let mut rx = self.order_events.subscribe();
+        let deadline = Instant::now() + ORDER_OUTCOME_TIMEOUT;
+        match self
+            .client
+            .amend_position_sltp(self.config.account_id, position_id, stop_loss, take_profit, None)
+            .await
+        {
+            Ok(ev) => return Ok(ev),
+            Err(ctrader_rs::Error::Timeout) => {
+                debug!("Amend response not delivered by ctrader-rs; falling back to execution events");
+            }
+            Err(e) => return Err(anyhow!(e).context(format!("Failed to amend SL/TP of position {position_id}"))),
+        }
+        self.await_order_outcome(&mut rx, deadline, |ev| {
+            ev.position.as_ref().map(|p| p.position_id) == Some(position_id)
         })
         .await
     }
@@ -711,6 +853,23 @@ impl CTraderService {
     }
 }
 
+/// 銘柄が見つからないときのメッセージ。入力を含む銘柄名を候補として添える（USDJPY → USDJPY_z など）
+fn unknown_symbol_message(symbol_name: &str, symbols: &HashMap<String, SymbolInfo>) -> String {
+    let key = symbol_name.trim().to_uppercase();
+    let mut candidates: Vec<&str> = symbols
+        .iter()
+        .filter(|(k, _)| !key.is_empty() && k.contains(&key))
+        .map(|(_, s)| s.symbol_name.as_str())
+        .collect();
+    candidates.sort_by_key(|n| (n.len(), n.to_string()));
+    candidates.truncate(8);
+    if candidates.is_empty() {
+        format!("Symbol '{symbol_name}' not found in cTrader symbols list ({} symbols)", symbols.len())
+    } else {
+        format!("Symbol '{symbol_name}' not found in cTrader symbols list; candidates: {}", candidates.join(", "))
+    }
+}
+
 /// 注文拒否コードに対する、設定側で取りうる対処のヒント
 ///
 /// cTrader の errorCode だけでは原因が口座側かトークン側か分からないため、
@@ -785,5 +944,22 @@ fn handle_unsolicited_event(msg: ProtoMessage, tx: &broadcast::Sender<OrderOutco
             Err(e) => warn!("Failed to decode ProtoOAErrorRes: {e}"),
         },
         t => debug!("Received unsolicited cTrader message (type={t})"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_symbol_lists_names_containing_the_input() {
+        let symbols: HashMap<String, SymbolInfo> = ["USDJPY", "USDJPY_z", "EURUSD_z"]
+            .into_iter()
+            .enumerate()
+            .map(|(i, n)| (n.to_uppercase(), SymbolInfo::new_with_defaults(i as i64, n.to_string())))
+            .collect();
+        let msg = unknown_symbol_message("usdjp", &symbols);
+        assert!(msg.ends_with("candidates: USDJPY, USDJPY_z"), "{msg}");
+        assert!(!unknown_symbol_message("GBPUSD", &symbols).contains("candidates"));
     }
 }

@@ -9,9 +9,10 @@ use tracing::{debug, error, info, warn};
 
 use crate::ctrader::{token, BarPeriod, CTraderConfig, CTraderService, TokenSet};
 use crate::executor::{CTraderOrderSink, DisconnectedOrderSink, OrderSink, PlanBook};
-use crate::guard::{GuardConfig, DEFAULT_GUARD_CONFIG_PATH};
+use crate::guard::GuardConfig;
 use crate::llm::{LlmClient, LlmClientConfig};
 use crate::snapshot::measures;
+use crate::settings::TradingSettings;
 use crate::snapshot::SnapshotBundle;
 use crate::storage::Db;
 use super::types::{
@@ -26,22 +27,27 @@ pub struct AppState {
     pub ctrader_service: Arc<RwLock<Option<Arc<CTraderService>>>>,
     pub ctrader_config: Arc<RwLock<Option<CTraderConfig>>>,
     pub available_accounts: Arc<RwLock<Vec<AccountInfo>>>,
-    /// 直近に生成した Snapshot（客観的事実 + 画像4枚）
-    pub latest_snapshot: Arc<RwLock<Option<SnapshotBundle>>>,
+    /// ペアごとの直近の Snapshot（客観的事実 + 画像4枚）
+    pub latest_snapshots: Arc<RwLock<HashMap<String, SnapshotBundle>>>,
     /// SQLite（ヒストリカルバー・リプレイ結果・判断ログ・ポジション・決済履歴・教訓）
     pub db_path: PathBuf,
     /// `positions` の SQLite 書き出しを直列化する（古いスナップショットで上書きしないため）
     positions_persist_lock: Arc<tokio::sync::Mutex<()>>,
-    /// 事後ガード設定（config/guard.toml）
-    pub guard_config: Arc<RwLock<GuardConfig>>,
+    /// 画面から変更できる取引設定（対象ペア・待ち秒数・事後ガード）。SQLite の app_settings が正
+    pub settings: Arc<RwLock<TradingSettings>>,
     /// 保持中の条件付きプラン
     pub plan_book: Arc<RwLock<PlanBook>>,
     /// LLM 推論クライアント
     pub llm: Arc<LlmClient>,
     /// 発注先（cTrader 接続時は CTraderOrderSink、未接続時は DisconnectedOrderSink）
     pub order_sink: Arc<RwLock<Arc<dyn OrderSink>>>,
-    /// 判断サイクルの直列化
-    pub decide_lock: Arc<tokio::sync::Mutex<()>>,
+    /// 判断サイクル（読み取り側・ペア間で並行可）と cTrader 接続の差し替え（書き込み側）の排他
+    pub cycle_gate: Arc<RwLock<()>>,
+    /// 同じペアの判断サイクルを重ねない（スケジューラと手動実行の衝突防止）
+    pair_locks: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// ガード評価（建玉数・日次損失）から発注・建玉記録までを直列化する。
+    /// ペアを並行に回すと、両方が「建玉 0」を見て全体上限を超えて発注しうるため
+    pub order_lock: Arc<tokio::sync::Mutex<()>>,
     /// ブローカー残高の最終同期時刻
     pub last_broker_sync: Arc<RwLock<Option<std::time::Instant>>>,
     /// ブローカーとの建玉照合の直列化（常駐ループと判断サイクル後の照合が重ならないように）
@@ -78,6 +84,10 @@ async fn closed_trade(ctrader: &CTraderService, p: Position) -> TradeHistory {
 
     let pip = measures::get_pip_size(&p.symbol);
     let sign = if p.side == "BUY" { 1.0 } else { -1.0 };
+    let pip_value = match &deal {
+        Some(_) => 0.0,
+        None => pip_value_or_estimate(ctrader, &p.symbol).await,
+    };
     let (entry_price, close_price, close_time, pnl_amount) = match &deal {
         Some(d) => (
             d.entry_price,
@@ -91,20 +101,13 @@ async fn closed_trade(ctrader: &CTraderService, p: Position) -> TradeHistory {
                 p.entry_price,
                 p.current_price,
                 Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-                (pnl_pips * measures::pip_value_per_lot(&p.symbol) * p.volume_lots).round(),
+                (pnl_pips * pip_value * p.volume_lots).round(),
             )
         }
     };
     let pnl_pips = ((close_price - entry_price) * sign / pip * 10.0).round() / 10.0;
 
-    let is_buy = p.side == "BUY";
-    let close_reason = if p.stop_loss > 0.0 && ((is_buy && close_price <= p.stop_loss) || (!is_buy && close_price >= p.stop_loss)) {
-        CloseReason::StopLoss
-    } else if p.take_profit > 0.0 && ((is_buy && close_price >= p.take_profit) || (!is_buy && close_price <= p.take_profit)) {
-        CloseReason::TakeProfit
-    } else {
-        CloseReason::Manual
-    };
+    let close_reason = classify_close_reason(&p.side, close_price, p.stop_loss, p.take_profit);
 
     if let Some(d) = &deal {
         info!(
@@ -129,6 +132,51 @@ async fn closed_trade(ctrader: &CTraderService, p: Position) -> TradeHistory {
         open_time: p.open_time,
         close_time,
         cot_log_id: p.cot_log_id,
+    }
+}
+
+/// 決済価格を建玉の SL/TP と突き合わせて決済理由を決める。
+///
+/// SL/TP はブローカー側で執行されるので、ntrade からは「どちらに当たったか」を価格でしか
+/// 判定できない。どちらにも当たっていなければ手動決済（＝ダッシュボード操作か cTrader 側の操作）。
+/// 前提として建玉の SL/TP がブローカーの持つ値と一致している必要がある（`adopt_broker_protection`）。
+fn classify_close_reason(side: &str, close_price: f64, stop_loss: f64, take_profit: f64) -> CloseReason {
+    let is_buy = side == "BUY";
+    if stop_loss > 0.0 && ((is_buy && close_price <= stop_loss) || (!is_buy && close_price >= stop_loss)) {
+        CloseReason::StopLoss
+    } else if take_profit > 0.0 && ((is_buy && close_price >= take_profit) || (!is_buy && close_price <= take_profit)) {
+        CloseReason::TakeProfit
+    } else {
+        CloseReason::Manual
+    }
+}
+
+/// ブローカー側が実際に持っている SL/TP をローカルの建玉に取り込む。
+///
+/// 決済理由（SL/TP/手動）の判定は建玉に記録された SL/TP との比較で行うため、ここがずれると
+/// 「SL で刈られたのに手動決済と表示される」ことになる。ブローカーが SL/TP を持っていない
+/// 場合は 0.0 を入れる（＝無防備であることを記録に残す）。
+fn adopt_broker_protection(p: &mut Position, b: &crate::ctrader::types::BrokerPosition) {
+    let (sl, tp) = (b.stop_loss.unwrap_or(0.0), b.take_profit.unwrap_or(0.0));
+    if (p.stop_loss - sl).abs() < 1e-9 && (p.take_profit - tp).abs() < 1e-9 {
+        return;
+    }
+    warn!(
+        position = %p.id, local_sl = p.stop_loss, broker_sl = sl, local_tp = p.take_profit, broker_tp = tp,
+        "protection levels differ from broker; adopting the broker's"
+    );
+    p.stop_loss = sl;
+    p.take_profit = tp;
+}
+
+/// 1 lot・1 pip の価値（口座通貨）。ブローカーの銘柄仕様とレートから求め、取れなければ固定の概算に倒す
+async fn pip_value_or_estimate(ctrader: &CTraderService, symbol: &str) -> f64 {
+    match ctrader.pip_value_per_lot(symbol).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(%symbol, "failed to resolve pip value from broker; using a fixed estimate: {e:#}");
+            measures::pip_value_per_lot(symbol)
+        }
     }
 }
 
@@ -164,6 +212,14 @@ async fn refresh_unrealized(ctrader: &CTraderService, positions: &mut [Position]
         }
     }
 
+    let mut pip_values: HashMap<String, f64> = HashMap::new();
+    for p in positions.iter() {
+        let missing = p.id.parse::<i64>().ok().and_then(|id| broker_pnl.get(&id)).is_none();
+        if missing && !pip_values.contains_key(&p.symbol) {
+            pip_values.insert(p.symbol.clone(), pip_value_or_estimate(ctrader, &p.symbol).await);
+        }
+    }
+
     for p in positions.iter_mut() {
         if let Some(price) = prices.get(&p.symbol) {
             p.current_price = *price;
@@ -173,7 +229,7 @@ async fn refresh_unrealized(ctrader: &CTraderService, positions: &mut [Position]
         p.pnl_pips = ((p.current_price - p.entry_price) * sign / pip * 10.0).round() / 10.0;
         p.pnl_amount = match p.id.parse::<i64>().ok().and_then(|id| broker_pnl.get(&id)) {
             Some(v) => *v,
-            None => (p.pnl_pips * measures::pip_value_per_lot(&p.symbol) * p.volume_lots).round(),
+            None => (p.pnl_pips * pip_values.get(&p.symbol).copied().unwrap_or_default() * p.volume_lots).round(),
         };
     }
 }
@@ -221,6 +277,7 @@ impl AppState {
 
         let db_path = PathBuf::from(crate::storage::DEFAULT_DB_PATH);
         let positions = load_saved_positions(&db_path);
+        let settings = TradingSettings::load_or_seed(&db_path);
         // SQLite に保存済みのトークンがあれば .env の値より優先する（自動更新で .env は古くなるため）
         let initial_config = CTraderConfig::from_env().ok().map(|cfg| match load_saved_tokens(&db_path) {
             Some(tokens) => {
@@ -237,14 +294,16 @@ impl AppState {
             ctrader_service: Arc::new(RwLock::new(None)),
             ctrader_config: Arc::new(RwLock::new(initial_config)),
             available_accounts: Arc::new(RwLock::new(Vec::new())),
-            latest_snapshot: Arc::new(RwLock::new(None)),
+            latest_snapshots: Arc::new(RwLock::new(HashMap::new())),
             db_path,
             positions_persist_lock: Arc::new(tokio::sync::Mutex::new(())),
-            guard_config: Arc::new(RwLock::new(GuardConfig::load_or_default(DEFAULT_GUARD_CONFIG_PATH))),
+            settings: Arc::new(RwLock::new(settings)),
             plan_book: Arc::new(RwLock::new(PlanBook::default())),
             llm: Arc::new(LlmClient::new(LlmClientConfig::default())),
             order_sink: Arc::new(RwLock::new(Arc::new(DisconnectedOrderSink))),
-            decide_lock: Arc::new(tokio::sync::Mutex::new(())),
+            cycle_gate: Arc::new(RwLock::new(())),
+            pair_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            order_lock: Arc::new(tokio::sync::Mutex::new(())),
             last_broker_sync: Arc::new(RwLock::new(None)),
             reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
@@ -394,8 +453,8 @@ impl AppState {
         if !cfg.tokens().needs_refresh(chrono::Utc::now().timestamp()) {
             return;
         }
-        // 判断サイクルの途中で接続を差し替えないよう直列化する
-        let _serial = self.decide_lock.lock().await;
+        // 判断サイクルの途中で接続を差し替えないよう、実行中のサイクルが終わるのを待つ
+        let _gate = self.cycle_gate.write().await;
         let result = async {
             let cfg = self.refresh_ctrader_tokens(cfg).await?;
             let service = CTraderService::connect(cfg).await?;
@@ -480,11 +539,19 @@ impl AppState {
         let local = self.positions.read().await.clone();
         let mut remaining: Vec<Position> = Vec::new();
         let mut closed: Vec<TradeHistory> = Vec::new();
-        for p in local {
-            if broker.iter().any(|b| b.position_id.to_string() == p.id) {
-                remaining.push(p);
-            } else {
-                closed.push(closed_trade(&ctrader, p).await);
+        for mut p in local {
+            match broker.iter().find(|b| b.position_id.to_string() == p.id) {
+                Some(b) => {
+                    adopt_broker_protection(&mut p, b);
+                    // 以前は銘柄名から口座のサフィックスを外して記録していた（USDJPY_z → USDJPY）。
+                    // 設定のペアとの照合（ペアごとの建玉数など）がずれないよう、ブローカーの表記にそろえる
+                    if let Some(name) = b.symbol_name.as_ref().filter(|n| **n != p.symbol) {
+                        info!(position = %p.id, from = %p.symbol, to = %name, "position symbol aligned with broker");
+                        p.symbol = name.clone();
+                    }
+                    remaining.push(p);
+                }
+                None => closed.push(closed_trade(&ctrader, p).await),
             }
         }
 
@@ -512,6 +579,7 @@ impl AppState {
                 open_time: b.open_time.unwrap_or_else(Utc::now).format("%Y-%m-%d %H:%M:%S").to_string(),
                 invalidation_reason: "ブローカー側から取り込んだ建玉（ntrade の記録に無し）".into(),
                 cot_log_id: None,
+                close_stop: None,
             });
         }
 
@@ -527,6 +595,13 @@ impl AppState {
     /// 単一建玉の手動成行決済。ブローカーの約定を待ってから決済履歴を確定させるので、
     /// 決済に失敗した場合は建玉をローカルから消さない。
     pub async fn close_position_now(&self, id: &str) -> Result<TradeHistory> {
+        self.close_position_as(id, None).await
+    }
+
+    /// 単一建玉の成行決済。`reason` を渡すと、決済価格からの推定ではなくその理由で記録する。
+    pub async fn close_position_as(&self, id: &str, reason: Option<CloseReason>) -> Result<TradeHistory> {
+        // 照合ループが先に「ブローカーから消えた建玉」として別の理由で取り込まないよう、照合と直列にする
+        let _serial = self.reconcile_lock.lock().await;
         let target = self
             .positions
             .read()
@@ -544,7 +619,10 @@ impl AppState {
             .await
             .clone()
             .context("cTrader is not connected")?;
-        let trade = closed_trade(&ctrader, target).await;
+        let mut trade = closed_trade(&ctrader, target).await;
+        if let Some(r) = reason {
+            trade.close_reason = r;
+        }
 
         self.positions.write().await.retain(|p| p.id != id);
         self.persist_positions().await;
@@ -642,6 +720,80 @@ impl AppState {
         Ok(())
     }
 
+    // ------------------------------------------------------------- 取引設定
+
+    pub async fn guard_config(&self) -> GuardConfig {
+        self.settings.read().await.guard.clone()
+    }
+
+    /// 判断サイクルの対象ペア
+    pub async fn pairs(&self) -> Vec<String> {
+        self.settings.read().await.pairs.clone()
+    }
+
+    /// API のペア指定を解決する。設定にあるペアなら設定の表記にそろえ、省略時は設定の先頭ペア
+    pub async fn resolve_pair(&self, pair: Option<&str>) -> String {
+        let settings = self.settings.read().await;
+        match pair.map(str::trim).filter(|p| !p.is_empty()) {
+            Some(p) => settings.pairs.iter().find(|s| s.eq_ignore_ascii_case(p)).cloned().unwrap_or_else(|| p.to_string()),
+            None => settings.default_pair(),
+        }
+    }
+
+    /// 設定を検証して SQLite に保存し、次の判断サイクルから反映する
+    pub async fn save_settings(&self, mut next: TradingSettings) -> Result<TradingSettings> {
+        next.normalize();
+        next.validate()?;
+        // 接続中なら、ブローカーに存在しない銘柄を保存前に弾き、表記をブローカーの一覧どおりにそろえる
+        // （usdjpy_z → USDJPY_z）。保存後にサイクルが失敗し続けるのを防ぐため
+        if let Some(ctrader) = self.ctrader_service.read().await.clone() {
+            let mut unknown = Vec::new();
+            for p in next.pairs.iter_mut() {
+                match ctrader.canonical_symbol(p).await {
+                    Ok(name) => *p = name,
+                    Err(e) => unknown.push(format!("{e:#}")),
+                }
+            }
+            if !unknown.is_empty() {
+                anyhow::bail!("cTrader に存在しない銘柄です: {}", unknown.join(" / "));
+            }
+        }
+        let saved = next.clone();
+        self.with_db(move |db| db.save_setting(crate::settings::SETTINGS_KEY, &saved)).await?;
+        let prev_pairs = std::mem::replace(&mut *self.settings.write().await, next.clone()).pairs;
+        info!(pairs = ?next.pairs, ?prev_pairs, "trading settings updated");
+        Ok(next)
+    }
+
+    /// ペア単位のロック（同じペアの判断サイクルを重ねないため）
+    pub fn pair_lock(&self, pair: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.pair_locks.lock().unwrap_or_else(|e| e.into_inner());
+        locks.entry(pair.to_uppercase()).or_default().clone()
+    }
+
+    /// 1 lot・1 pip の価値（口座通貨）をブローカーのレートから求める。未接続・取得失敗なら None
+    pub async fn live_pip_value(&self, pair: &str) -> Option<f64> {
+        let ctrader = self.ctrader_service.read().await.clone()?;
+        match ctrader.pip_value_per_lot(pair).await {
+            Ok(v) => Some(v),
+            Err(e) => {
+                warn!(pair, "failed to resolve pip value from broker: {e:#}");
+                None
+            }
+        }
+    }
+
+    /// 発注ロット。リスク % 指定のときだけブローカーから pip 価値を引く
+    pub async fn order_volume(&self, cfg: &GuardConfig, pair: &str, sl_pips: f64) -> f64 {
+        let balance = self.metrics.read().await.balance;
+        let live = if cfg.risk_pct.is_some() && cfg.pip_value_per_lot.is_none() {
+            self.live_pip_value(pair).await
+        } else {
+            None
+        };
+        cfg.volume_lots(balance, sl_pips, live)
+    }
+
     /// SQLite を開いて `f` を専用スレッドで実行する
     pub async fn with_db<T, F>(&self, f: F) -> Result<T>
     where
@@ -695,8 +847,7 @@ impl AppState {
             win_rate_today: 0.0,
             total_trades_today: 0,
             winning_trades_today: 0,
-            usdjpy_spread: 0.0,
-            eurusd_spread: 0.0,
+            spreads: Default::default(),
             circuit_breaker_threshold_percent: -3.0,
             order_mode: "live".to_string(),
             broker_balance: None,
@@ -708,5 +859,72 @@ impl AppState {
                 account_number: "未連携".to_string(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ctrader::types::BrokerPosition;
+
+    fn position(sl: f64, tp: f64) -> Position {
+        Position {
+            id: "10871878".into(),
+            symbol: "USDJPY".into(),
+            side: "SELL".into(),
+            volume_lots: 0.01,
+            entry_price: 157.229,
+            current_price: 157.229,
+            stop_loss: sl,
+            take_profit: tp,
+            pnl_pips: 0.0,
+            pnl_amount: 0.0,
+            open_time: "2026-09-25 16:51:30".into(),
+            invalidation_reason: String::new(),
+            cot_log_id: None,
+            close_stop: None,
+        }
+    }
+
+    fn broker(sl: Option<f64>, tp: Option<f64>) -> BrokerPosition {
+        BrokerPosition {
+            position_id: 10871878,
+            symbol_id: 1,
+            symbol_name: Some("USDJPY".into()),
+            is_buy: false,
+            volume_lots: 0.01,
+            entry_price: Some(157.229),
+            stop_loss: sl,
+            take_profit: tp,
+            open_time: None,
+        }
+    }
+
+    #[test]
+    fn close_reason_follows_the_levels_actually_held_by_the_broker() {
+        // 実例（trd-10871878）: 計画上の SL は 157.600 だが、成行約定のズレで
+        // ブローカーには 157.379 が置かれていた。計画値のままだと手動決済に見えてしまう。
+        assert!(matches!(classify_close_reason("SELL", 157.379, 157.600, 156.950), CloseReason::Manual));
+        assert!(matches!(classify_close_reason("SELL", 157.379, 157.379, 156.729), CloseReason::StopLoss));
+
+        assert!(matches!(classify_close_reason("SELL", 156.900, 157.600, 156.950), CloseReason::TakeProfit));
+        assert!(matches!(classify_close_reason("BUY", 157.700, 157.000, 157.600), CloseReason::TakeProfit));
+        assert!(matches!(classify_close_reason("BUY", 156.900, 157.000, 157.600), CloseReason::StopLoss));
+        // SL/TP 未設定（0.0）の建玉は価格で判定できない
+        assert!(matches!(classify_close_reason("SELL", 157.379, 0.0, 0.0), CloseReason::Manual));
+    }
+
+    #[test]
+    fn broker_protection_overrides_the_planned_levels() {
+        let mut p = position(157.600, 156.950);
+        adopt_broker_protection(&mut p, &broker(Some(157.379), Some(156.729)));
+        assert_eq!(p.stop_loss, 157.379);
+        assert_eq!(p.take_profit, 156.729);
+
+        // ブローカーが SL/TP を持っていないなら、無防備であることをそのまま記録する
+        let mut p = position(157.600, 156.950);
+        adopt_broker_protection(&mut p, &broker(None, None));
+        assert_eq!(p.stop_loss, 0.0);
+        assert_eq!(p.take_profit, 0.0);
     }
 }

@@ -131,7 +131,9 @@ impl LlmClient {
                 String::from_utf8_lossy(&output.stderr)
             ));
         }
-        String::from_utf8(output.stdout).context("CLI output is not UTF-8")
+        let stdout = String::from_utf8(output.stdout).context("CLI output is not UTF-8")?;
+        log_usage(&stdout);
+        Ok(stdout)
     }
 
     /// CLI 出力（JSON エンベロープ or 生テキスト）から TradeDecision を取り出す
@@ -192,6 +194,24 @@ impl LlmClient {
         }
         Err(anyhow!("no JSON object found in output"))
     }
+}
+
+/// `--output-format json` のエンベロープからトークン使用量を拾ってログに出す（コスト把握用）
+fn log_usage(raw: &str) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw.trim()) else {
+        return;
+    };
+    let n = |p: &str| v.pointer(p).and_then(|x| x.as_u64()).unwrap_or(0);
+    info!(
+        turns = n("/num_turns"),
+        input = n("/usage/input_tokens"),
+        cache_write = n("/usage/cache_creation_input_tokens"),
+        cache_read = n("/usage/cache_read_input_tokens"),
+        output = n("/usage/output_tokens"),
+        cost_usd = v.get("total_cost_usd").and_then(|x| x.as_f64()).unwrap_or(0.0),
+        models = %v.get("modelUsage").and_then(|m| m.as_object()).map(|m| m.keys().cloned().collect::<Vec<_>>().join(",")).unwrap_or_default(),
+        "LLM usage"
+    );
 }
 
 impl LlmBackend for LlmClient {

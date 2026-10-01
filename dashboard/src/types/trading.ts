@@ -15,9 +15,11 @@ export interface Position {
   invalidationReason: string;
   /** このポジションを建てた判断（CoT ログ ID） */
   cotLogId?: string;
+  /** 終値判定モードの損切りライン（LLM の SL）。このとき stopLoss はブローカーに置いたハードSL */
+  closeStop?: number;
 }
 
-export type CloseReason = "TAKE_PROFIT" | "STOP_LOSS" | "MANUAL" | "CIRCUIT_BREAKER";
+export type CloseReason = "TAKE_PROFIT" | "STOP_LOSS" | "INVALIDATED" | "MANUAL" | "CIRCUIT_BREAKER";
 
 export interface TradeHistory {
   id: string;
@@ -82,8 +84,8 @@ export interface AccountMetrics {
   winRateToday: number;
   totalTradesToday: number;
   winningTradesToday: number;
-  usdjpySpread: number;
-  eurusdSpread: number;
+  /** ペアごとの直近スプレッド（pips） */
+  spreads: Record<string, number>;
   circuitBreakerThresholdPercent: number;
   /** "paper" | "live"。live のとき balance はブローカー残高 */
   orderMode: "paper" | "live";
@@ -123,6 +125,6 @@ export interface CoTDetail {
   trades: TradeHistory[];
   /** 保有中のポジション */
   openPositions: Position[];
-  /** 成立ログの場合、そのプランを立てた元の LLM 判断 */
+  /** プラン成立を受けた再判断（旧データは成立ログ）の場合、そのプランを立てた LLM 判断 */
   origin?: CoTLog;
 }

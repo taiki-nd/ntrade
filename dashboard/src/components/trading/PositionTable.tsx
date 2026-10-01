@@ -108,8 +108,13 @@ export function PositionTable({ positions, onClosePosition }: PositionTableProps
                       </TableCell>
                       <TableCell className="text-right">
                         <div className="flex flex-col items-end gap-0.5">
+                          {pos.closeStop != null && (
+                            <span className="font-mono tabular-nums text-xs text-rose-600 dark:text-rose-400">
+                              終値SL: {pos.closeStop.toFixed(pos.symbol.includes("JPY") ? 3 : 5)}
+                            </span>
+                          )}
                           <span className="font-mono tabular-nums text-xs text-rose-600 dark:text-rose-400">
-                            SL: {pos.stopLoss.toFixed(pos.symbol.includes("JPY") ? 3 : 5)}
+                            {pos.closeStop != null ? "ハードSL" : "SL"}: {pos.stopLoss.toFixed(pos.symbol.includes("JPY") ? 3 : 5)}
                           </span>
                           <span className="font-mono tabular-nums text-xs text-emerald-600 dark:text-emerald-400">
                             TP: {pos.takeProfit.toFixed(pos.symbol.includes("JPY") ? 3 : 5)}

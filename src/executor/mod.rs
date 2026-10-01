@@ -1,13 +1,14 @@
-//! 条件執行: LLM が返した条件付きプランを保持し、5M 確定ごとに機械的に評価して発注する。
+//! 条件執行: LLM が返した条件付きプランを保持し、5M 確定ごとに機械的に評価する。
 //!
-//! LLM を再度呼ばずに執行するが、成立時には事後ガード（`guard::evaluate_plan_trigger`）を必ず通す。
+//! 成立しても機械的には発注しない。成立足の終値はプランの想定価格からずれるので、成立を
+//! 判断サイクルに渡し、LLM に今の価格で入るかを判断し直させる（`server::handlers::decide`）。
 
 use anyhow::Result;
 use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::ctrader::CandleBar;
 use crate::strategy::types::{Action, ConditionalPlan, PriceCondition};
@@ -78,6 +79,10 @@ pub struct OrderRequest {
 pub struct OrderReceipt {
     pub order_id: String,
     pub filled_price: Option<f64>,
+    /// ブローカー側に実際に置かれた SL/TP。要求値と一致するとは限らないので、
+    /// ローカルの建玉にはこちらを記録する（決済理由の判定がこの値に依存する）。
+    pub stop_loss: f64,
+    pub take_profit: f64,
 }
 
 /// cTrader 未接続時のプレースホルダー。未接続時の発注はエラーとする。
@@ -113,6 +118,45 @@ pub fn relative_points(entry: f64, target: f64) -> i64 {
     ((entry - target).abs() * 100_000.0).round() as i64
 }
 
+/// 損切りの執行方法に応じて、ブローカーに置く SL と、ntrade が終値で判定する損切りラインを決める。
+///
+/// - `Touch`: LLM の SL をそのままブローカーに置く（終値判定なし）
+/// - `Close`: LLM の SL は終値判定のラインにし、ブローカーには `hard_stop_atr` × ATR だけ外側のハードSLを置く。
+///   ATR が取れないときはハードSLの幅を決められないので `Touch` と同じにする
+///
+/// 戻り値は（ブローカーに置く SL, 終値判定ライン）
+pub fn protective_stops(action: Action, stop_loss: f64, atr: Option<f64>, cfg: &crate::guard::GuardConfig) -> (f64, Option<f64>) {
+    let sign = match action {
+        Action::Buy => 1.0,
+        Action::Sell => -1.0,
+        Action::Hold => return (stop_loss, None),
+    };
+    match (cfg.stop_mode, atr.filter(|a| *a > 0.0)) {
+        (crate::guard::StopMode::Close, Some(atr)) if stop_loss > 0.0 => {
+            (stop_loss - sign * cfg.hard_stop_atr * atr, Some(stop_loss))
+        }
+        _ => (stop_loss, None),
+    }
+}
+
+/// 終値判定ラインを越えて確定したか（BUY は下抜け、SELL は上抜け）
+pub fn close_stop_breached(side: &str, close_stop: f64, bar_close: f64) -> bool {
+    if side == "BUY" {
+        bar_close < close_stop
+    } else {
+        bar_close > close_stop
+    }
+}
+
+/// 約定価格が想定からずれたときに、相対指定の SL/TP が実際に置かれる絶対価格。
+///
+/// cTrader は成行注文の SL/TP を「約定価格からの距離」として解釈するため、
+/// 想定価格からの距離がそのまま約定価格に平行移動する。
+pub fn shifted_levels(entry_hint: f64, filled: f64, stop_loss: f64, take_profit: f64) -> (f64, f64) {
+    let shift = filled - entry_hint;
+    (stop_loss + shift, take_profit + shift)
+}
+
 impl OrderSink for CTraderOrderSink {
     fn place_market<'a>(
         &'a self,
@@ -120,6 +164,8 @@ impl OrderSink for CTraderOrderSink {
     ) -> Pin<Box<dyn Future<Output = Result<OrderReceipt>> + Send + 'a>> {
         Box::pin(async move {
             let is_buy = req.action == Action::Buy;
+            // 約定価格は発注時点では分からないので、まず想定価格からの相対距離で SL/TP を付ける。
+            // 建玉が一瞬でも無防備にならないようにするための保険であって、意図した価格ではない。
             let rel = |p: f64| relative_points(req.entry_hint, p);
             let volume = crate::ctrader::lots_to_volume(req.volume_lots);
             info!(pair = %req.pair, ?req.action, volume, sl = req.stop_loss, tp = req.take_profit, "LIVE order → cTrader");
@@ -141,7 +187,45 @@ impl OrderSink for CTraderOrderSink {
                 .as_ref()
                 .and_then(|d| d.execution_price)
                 .or_else(|| ev.position.as_ref().and_then(|p| p.price));
-            Ok(OrderReceipt { order_id: position_id.to_string(), filled_price: filled })
+
+            // 約定価格が判明したら、意図した絶対価格へ付け替える。
+            // これをしないと SL/TP は約定ズレの分だけ平行移動したまま執行される。
+            let mut effective = (req.stop_loss, req.take_profit);
+            let pip = crate::snapshot::measures::get_pip_size(&req.pair);
+            match filled {
+                Some(fill)
+                    if req.stop_loss > 0.0
+                        && req.take_profit > 0.0
+                        && (fill - req.entry_hint).abs() >= pip * 0.1 =>
+                {
+                    match self
+                        .service
+                        .amend_position_sltp(position_id, Some(req.stop_loss), Some(req.take_profit))
+                        .await
+                    {
+                        Ok(_) => info!(
+                            position_id, fill, hint = req.entry_hint, sl = req.stop_loss, tp = req.take_profit,
+                            "SL/TP re-anchored to intended prices after fill"
+                        ),
+                        Err(e) => {
+                            // 付け替えに失敗した場合、ブローカー側は相対指定のままなので、
+                            // 記録も実際に置かれている価格に合わせる（判定と表示を嘘にしないため）
+                            effective = shifted_levels(req.entry_hint, fill, req.stop_loss, req.take_profit);
+                            warn!(
+                                position_id, fill, sl = effective.0, tp = effective.1,
+                                "failed to amend SL/TP after fill; broker keeps the shifted levels: {e:#}"
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+            Ok(OrderReceipt {
+                order_id: position_id.to_string(),
+                filled_price: filled,
+                stop_loss: effective.0,
+                take_profit: effective.1,
+            })
         })
     }
 }
@@ -257,6 +341,46 @@ mod tests {
         assert_eq!(relative_points(1.08500, 1.08390), 110);
         // 向きに依らず絶対距離
         assert_eq!(relative_points(157.040, 157.150), 11_000);
+    }
+
+    #[test]
+    fn shifted_levels_follow_the_fill() {
+        // 実例（trd-10871878）: 指値 157.450 想定で SL 157.600 / TP 156.950 を送ったが、
+        // 成行約定は 157.229 だったため、ブローカー側の SL は 157.379 に置かれていた
+        let (sl, tp) = shifted_levels(157.450, 157.229, 157.600, 156.950);
+        assert!((sl - 157.379).abs() < 1e-9, "sl was {sl}");
+        assert!((tp - 156.729).abs() < 1e-9, "tp was {tp}");
+        // 約定が想定どおりなら動かない
+        let (sl, tp) = shifted_levels(157.450, 157.450, 157.600, 156.950);
+        assert!((sl - 157.600).abs() < 1e-9 && (tp - 156.950).abs() < 1e-9);
+    }
+
+    #[test]
+    fn protective_stops_follow_stop_mode() {
+        use crate::guard::{GuardConfig, StopMode};
+        let touch = GuardConfig::default();
+        assert_eq!(protective_stops(Action::Sell, 157.70, Some(0.08), &touch), (157.70, None));
+
+        let close = GuardConfig { stop_mode: StopMode::Close, hard_stop_atr: 2.0, ..GuardConfig::default() };
+        // SELL: ハードSLは上へ 2 × 0.08 = 16 pips
+        let (hard, soft) = protective_stops(Action::Sell, 157.70, Some(0.08), &close);
+        assert!((hard - 157.86).abs() < 1e-9);
+        assert_eq!(soft, Some(157.70));
+        // BUY: 下へ
+        let (hard, soft) = protective_stops(Action::Buy, 1.1360, Some(0.0004), &close);
+        assert!((hard - 1.1352).abs() < 1e-9);
+        assert_eq!(soft, Some(1.1360));
+        // ATR が無いと幅を決められないので、LLM の SL をそのまま置く
+        assert_eq!(protective_stops(Action::Sell, 157.70, None, &close), (157.70, None));
+    }
+
+    #[test]
+    fn close_stop_breach_needs_a_close_beyond_the_line() {
+        assert!(close_stop_breached("SELL", 157.70, 157.71));
+        assert!(!close_stop_breached("SELL", 157.70, 157.70));
+        assert!(!close_stop_breached("SELL", 157.70, 157.65));
+        assert!(close_stop_breached("BUY", 1.1360, 1.1359));
+        assert!(!close_stop_breached("BUY", 1.1360, 1.1361));
     }
 
     #[test]

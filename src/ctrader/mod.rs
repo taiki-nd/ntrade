@@ -7,5 +7,6 @@ pub use client::{CTraderService, OrderOutcome, TradingPermission};
 pub use config::{symbol_suffix_from_env, CTraderConfig};
 pub use token::TokenSet;
 pub use types::{
-    lots_to_volume, volume_to_lots, AccountSummary, BarPeriod, BrokerPosition, CandleBar, ClosedDeal, SymbolInfo,
+    lots_to_volume, quote_currency_from_name, volume_to_lots, AccountSummary, BarPeriod, BrokerPosition, CandleBar,
+    ClosedDeal, SymbolInfo, SymbolSpec,
 };

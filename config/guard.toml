@@ -1,5 +1,8 @@
 # 事後ガード設定（docs/02_trading_strategy.md 7章）
 # ここにある数値は「判断」ではなく「リスク管理」。LLM のプロンプトには書かない。
+#
+# 本番エンジンでは初回起動時の初期値としてだけ使う。以後は SQLite（app_settings）に保存された値が正で、
+# ダッシュボードの設定画面から変更する（このファイルを直しても反映されない）。リプレイ（bin/replay）は引き続きこのファイルを読む。
 
 # 観測整合: LLM が報告した最新足時刻が Snapshot と一致しなければ HOLD
 observed_check = true
@@ -15,6 +18,13 @@ sl_atr_min = 0.5
 sl_atr_max = 4.0
 sl_min_pips = 3.0
 
+# 損切りの執行方法
+# touch: LLM の SL をそのままブローカーに置き、ヒゲが触れたら決済
+# close: LLM の SL は「5M 確定足の終値で越えたら決済」のラインとして ntrade が判定する。
+#        ブローカーには急変に備えて hard_stop_atr × 5M ATR だけ外側にハードSLを置く
+stop_mode = "touch"
+hard_stop_atr = 2.0
+
 # ポジション上限
 max_positions_per_pair = 1
 max_positions_total = 1
@@ -25,7 +35,9 @@ daily_loss_limit_pct = 3.0
 # 条件付きプランの最長有効期間（時間）
 plan_max_hours = 8.0
 
-# 発注ロット（固定）。risk_pct を設定すると SL 幅から自動計算（pip_value_per_lot が必要）
+# 発注ロット（固定）。risk_pct を設定すると SL 幅から自動計算する。
+# 1 lot・1 pip の価値はブローカーの銘柄仕様と直近レートから口座通貨で求める（EURUSD を JPY 口座なら USDJPY で換算）。
+# pip_value_per_lot を書くとその固定値を優先する
 fixed_volume_lots = 0.01
 # risk_pct = 0.5
 # pip_value_per_lot = 1000.0

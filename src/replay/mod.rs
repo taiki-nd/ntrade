@@ -17,10 +17,11 @@ use crate::ctrader::{BarPeriod, CandleBar};
 use crate::guard::{self, GuardConfig, GuardContext};
 use crate::llm::LlmBackend;
 use crate::snapshot::measures::get_pip_size;
-use crate::snapshot::{AccountState, MarketSnapshot, SnapshotBundle, SnapshotInput, SnapshotPipeline};
+use crate::snapshot::{AccountState, MarketSnapshot, SnapshotBundle, SnapshotInput, SnapshotPipeline, TriggeredPlan};
 use crate::storage::{Db, ReplayDecisionRow};
+use crate::strategy::types::Action;
 use crate::strategy::PromptBuilder;
-use score::{score_decision, ScoreConfig};
+use score::{plan_trigger_index, score_decision, score_followup, ExitRule, ScoreConfig};
 
 pub const SNAPSHOT_VERSION: &str = "snapshot-v2";
 
@@ -177,6 +178,21 @@ pub struct ReplayConfig {
     pub max_bars_to_exit: usize,
     pub chart_root: PathBuf,
     pub lessons: Vec<String>,
+    pub exit: ExitRule,
+    /// 条件付きプランが成立したら、本番と同じくその時点で LLM に判断し直させる。
+    /// false なら成立足の終値で機械的に執行したとみなす（旧方式との比較用）
+    pub plan_rejudge: bool,
+}
+
+/// 条件付きプランが成立した時点の再判断（`replay_decisions.followup_json`）
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PlanFollowup {
+    /// 再判断の時刻（成立足の確定時刻）
+    pub t: String,
+    /// 元の判断時刻から成立足までの5M本数（成立足を含む）
+    pub offset: usize,
+    pub decision: crate::strategy::types::TradeDecision,
+    pub guard_result: String,
 }
 
 pub struct ReplayRunner {
@@ -198,7 +214,9 @@ impl ReplayRunner {
         let guard_config = serde_json::json!({
             "guard": self.guard,
             "max_bars_to_exit": cfg.max_bars_to_exit,
-            "spread_pips": cfg.spread_pips
+            "spread_pips": cfg.spread_pips,
+            "exit": cfg.exit,
+            "plan_rejudge": cfg.plan_rejudge
         })
         .to_string();
         let sampling = format!("step:{}m{}", cfg.step_minutes, cfg.limit.map(|l| format!(":limit={l}")).unwrap_or_default());
@@ -217,11 +235,23 @@ impl ReplayRunner {
             }
         };
 
-        let times: Vec<DateTime<Utc>> = sample_times(cfg.from, cfg.to, cfg.step_minutes, cfg.limit)
-            .into_iter()
-            .filter(|t| !done.contains(t))
-            .collect();
-        info!(run_id, samples = times.len(), skipped = done.len(), "Replay run starting");
+        let (times, closed): (Vec<DateTime<Utc>>, Vec<DateTime<Utc>>) = {
+            let db = self.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+            let mut closed = Vec::new();
+            let mut times = Vec::new();
+            for t in sample_times(cfg.from, cfg.to, cfg.step_minutes, cfg.limit) {
+                if done.contains(&t) {
+                    continue;
+                }
+                if market_open_at(&db, &cfg.pair, t)? {
+                    times.push(t);
+                } else {
+                    closed.push(t);
+                }
+            }
+            (times, closed)
+        };
+        info!(run_id, samples = times.len(), skipped = done.len(), market_closed = closed.len(), "Replay run starting");
 
         let source = Arc::new(SqliteBarSource::new(self.db.clone()));
         let pipeline = Arc::new(SnapshotPipeline::new(cfg.chart_root.join("replay").join(run_id.to_string())));
@@ -271,15 +301,36 @@ async fn evaluate_one(
     // リプレイでは口座状態を持たないので、ポジション数・日次損失は常にゼロとして評価する
     let guard = guard::evaluate(&decision, &bundle.snapshot, &GuardContext { now: Some(t), ..Default::default() }, guard_cfg).summary();
 
-    let after = {
+    let (after, atr) = {
         let db = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
-        db.bars_from(&cfg.pair, BarPeriod::M5, t, cfg.max_bars_to_exit + 400)?
+        (db.bars_from(&cfg.pair, BarPeriod::M5, t, cfg.max_bars_to_exit + 400)?, atr_5m_at(&db, &cfg.pair, t)?)
     };
-    let score = score_decision(
-        &after,
-        &decision,
-        &ScoreConfig { pip_size: get_pip_size(&cfg.pair), spread_pips: cfg.spread_pips, max_bars: cfg.max_bars_to_exit },
-    );
+    let score_cfg = |atr| ScoreConfig {
+        pip_size: get_pip_size(&cfg.pair),
+        spread_pips: cfg.spread_pips,
+        max_bars: cfg.max_bars_to_exit,
+        exit: cfg.exit,
+        atr,
+    };
+
+    let plan = decision.conditional_plan.as_ref().filter(|p| decision.action == Action::Hold && p.then_action != Action::Hold);
+    let trigger = match plan {
+        Some(p) if cfg.plan_rejudge => plan_trigger_index(&after, p).ok().map(|i| (p, i)),
+        _ => None,
+    };
+    let (score, followup) = match trigger {
+        Some((plan, i)) => {
+            let f = rejudge_plan(llm, source, pipeline, cfg, guard_cfg, t, plan, &after[i], i + 1).await?;
+            let t2 = Utc.timestamp_opt(crate::storage::parse_ts(&f.t)?, 0).single().ok_or_else(|| anyhow!("bad ts {}", f.t))?;
+            let (after2, atr2) = {
+                let db = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+                (db.bars_from(&cfg.pair, BarPeriod::M5, t2, cfg.max_bars_to_exit + 400)?, atr_5m_at(&db, &cfg.pair, t2)?)
+            };
+            let score = score_followup(&after2, &f.decision, f.guard_result == "PASS", f.offset, &score_cfg(atr2));
+            (score, Some(serde_json::to_string(&f)?))
+        }
+        None => (score_decision(&after, &decision, &score_cfg(atr)), None),
+    };
 
     let row = ReplayDecisionRow {
         run_id,
@@ -293,11 +344,114 @@ async fn evaluate_one(
         session: serde_json::to_value(bundle.snapshot.session)?.as_str().unwrap_or("").to_string(),
         confidence: decision.confidence,
         action: serde_json::to_value(decision.action)?.as_str().unwrap_or("").to_string(),
+        followup_json: followup,
     };
     let db = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
     db.insert_decision(&row)?;
     info!(%t, action = %row.action, outcome = %row.outcome, guard = %row.guard_result, "replay sample done");
     Ok(())
+}
+
+/// プランが成立した足の確定時刻で Snapshot を作り直し、成立を添えて LLM に判断し直させる（本番の判断サイクルと同じ）。
+/// 再判断が新たに立てたプランは追わない。
+#[allow(clippy::too_many_arguments)]
+async fn rejudge_plan(
+    llm: &dyn LlmBackend,
+    source: &dyn BarSource,
+    pipeline: &SnapshotPipeline,
+    cfg: &ReplayConfig,
+    guard_cfg: &GuardConfig,
+    planned_at: DateTime<Utc>,
+    plan: &crate::strategy::types::ConditionalPlan,
+    bar: &CandleBar,
+    offset: usize,
+) -> Result<PlanFollowup> {
+    let t2 = bar.timestamp + BarPeriod::M5.duration();
+    let account_state = AccountState {
+        triggered_plan: Some(TriggeredPlan {
+            planned_at: planned_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+            triggered_bar: bar.timestamp.format("%Y-%m-%d %H:%M").to_string(),
+            triggered_close: bar.close,
+            plan: plan.clone(),
+        }),
+        ..Default::default()
+    };
+    let bundle = build_snapshot_at(source, pipeline, &cfg.pair, t2, cfg.spread_pips, cfg.bars_per_tf, account_state).await?;
+    let prompt = PromptBuilder::new().with_lessons(cfg.lessons.clone()).build(&bundle.snapshot, &bundle.charts);
+    let decision = llm.infer(&prompt).await?;
+    let guard = guard::evaluate(&decision, &bundle.snapshot, &GuardContext { now: Some(t2), ..Default::default() }, guard_cfg).summary();
+    info!(%planned_at, %t2, action = ?decision.action, %guard, "replay plan triggered; re-judged");
+    Ok(PlanFollowup { t: t2.format("%Y-%m-%d %H:%M:%S").to_string(), offset, decision, guard_result: guard })
+}
+
+/// 時刻 `t` の直前に 5M 足が確定しているか。週末・休場中は同じ Snapshot で LLM を呼ぶだけになるので飛ばす。
+/// 足が1本欠けることはあるので、直近 2 本分（10分）以内に確定足があれば開場中とみなす。
+fn market_open_at(db: &Db, pair: &str, t: DateTime<Utc>) -> Result<bool> {
+    let last = db.bars_until(pair, BarPeriod::M5, t, 1)?;
+    Ok(last.last().is_some_and(|b| t - (b.timestamp + BarPeriod::M5.duration()) <= Duration::minutes(5)))
+}
+
+/// 時刻 `t` で確定している 5M 足から求めた ATR(14)（価格単位）。足が足りなければ 0。
+fn atr_5m_at(db: &Db, pair: &str, t: DateTime<Utc>) -> Result<f64> {
+    let bars = db.bars_until(pair, BarPeriod::M5, t, 100)?;
+    Ok(crate::snapshot::measures::calculate_atr(&bars, 14).unwrap_or(0.0))
+}
+
+/// 保存済みの run の判断を、LLM を呼ばずに別の決済ルールで採点し直して新しい run として保存する。
+/// 判断（decision_json）とガード結果はそのまま引き継ぎ、outcome / pnl / bars_to_exit だけを再計算する。
+pub fn rescore_run(db: &Arc<Mutex<Db>>, source_run: i64, exit: ExitRule, label: &str) -> Result<i64> {
+    let db = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+    let run = db.get_run(source_run)?.ok_or_else(|| anyhow!("run {source_run} not found"))?;
+    let rows = db.decisions(source_run)?;
+
+    let mut cfg_json: serde_json::Value = serde_json::from_str(&run.guard_config).unwrap_or_default();
+    let max_bars = cfg_json.get("max_bars_to_exit").and_then(|v| v.as_u64()).unwrap_or(48) as usize;
+    let spread_pips = cfg_json.get("spread_pips").and_then(|v| v.as_f64()).unwrap_or(0.3);
+    cfg_json["exit"] = serde_json::to_value(exit)?;
+    cfg_json["rescored_from"] = source_run.into();
+
+    let ts = |s: &str| -> Result<DateTime<Utc>> {
+        Utc.timestamp_opt(crate::storage::parse_ts(s)?, 0).single().ok_or_else(|| anyhow!("bad ts {s}"))
+    };
+    let run_id = db.create_run(
+        label,
+        &run.pair,
+        ts(&run.from_ts)?,
+        ts(&run.to_ts)?,
+        &format!("rescore:#{source_run}"),
+        &run.prompt_hash,
+        &run.snapshot_ver,
+        &cfg_json.to_string(),
+    )?;
+
+    let pip_size = get_pip_size(&run.pair);
+    for row in rows {
+        let t = ts(&row.t)?;
+        let decision: crate::strategy::types::TradeDecision =
+            serde_json::from_str(&row.decision_json).with_context(|| format!("decision_json at {}", row.t))?;
+        let after = db.bars_from(&run.pair, BarPeriod::M5, t, max_bars + 400)?;
+        let atr = atr_5m_at(&db, &run.pair, t)?;
+        let score = match row.followup_json.as_deref() {
+            // 再判断がある run は、再判断の時刻以降の足で採点し直す
+            Some(raw) => {
+                let f: PlanFollowup = serde_json::from_str(raw).with_context(|| format!("followup_json at {}", row.t))?;
+                let t2 = ts(&f.t)?;
+                let after2 = db.bars_from(&run.pair, BarPeriod::M5, t2, max_bars + 400)?;
+                let atr2 = atr_5m_at(&db, &run.pair, t2)?;
+                score_followup(&after2, &f.decision, f.guard_result == "PASS", f.offset, &ScoreConfig { pip_size, spread_pips, max_bars, exit, atr: atr2 })
+            }
+            None => score_decision(&after, &decision, &ScoreConfig { pip_size, spread_pips, max_bars, exit, atr }),
+        };
+        db.insert_decision(&ReplayDecisionRow {
+            run_id,
+            outcome: score.outcome.as_str().to_string(),
+            pnl_pips: score.pnl_pips,
+            bars_to_exit: score.bars_to_exit.map(|n| n as i64),
+            ..row
+        })?;
+    }
+    info!(run_id, source_run, exit = %exit.label(), "Rescored run");
+    Ok(run_id)
 }
 
 /// プロンプト本文（教訓含む）のフィンガープリント。変更検知用。
@@ -391,6 +545,20 @@ mod tests {
         assert_eq!(all.len(), 8);
         let few = sample_times(from, to, 15, Some(4));
         assert_eq!(few.len(), 4);
+    }
+
+    #[test]
+    fn market_closed_times_are_detected() {
+        let mut db = Db::open_in_memory().unwrap();
+        // 金曜 20:55 開始の足が最後（21:00 に確定）
+        let fri_close = Utc.with_ymd_and_hms(2026, 9, 18, 20, 55, 0).unwrap();
+        db.insert_bars("USDJPY", BarPeriod::M5, &make(20, 5, fri_close)).unwrap();
+        let at = |d, h, m| Utc.with_ymd_and_hms(2026, 9, d, h, m, 0).unwrap();
+        assert!(market_open_at(&db, "USDJPY", at(18, 21, 0)).unwrap());
+        assert!(market_open_at(&db, "USDJPY", at(18, 21, 5)).unwrap()); // 1本欠けは許容
+        assert!(!market_open_at(&db, "USDJPY", at(18, 21, 10)).unwrap());
+        assert!(!market_open_at(&db, "USDJPY", at(19, 12, 0)).unwrap()); // 土曜
+        assert!(!market_open_at(&db, "EURUSD", at(18, 21, 0)).unwrap()); // データなし
     }
 
     #[test]

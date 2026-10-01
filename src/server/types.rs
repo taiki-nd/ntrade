@@ -26,6 +26,10 @@ pub struct Position {
     /// このポジションを建てた判断（CoT ログ）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cot_log_id: Option<String>,
+    /// `stop_mode = close` の建玉だけが持つ、5M 確定足の終値で判定する損切りライン（LLM の SL）。
+    /// このとき `stop_loss` はブローカーに置いたハードSL
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_stop: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,6 +37,8 @@ pub struct Position {
 pub enum CloseReason {
     TakeProfit,
     StopLoss,
+    /// `stop_mode = close`: 5M 確定足の終値が LLM の SL（無効化ライン）を越えたため ntrade が成行決済した
+    Invalidated,
     Manual,
     CircuitBreaker,
 }
@@ -124,8 +130,8 @@ pub struct AccountMetrics {
     pub win_rate_today: f64,
     pub total_trades_today: u32,
     pub winning_trades_today: u32,
-    pub usdjpy_spread: f64,
-    pub eurusd_spread: f64,
+    /// ペアごとの直近スプレッド（pips）。直近 Snapshot の値
+    pub spreads: std::collections::BTreeMap<String, f64>,
     pub circuit_breaker_threshold_percent: f64,
     /// "paper" | "live"。live のとき balance はブローカー残高を反映する
     pub order_mode: String,

@@ -2,8 +2,9 @@
 //!
 //! 判断と取引の対応は `cot_log_id` で辿る: `cot_logs.id` ← `positions.cot_log_id` / `trades.cot_log_id`、
 //! 教訓は `lessons.trigger_trade_id` → `trades.id`。
-//! 条件付きプランは「発注した記録（成立ログ）」と「根拠になった LLM 判断」が別ログになるため、
-//! 取引は成立ログに紐づき、根拠は `cot_logs.origin_cot_log_id` で元の判断へ辿る。
+//! 条件付きプランが成立すると LLM が入るかを判断し直す。取引はその再判断のログに紐づき、
+//! プランを立てた判断へは `cot_logs.origin_cot_log_id` で辿る。
+//! 旧データ（`cot-plan-*`）は LLM を通さずに発注した機械的な成立ログで、根拠は origin 側にある。
 //! 時刻は API と同じ "YYYY-MM-DD HH:MM:SS"（UTC）の文字列で持つ（辞書順 = 時系列順）。
 
 use anyhow::Result;
@@ -27,7 +28,7 @@ const COT_COLS: &str = "id, timestamp, symbol, action, confidence, entry_type, e
     origin_cot_log_id";
 
 /// CoT ログの絞り込み条件（?1 = ペア / ?2 = 検索語。いずれも NULL なら無条件）
-const COT_SEARCH_WHERE: &str = r#"WHERE (?1 IS NULL OR symbol = ?1)
+const COT_SEARCH_WHERE: &str = r#"WHERE (?1 IS NULL OR symbol = ?1 COLLATE NOCASE)
       AND (?2 IS NULL OR lower(
             symbol || ' ' || action || ' ' || timestamp || ' ' || COALESCE(entry_type, '') || ' ' ||
             macro_context || ' ' || order_flow || ' ' || invalidation || ' ' || conflicts || ' ' ||
@@ -42,7 +43,7 @@ fn search_pattern(query: Option<&str>) -> Option<String> {
 }
 
 const POSITION_COLS: &str = "id, symbol, side, volume_lots, entry_price, current_price, stop_loss, take_profit,
-    pnl_pips, pnl_amount, open_time, invalidation_reason, cot_log_id";
+    pnl_pips, pnl_amount, open_time, invalidation_reason, cot_log_id, close_stop";
 
 const TRADE_COLS: &str = "id, symbol, side, volume_lots, entry_price, close_price, stop_loss, take_profit,
     pnl_pips, pnl_amount, close_reason, open_time, close_time, cot_log_id";
@@ -51,7 +52,7 @@ const LESSON_COLS: &str = "id, created_at, symbol, rule, context, active, trigge
 
 /// 決済履歴の絞り込み条件（NULL の名前付きパラメータは絞り込まない）
 const TRADE_SEARCH_WHERE: &str = r#"WHERE (:cot_log_id IS NULL OR cot_log_id = :cot_log_id)
-      AND (:symbol IS NULL OR symbol = :symbol)
+      AND (:symbol IS NULL OR symbol = :symbol COLLATE NOCASE)
       AND (:side IS NULL OR side = :side)
       AND (:close_reason IS NULL OR close_reason = :close_reason)
       AND (:win IS NULL OR :win = (pnl_pips >= 0))
@@ -114,7 +115,8 @@ impl Db {
               pnl_amount          REAL NOT NULL,
               open_time           TEXT NOT NULL,
               invalidation_reason TEXT NOT NULL,
-              cot_log_id          TEXT
+              cot_log_id          TEXT,
+              close_stop          REAL
             );
             CREATE TABLE IF NOT EXISTS trades (
               id           TEXT PRIMARY KEY,
@@ -156,6 +158,7 @@ impl Db {
 
         // 既存 DB への列追加。既にあれば "duplicate column name" になるので無視する
         let _ = self.conn.execute("ALTER TABLE cot_logs ADD COLUMN origin_cot_log_id TEXT", []);
+        let _ = self.conn.execute("ALTER TABLE positions ADD COLUMN close_stop REAL", []);
 
         self.conn.execute_batch(
             r#"
@@ -203,7 +206,6 @@ impl Db {
 
     /// 新しい順。`symbol` 指定時はそのペアのみ、`query` 指定時は本文の部分一致（大文字小文字を無視）で絞り込む
     pub fn cot_logs(&self, symbol: Option<&str>, query: Option<&str>, limit: usize, offset: usize) -> Result<Page<CoTLog>> {
-        let symbol = symbol.map(str::to_uppercase);
         let query = search_pattern(query);
         let total = self.conn.query_row(
             &format!("SELECT COUNT(*) FROM cot_logs {COT_SEARCH_WHERE}"),
@@ -246,7 +248,7 @@ impl Db {
         tx.execute("DELETE FROM positions", [])?;
         {
             let mut stmt = tx.prepare(&format!(
-                "INSERT INTO positions ({POSITION_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
+                "INSERT INTO positions ({POSITION_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
             ))?;
             for p in positions {
                 stmt.execute(params![
@@ -262,7 +264,8 @@ impl Db {
                     p.pnl_amount,
                     p.open_time,
                     p.invalidation_reason,
-                    p.cot_log_id
+                    p.cot_log_id,
+                    p.close_stop
                 ])?;
             }
         }
@@ -309,7 +312,7 @@ impl Db {
 
     /// 銘柄・売買・決済理由・勝敗・期間・損益幅・フリーワードで絞り込んだ決済履歴
     pub fn search_trades(&self, q: &TradeQuery) -> Result<Page<TradeHistory>> {
-        let symbol = non_empty(q.symbol.as_ref()).map(|s| s.to_uppercase());
+        let symbol = non_empty(q.symbol.as_ref());
         let side = non_empty(q.side.as_ref()).map(|s| s.to_uppercase());
         let close_reason = q.close_reason.as_ref().map(close_reason_str);
         let cot_log_id = non_empty(q.cot_log_id.as_ref());
@@ -450,6 +453,7 @@ fn row_to_position(r: &Row) -> rusqlite::Result<Position> {
         open_time: r.get(10)?,
         invalidation_reason: r.get(11)?,
         cot_log_id: r.get(12)?,
+        close_stop: r.get(13)?,
     })
 }
 
@@ -686,9 +690,11 @@ mod tests {
             open_time: "2026-09-15 09:00:00".into(),
             invalidation_reason: "i".into(),
             cot_log_id: Some("cot-1".into()),
+            close_stop: Some(154.12),
         };
         db.replace_positions(std::slice::from_ref(&p)).unwrap();
         assert_eq!(db.positions().unwrap()[0].cot_log_id.as_deref(), Some("cot-1"));
+        assert_eq!(db.positions().unwrap()[0].close_stop, Some(154.12));
         db.replace_positions(&[]).unwrap();
         assert!(db.positions().unwrap().is_empty());
     }

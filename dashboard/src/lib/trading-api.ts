@@ -344,8 +344,8 @@ export const tradingApi = {
   /**
    * Snapshot（時間足別チャート4枚 + 客観的事実JSON）の再生成トリガー
    */
-  async generateChart(): Promise<ApiResponse<string>> {
-    return await request<ApiResponse<string>>("/api/chart/generate", {
+  async generateChart(pair?: string): Promise<ApiResponse<string>> {
+    return await request<ApiResponse<string>>(`/api/chart/generate${pairQuery(pair)}`, {
       method: "POST",
     });
   },
@@ -353,15 +353,16 @@ export const tradingApi = {
   /**
    * 時間足別の最新チャート画像URL
    */
-  getLatestChartUrl(tf: ChartTimeframe, cacheKey: number = Date.now()): string {
-    return `${API_BASE_URL}/api/chart/latest?tf=${tf}&t=${cacheKey}`;
+  getLatestChartUrl(tf: ChartTimeframe, cacheKey: number = Date.now(), pair?: string): string {
+    const p = pair ? `&pair=${encodeURIComponent(pair)}` : "";
+    return `${API_BASE_URL}/api/chart/latest?tf=${tf}${p}&t=${cacheKey}`;
   },
 
   /**
    * 直近 Snapshot の客観的事実JSON
    */
-  async getLatestSnapshot(): Promise<ApiResponse<MarketSnapshot>> {
-    return await request<ApiResponse<MarketSnapshot>>("/api/snapshot/latest");
+  async getLatestSnapshot(pair?: string): Promise<ApiResponse<MarketSnapshot>> {
+    return await request<ApiResponse<MarketSnapshot>>(`/api/snapshot/latest${pairQuery(pair)}`);
   },
 
   /** リプレイ run 一覧 */
@@ -380,8 +381,8 @@ export const tradingApi = {
   },
 
   /** 判断サイクルを1回実行（Snapshot → LLM → ガード → 執行/プラン登録） */
-  async decideNow(): Promise<ApiResponse<DecideResponse>> {
-    return await request<ApiResponse<DecideResponse>>("/api/decide", { method: "POST" });
+  async decideNow(pair?: string): Promise<ApiResponse<DecideResponse>> {
+    return await request<ApiResponse<DecideResponse>>(`/api/decide${pairQuery(pair)}`, { method: "POST" });
   },
 
   /** 保持中の条件付きプラン */
@@ -403,7 +404,32 @@ export const tradingApi = {
   async getGuardConfig(): Promise<ApiResponse<GuardConfig>> {
     return await request<ApiResponse<GuardConfig>>("/api/guard/config");
   },
+
+  /** 取引設定（対象ペア・待ち秒数・事後ガード） */
+  async getSettings(): Promise<ApiResponse<TradingSettings>> {
+    return await request<ApiResponse<TradingSettings>>("/api/settings");
+  },
+
+  /** 取引設定を保存（SQLite）。次の判断サイクルから反映 */
+  async saveSettings(settings: TradingSettings): Promise<ApiResponse<TradingSettings>> {
+    return await request<ApiResponse<TradingSettings>>("/api/settings", {
+      method: "PUT",
+      body: JSON.stringify(settings),
+    });
+  },
 };
+
+/** `?pair=XXX`（省略時はエンジン側で設定の先頭ペア） */
+function pairQuery(pair?: string): string {
+  return pair ? `?pair=${encodeURIComponent(pair)}` : "";
+}
+
+/** 画面から変更できる取引設定。guard のキーは Rust 側のまま snake_case */
+export interface TradingSettings {
+  pairs: string[];
+  barDelaySecs: number;
+  guard: GuardConfig;
+}
 
 export interface RuntimeInfo {
   orderMode: "paper" | "live";
@@ -439,6 +465,10 @@ export interface GuardConfig {
   pip_value_per_lot: number | null;
   max_spread_pips: Record<string, number>;
   news_blackout: { time: string; before_min: number; after_min: number; label: string }[];
+  /** 損切りの執行方法。touch = ブローカーの SL（ヒゲ判定） / close = 5M 確定足の終値で判定 */
+  stop_mode: "touch" | "close";
+  /** close のとき、ブローカーに置くハードSLを LLM の SL から 5M ATR の何倍外側に置くか */
+  hard_stop_atr: number;
 }
 
 export interface ConditionalPlan {

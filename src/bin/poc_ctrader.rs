@@ -71,8 +71,10 @@ async fn main() -> Result<()> {
     println!();
 
     // 3. 主要通貨ペアのシンボル解決
-    println!("[3/4] 主要シンボル (USDJPY, EURUSD) の確認:");
-    let pairs = ["USDJPY", "EURUSD"];
+    // 銘柄名はブローカーの表記どおりに指定する（ゼロ口座は USDJPY_z。素の USDJPY は発注できない）
+    let suffix = ntrade::ctrader::symbol_suffix_from_env().unwrap_or_default();
+    let pairs = [format!("USDJPY{suffix}"), format!("EURUSD{suffix}")];
+    println!("[3/4] 主要シンボル ({}) の確認:", pairs.join(", "));
     for pair in &pairs {
         match service.get_symbol_id(pair).await {
             Ok(id) => {
@@ -81,6 +83,16 @@ async fn main() -> Result<()> {
                     Err(e) => format!("取得失敗: {e}"),
                 };
                 println!("  ✓ {} -> Symbol ID: {} | 取引モード: {}", pair, id, mode);
+                match (service.symbol_spec(pair).await, service.pip_value_per_lot(pair).await) {
+                    (Ok(spec), Ok(pv)) => println!(
+                        "      pip {} | 1 lot = {} 通貨 | 1 lot・1 pip = {:.2}（口座通貨 {}）",
+                        spec.pip_size(),
+                        spec.lot_units,
+                        pv,
+                        service.account_currency().await.unwrap_or_else(|_| "不明".into())
+                    ),
+                    (Err(e), _) | (_, Err(e)) => println!("      pip 価値の取得失敗: {e:#}"),
+                }
             }
             Err(e) => println!("  ✗ {} -> 取得失敗: {}", pair, e),
         }
@@ -135,11 +147,12 @@ async fn main() -> Result<()> {
         // SL 10 pips / TP 20 pips。相対値は価格の 1/100000 単位（USDJPY は 1 pip = 1,000）
         let (rel_sl, rel_tp) = if with_sltp { (Some(10_000), Some(20_000)) } else { (None, None) };
         println!(
-            "[5/5] テスト発注（USDJPY 0.01 lot BUY / {}）:",
+            "[5/5] テスト発注（{} 0.01 lot BUY / {}）:",
+            pairs[0],
             if with_sltp { "SL 10 pips・TP 20 pips" } else { "SL・TP なし" }
         );
         let volume = ntrade::ctrader::lots_to_volume(0.01);
-        match service.place_market_order_with_sltp("USDJPY", true, volume, rel_sl, rel_tp).await {
+        match service.place_market_order_with_sltp(&pairs[0], true, volume, rel_sl, rel_tp).await {
             Ok(ev) => {
                 let position_id = ev
                     .position

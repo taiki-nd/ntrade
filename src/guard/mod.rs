@@ -24,6 +24,19 @@ pub struct NewsBlackout {
     pub label: String,
 }
 
+/// 損切りの執行方法
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StopMode {
+    /// LLM の SL をそのままブローカーに置き、ヒゲが触れたら決済する
+    #[default]
+    Touch,
+    /// LLM の SL は「5M 確定足の終値で越えたら無効」のラインとして ntrade が判定し、成行で決済する。
+    /// ブローカーには急変に備えたハードSL（`hard_stop_atr` だけ外側）を置く。
+    /// プロンプトが損切りを「実体で抜けたら無効」と定義しているのに合わせた執行方法
+    Close,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GuardConfig {
@@ -42,6 +55,9 @@ pub struct GuardConfig {
     pub pip_value_per_lot: Option<f64>,
     pub max_spread_pips: HashMap<String, f64>,
     pub news_blackout: Vec<NewsBlackout>,
+    pub stop_mode: StopMode,
+    /// `stop_mode = close` のとき、ブローカーに置くハードSLを LLM の SL から 5M ATR の何倍外側に置くか
+    pub hard_stop_atr: f64,
 }
 
 impl Default for GuardConfig {
@@ -62,6 +78,8 @@ impl Default for GuardConfig {
             pip_value_per_lot: None,
             max_spread_pips: HashMap::from([("default".to_string(), 1.0)]),
             news_blackout: Vec::new(),
+            stop_mode: StopMode::Touch,
+            hard_stop_atr: 2.0,
         }
     }
 }
@@ -78,17 +96,22 @@ impl GuardConfig {
         Self::load(path).unwrap_or_default()
     }
 
+    /// ペア名は大文字小文字を区別せずに照合する（キーは画面で入力した表記のまま保存するため）
     pub fn max_spread_for(&self, pair: &str) -> f64 {
         self.max_spread_pips
-            .get(&pair.to_uppercase())
-            .or_else(|| self.max_spread_pips.get("default"))
-            .copied()
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(pair))
+            .or_else(|| self.max_spread_pips.get_key_value("default"))
+            .map(|(_, v)| *v)
             .unwrap_or(1.0)
     }
 
-    /// 発注ロット。risk_pct と pip_value_per_lot が設定されていれば SL 幅から算出。
-    pub fn volume_lots(&self, balance: f64, sl_pips: f64) -> f64 {
-        match (self.risk_pct, self.pip_value_per_lot) {
+    /// 発注ロット。risk_pct が設定されていれば SL 幅から算出する。
+    ///
+    /// 1 lot・1 pip の価値は `pip_value_per_lot`（設定での固定値）を優先し、無ければ
+    /// ブローカーのレートから求めた `live_pip_value` を使う。どちらも無ければ固定ロット。
+    pub fn volume_lots(&self, balance: f64, sl_pips: f64, live_pip_value: Option<f64>) -> f64 {
+        match (self.risk_pct, self.pip_value_per_lot.or(live_pip_value)) {
             (Some(r), Some(pv)) if sl_pips > 0.0 && pv > 0.0 => {
                 let risk_amount = balance * r / 100.0;
                 let lots = risk_amount / (sl_pips * pv);
@@ -97,6 +120,45 @@ impl GuardConfig {
             _ => self.fixed_volume_lots,
         }
         .max(0.01)
+    }
+
+    /// 画面から保存する前の値チェック。明らかに運用できない値だけを弾く
+    pub fn validate(&self) -> Result<()> {
+        let mut errs: Vec<String> = Vec::new();
+        let mut check = |ok: bool, msg: &str| {
+            if !ok {
+                errs.push(msg.to_string());
+            }
+        };
+        check((0.0..=1.0).contains(&self.min_confidence), "min_confidence は 0〜1");
+        check(self.min_rr > 0.0, "min_rr は 0 より大きい値");
+        check(self.sl_atr_min >= 0.0 && self.sl_atr_min <= self.sl_atr_max, "sl_atr_min は 0 以上かつ sl_atr_max 以下");
+        check(self.sl_min_pips >= 0.0, "sl_min_pips は 0 以上");
+        check(self.max_positions_per_pair >= 1, "max_positions_per_pair は 1 以上");
+        check(self.max_positions_total >= 1, "max_positions_total は 1 以上");
+        check(self.daily_loss_limit_pct > 0.0, "daily_loss_limit_pct は 0 より大きい値");
+        check(self.plan_max_hours > 0.0, "plan_max_hours は 0 より大きい値");
+        check(self.fixed_volume_lots >= 0.01, "fixed_volume_lots は 0.01 以上");
+        check(self.risk_pct.is_none_or(|r| r > 0.0 && r <= 10.0), "risk_pct は 0〜10（%）");
+        check(self.pip_value_per_lot.is_none_or(|v| v > 0.0), "pip_value_per_lot は 0 より大きい値");
+        check(self.max_spread_pips.values().all(|v| *v >= 0.0), "max_spread_pips は 0 以上");
+        check(self.news_blackout.iter().all(|b| parse_utc(&b.time).is_some()), "news_blackout.time は YYYY-MM-DD HH:MM:SS（UTC）");
+        check(self.news_blackout.iter().all(|b| b.before_min >= 0 && b.after_min >= 0), "news_blackout の前後分数は 0 以上");
+        check(self.hard_stop_atr > 0.0 && self.hard_stop_atr <= 10.0, "hard_stop_atr は 0 より大きく 10 以下");
+        if errs.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!(errs.join(" / "))
+        }
+    }
+
+    /// スプレッド上限のキーの前後の空白を除き、default だけ小文字にそろえる（銘柄名の表記は保つ）
+    pub fn normalize(&mut self) {
+        self.max_spread_pips = std::mem::take(&mut self.max_spread_pips)
+            .into_iter()
+            .map(|(k, v)| if k.trim().eq_ignore_ascii_case("default") { ("default".to_string(), v) } else { (k.trim().to_string(), v) })
+            .filter(|(k, _)| !k.is_empty())
+            .collect();
     }
 }
 
@@ -200,29 +262,11 @@ pub fn evaluate(decision: &TradeDecision, snapshot: &MarketSnapshot, ctx: &Guard
         check_environment(&mut c, snapshot, ctx, cfg, now);
     }
 
-    // 3. 条件付きプランの検証（成立時に同じ検証を再度通す前提で、構造と期限だけ見る）
+    // 3. 条件付きプランの検証（成立時は LLM の再判断が同じ検証を通るので、構造と期限だけ見る）
     if let Some(p) = plan {
         check_plan(&mut c, p, snapshot, cfg, now);
     }
 
-    c.finish()
-}
-
-/// 条件付きプランが成立した瞬間に、実際の成立価格で行う検証
-pub fn evaluate_plan_trigger(
-    plan: &ConditionalPlan,
-    entry: f64,
-    snapshot: &MarketSnapshot,
-    ctx: &GuardContext,
-    cfg: &GuardConfig,
-) -> GuardVerdict {
-    let mut c = Checker { checks: Vec::new() };
-    let now = ctx.now.or_else(|| snapshot_time(snapshot)).unwrap_or_else(Utc::now);
-    match (plan.stop_loss, plan.take_profit) {
-        (Some(sl), Some(tp)) => check_levels(&mut c, plan.then_action, entry, sl, tp, snapshot, cfg),
-        _ => c.add("NO_SL_TP", false, "plan.stop_loss / take_profit must be set"),
-    }
-    check_environment(&mut c, snapshot, ctx, cfg, now);
     c.finish()
 }
 
@@ -437,9 +481,6 @@ mod tests {
         let mut late = d.clone();
         late.conditional_plan.as_mut().unwrap().expires_at = "2026-09-16 12:00:00 UTC".into();
         assert!(evaluate(&late, &snap, &GuardContext::default(), &GuardConfig::default()).failed.contains(&"PLAN_EXPIRY".to_string()));
-
-        let tv = evaluate_plan_trigger(d.conditional_plan.as_ref().unwrap(), 154.11, &snap, &GuardContext::default(), &GuardConfig::default());
-        assert!(tv.passed, "{:?}", tv.failed);
     }
 
     #[test]
@@ -447,8 +488,41 @@ mod tests {
         let cfg = GuardConfig::load(concat!(env!("CARGO_MANIFEST_DIR"), "/config/guard.toml")).unwrap();
         assert_eq!(cfg.max_spread_for("eurusd"), 1.2);
         assert_eq!(cfg.max_spread_for("GBPUSD"), 1.0);
-        assert_eq!(cfg.volume_lots(1_000_000.0, 10.0), 0.01);
-        let sized = GuardConfig { risk_pct: Some(0.5), pip_value_per_lot: Some(1000.0), ..cfg };
-        assert!((sized.volume_lots(1_000_000.0, 10.0) - 0.5).abs() < 1e-9);
+        assert_eq!(cfg.volume_lots(1_000_000.0, 10.0, Some(1000.0)), 0.01);
+        let sized = GuardConfig { risk_pct: Some(0.5), pip_value_per_lot: Some(1000.0), ..cfg.clone() };
+        assert!((sized.volume_lots(1_000_000.0, 10.0, None) - 0.5).abs() < 1e-9);
+        // 固定値が無ければブローカーのレートから求めた pip 価値で算出する（EURUSD・USDJPY=150 なら 1500 円）
+        let live = GuardConfig { risk_pct: Some(0.5), pip_value_per_lot: None, ..cfg.clone() };
+        assert!((live.volume_lots(1_000_000.0, 10.0, Some(1500.0)) - 0.33).abs() < 1e-9);
+        assert_eq!(live.volume_lots(1_000_000.0, 10.0, None), 0.01);
+    }
+
+    #[test]
+    fn stop_mode_is_read_from_saved_settings_and_defaults_to_touch() {
+        let cfg: GuardConfig = serde_json::from_str(r#"{"stop_mode":"close","hard_stop_atr":2.5}"#).unwrap();
+        assert_eq!((cfg.stop_mode, cfg.hard_stop_atr), (StopMode::Close, 2.5));
+        // 項目追加前に保存された設定は従来どおり touch
+        let old: GuardConfig = serde_json::from_str(r#"{"min_rr":1.5}"#).unwrap();
+        assert_eq!(old.stop_mode, StopMode::Touch);
+        assert!(GuardConfig { hard_stop_atr: 0.0, ..GuardConfig::default() }.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_unusable_values() {
+        assert!(GuardConfig::default().validate().is_ok());
+        let bad = GuardConfig { min_confidence: 1.5, max_positions_total: 0, ..GuardConfig::default() };
+        let err = bad.validate().unwrap_err().to_string();
+        assert!(err.contains("min_confidence") && err.contains("max_positions_total"), "{err}");
+
+        let mut cfg = GuardConfig::default();
+        cfg.max_spread_pips.clear();
+        cfg.max_spread_pips.insert(" EURUSD_z ".into(), 1.2);
+        cfg.max_spread_pips.insert("DEFAULT".into(), 2.0);
+        cfg.normalize();
+        assert!(cfg.max_spread_pips.contains_key("EURUSD_z"));
+        assert_eq!(cfg.max_spread_for("EURUSD_z"), 1.2);
+        assert_eq!(cfg.max_spread_for("eurusd_Z"), 1.2);
+        assert_eq!(cfg.max_spread_for("EURUSD"), 2.0);
+        assert_eq!(cfg.max_spread_for("GBPUSD"), 2.0);
     }
 }

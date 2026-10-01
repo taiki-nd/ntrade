@@ -7,6 +7,7 @@
 //! cargo run --bin replay -- run        --pair USDJPY --from 2026-08-01 --to 2026-08-31 --step 15 --limit 200 --label "prompt-v3"
 //! cargo run --bin replay -- report     --run 1
 //! cargo run --bin replay -- diff       --run 1 --run 2
+//! cargo run --bin replay -- rescore    --run 1 --exit touch:0.5 --exit close:0:2
 //! cargo run --bin replay -- list
 //! ```
 
@@ -20,8 +21,9 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use ntrade::ctrader::{BarPeriod, CTraderConfig, CTraderService};
 use ntrade::guard::{GuardConfig, DEFAULT_GUARD_CONFIG_PATH};
 use ntrade::llm::{LlmClient, LlmClientConfig};
-use ntrade::replay::report::{build_report, format_diff, format_report};
-use ntrade::replay::{check_leak, ReplayConfig, ReplayRunner};
+use ntrade::replay::report::{build_report, format_compare, format_diff, format_report};
+use ntrade::replay::score::ExitRule;
+use ntrade::replay::{check_leak, rescore_run, ReplayConfig, ReplayRunner};
 use ntrade::storage::{Db, DEFAULT_DB_PATH};
 
 #[derive(Parser)]
@@ -93,6 +95,21 @@ enum Cmd {
         /// LLM モデル名（省略時は CLI デフォルト）
         #[arg(long)]
         model: Option<String>,
+        /// 決済ルール（touch / touch:<SLバッファATR倍> / close:<SLバッファ>:<ハードSL>）
+        #[arg(long, default_value = "touch", value_parser = parse_exit)]
+        exit: ExitRule,
+        /// 条件付きプランを成立時の終値で機械的に執行したとみなして採点する（再判断を入れる前の旧方式）。
+        /// 省略時は本番と同じく、成立した足で LLM に判断し直させる
+        #[arg(long)]
+        mechanical_plans: bool,
+    },
+    /// 保存済み run の判断を、LLM を呼ばずに別の決済ルールで採点し直す（ルールごとに新しい run を作る）
+    Rescore {
+        #[arg(long)]
+        run: i64,
+        /// 決済ルール（複数指定可）。例: --exit touch --exit touch:0.5 --exit close:0:2
+        #[arg(long = "exit", required = true, value_parser = parse_exit)]
+        exits: Vec<ExitRule>,
     },
     /// run の集計を表示
     Report {
@@ -143,7 +160,7 @@ async fn main() -> Result<()> {
             let n = check_leak(db.clone(), &pair, samples, &PathBuf::from("charts")).await?;
             println!("check-leak OK: {n} snapshots generated with no future data");
         }
-        Cmd::Run { pair, from, to, step, limit, label, parallel, max_bars, spread, resume, lesson, model } => {
+        Cmd::Run { pair, from, to, step, limit, label, parallel, max_bars, spread, resume, lesson, model, exit, mechanical_plans } => {
             let llm = Arc::new(LlmClient::new(LlmClientConfig { model, ..Default::default() }));
             let cfg = ReplayConfig {
                 pair,
@@ -158,6 +175,8 @@ async fn main() -> Result<()> {
                 max_bars_to_exit: max_bars,
                 chart_root: PathBuf::from("charts"),
                 lessons: lesson,
+                exit,
+                plan_rejudge: !mechanical_plans,
             };
             let guard = GuardConfig::load_or_default(DEFAULT_GUARD_CONFIG_PATH);
             let run_id = ReplayRunner::new(db.clone(), llm, cfg, guard).run(resume).await?;
@@ -172,6 +191,18 @@ async fn main() -> Result<()> {
             } else {
                 println!("{}", format_report(&r));
             }
+        }
+        Cmd::Rescore { run, exits } => {
+            let source_label = db.lock().unwrap().get_run(run)?.ok_or_else(|| anyhow!("run {run} not found"))?.label;
+            let mut reports = vec![build_report(run, &db.lock().unwrap().decisions(run)?)];
+            println!("{:<8} {}", format!("#{run}"), "(source)");
+            for exit in exits {
+                let label = format!("{source_label} [{}]", exit.label()).trim().to_string();
+                let id = rescore_run(&db, run, exit, &label)?;
+                println!("{:<8} {}", format!("#{id}"), exit.label());
+                reports.push(build_report(id, &db.lock().unwrap().decisions(id)?));
+            }
+            println!("\n{}", format_compare(&reports));
         }
         Cmd::Diff { run } => {
             let d = db.lock().unwrap();
@@ -197,6 +228,10 @@ fn parse_date(s: &str) -> Result<DateTime<Utc>> {
     }
     let secs = ntrade::storage::parse_ts(s)?;
     Utc.timestamp_opt(secs, 0).single().ok_or_else(|| anyhow!("bad date {s}"))
+}
+
+fn parse_exit(s: &str) -> Result<ExitRule, String> {
+    ExitRule::parse(s).ok_or_else(|| format!("invalid exit rule '{s}' (touch / touch:0.5 / close:0.5:2)"))
 }
 
 fn print_coverage(db: &Arc<Mutex<Db>>) -> Result<()> {

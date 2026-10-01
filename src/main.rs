@@ -59,11 +59,12 @@ async fn main() -> Result<()> {
     info!("  - GET  /api/trades");
     info!("  - GET  /api/cot");
     info!("  - GET  /api/lessons");
-    info!("  - GET  /api/chart/latest?tf=4H|1H|15M|5M");
-    info!("  - GET  /api/snapshot/latest");
-    info!("  - POST /api/decide");
+    info!("  - GET  /api/chart/latest?tf=4H|1H|15M|5M&pair=USDJPY");
+    info!("  - GET  /api/snapshot/latest?pair=USDJPY");
+    info!("  - POST /api/decide?pair=USDJPY");
     info!("  - GET  /api/plans, DELETE /api/plans/:id");
     info!("  - GET  /api/guard/config");
+    info!("  - GET  /api/settings, PUT /api/settings");
     info!("  - GET  /api/replay/runs, /api/replay/runs/:id, /api/replay/coverage");
     info!("  - GET  /api/auth/ctrader/url");
     info!("  - POST /api/auth/ctrader/exchange");

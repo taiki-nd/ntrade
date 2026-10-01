@@ -174,7 +174,11 @@ export function BotControlHeader({
             />
             <Stat
               label="スプレッド"
-              value={`UJ ${metrics.usdjpySpread} / EU ${metrics.eurusdSpread}`}
+              value={
+                Object.entries(metrics.spreads ?? {})
+                  .map(([pair, v]) => `${pair} ${v}`)
+                  .join(" / ") || "-"
+              }
               sub="pips"
             />
           </div>

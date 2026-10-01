@@ -5,6 +5,7 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { LineChart, RefreshCw, Image as ImageIcon, LayoutGrid, Loader2 } from "lucide-react";
 import {
   tradingApi,
@@ -25,21 +26,21 @@ function fmt(v: number | null | undefined, digits = 1): string {
   return v === null || v === undefined ? "-" : v.toFixed(digits);
 }
 
+const NO_ERRORS: Record<ChartTimeframe, boolean> = { "4H": false, "1H": false, "15M": false, "5M": false };
+
 export function ChartPreview() {
   const [mode, setMode] = React.useState<"tabs" | "grid">("tabs");
   const [cacheKey, setCacheKey] = React.useState<number>(0);
   const [snapshot, setSnapshot] = React.useState<MarketSnapshot | null>(null);
   const [isRegenerating, setIsRegenerating] = React.useState<boolean>(false);
-  const [errored, setErrored] = React.useState<Record<ChartTimeframe, boolean>>({
-    "4H": false,
-    "1H": false,
-    "15M": false,
-    "5M": false,
-  });
+  const [errored, setErrored] = React.useState<Record<ChartTimeframe, boolean>>(NO_ERRORS);
+  /** 設定の対象ペア。先頭が既定 */
+  const [pairs, setPairs] = React.useState<string[]>([]);
+  const [pair, setPair] = React.useState<string>("");
 
-  const loadSnapshot = React.useCallback(async () => {
+  const loadSnapshot = React.useCallback(async (target: string) => {
     try {
-      const res = await tradingApi.getLatestSnapshot();
+      const res = await tradingApi.getLatestSnapshot(target || undefined);
       if (res.success && res.data) setSnapshot(res.data);
     } catch {
       // エンジン未起動時は静かに無視（画像側の onError で表示される）
@@ -47,31 +48,44 @@ export function ChartPreview() {
   }, []);
 
   React.useEffect(() => {
-    setCacheKey(Date.now());
     let cancelled = false;
     tradingApi
-      .getLatestSnapshot()
-      .then((res) => {
-        if (!cancelled && res.success && res.data) setSnapshot(res.data);
+      .getSettings()
+      .then(async (res) => {
+        if (cancelled || !res.success || !res.data) return;
+        const first = res.data.pairs[0] ?? "";
+        setPairs(res.data.pairs);
+        setPair(first);
+        setCacheKey(Date.now());
+        const snap = await tradingApi.getLatestSnapshot(first || undefined);
+        if (!cancelled && snap.success && snap.data) setSnapshot(snap.data);
       })
       .catch(() => {
-        // エンジン未起動時は静かに無視
+        // エンジン未起動時は静かに無視（画像側の onError で表示される）
       });
     return () => {
       cancelled = true;
     };
   }, []);
 
+  /** ペアを切り替えて、そのペアの Snapshot と画像を読み直す */
+  const selectPair = (next: string) => {
+    setPair(next);
+    setSnapshot(null);
+    setErrored(NO_ERRORS);
+    setCacheKey(Date.now());
+    void loadSnapshot(next);
+  };
 
   const handleRegenerate = async () => {
     try {
       setIsRegenerating(true);
-      const res = await tradingApi.generateChart();
+      const res = await tradingApi.generateChart(pair || undefined);
       if (res.success) {
         setCacheKey(Date.now());
-        setErrored({ "4H": false, "1H": false, "15M": false, "5M": false });
-        await loadSnapshot();
-        toast.success("Snapshot を再生成しました", {
+        setErrored(NO_ERRORS);
+        await loadSnapshot(pair);
+        toast.success(`${pair} の Snapshot を再生成しました`, {
           description: "4H / 1H / 15M / 5M の画像と客観的事実JSONが更新されました。",
         });
       } else {
@@ -100,8 +114,8 @@ export function ChartPreview() {
       ) : (
         // eslint-disable-next-line @next/next/no-img-element
         <img
-          src={tradingApi.getLatestChartUrl(tf, cacheKey)}
-          alt={`${tf} chart`}
+          src={tradingApi.getLatestChartUrl(tf, cacheKey, pair)}
+          alt={`${pair} ${tf} chart`}
           className="w-full h-auto object-contain"
           onError={() => setErrored((e) => ({ ...e, [tf]: true }))}
         />
@@ -124,6 +138,20 @@ export function ChartPreview() {
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
+          {pairs.length > 1 && (
+            <Select value={pair} items={Object.fromEntries(pairs.map((p) => [p, p]))} onValueChange={(v) => selectPair(String(v ?? ""))}>
+              <SelectTrigger size="sm" className="h-8 w-28 text-xs">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {pairs.map((p) => (
+                  <SelectItem key={p} value={p}>
+                    {p}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          )}
           <div className="flex items-center rounded-lg border bg-muted/50 p-0.5">
             <Button
               type="button"

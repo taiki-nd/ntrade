@@ -4,6 +4,7 @@ import * as React from "react";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Hourglass, Play, Loader2, Trash2 } from "lucide-react";
 import { tradingApi, type PendingPlan } from "@/lib/trading-api";
 import { toast } from "sonner";
@@ -16,6 +17,26 @@ interface PlanMonitorProps {
 export function PlanMonitor({ onDecided }: PlanMonitorProps) {
   const [plans, setPlans] = React.useState<PendingPlan[]>([]);
   const [deciding, setDeciding] = React.useState(false);
+  /** 設定の対象ペア。「今すぐ判断」をどのペアで回すか */
+  const [pairs, setPairs] = React.useState<string[]>([]);
+  const [pair, setPair] = React.useState<string>("");
+
+  React.useEffect(() => {
+    let cancelled = false;
+    tradingApi
+      .getSettings()
+      .then((res) => {
+        if (cancelled || !res.success || !res.data) return;
+        setPairs(res.data.pairs);
+        setPair((cur) => cur || res.data!.pairs[0] || "");
+      })
+      .catch(() => {
+        // エンジン未起動時は無視
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const load = React.useCallback(async () => {
     try {
@@ -38,7 +59,7 @@ export function PlanMonitor({ onDecided }: PlanMonitorProps) {
   const handleDecide = async () => {
     setDeciding(true);
     try {
-      const res = await tradingApi.decideNow();
+      const res = await tradingApi.decideNow(pair || undefined);
       if (res.success && res.data) {
         const d = res.data;
         const guard = d.guard.passed ? "ガード通過" : `ガード: ${d.guard.failed.join(", ")}`;
@@ -47,7 +68,7 @@ export function PlanMonitor({ onDecided }: PlanMonitorProps) {
           : d.plan_id
             ? "条件付きプランを登録"
             : "見送り";
-        toast.info(`判断: ${d.decision.action} (確信度 ${d.decision.confidence.toFixed(2)})`, {
+        toast.info(`${pair ? `${pair} ` : ""}判断: ${d.decision.action} (確信度 ${d.decision.confidence.toFixed(2)})`, {
           description: `${what} / ${guard}`,
         });
         await load();
@@ -83,13 +104,29 @@ export function PlanMonitor({ onDecided }: PlanMonitorProps) {
             <span>条件付きプラン</span>
           </CardTitle>
           <CardDescription className="text-xs">
-            LLM が「待ち」と判断した条件。5M 確定ごとにプログラムが評価し、成立時はガードを通して執行。
+            LLM が「待ち」と判断した条件。5M 確定ごとにプログラムが評価し、成立したら LLM が今の価格で入るかを判断し直す。
           </CardDescription>
         </div>
-        <Button size="sm" onClick={handleDecide} disabled={deciding} className="h-8 gap-1.5 text-xs">
-          {deciding ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
-          今すぐ判断
-        </Button>
+        <div className="flex items-center gap-2">
+          {pairs.length > 1 && (
+            <Select value={pair} items={Object.fromEntries(pairs.map((p) => [p, p]))} onValueChange={(v) => setPair(String(v ?? ""))}>
+              <SelectTrigger size="sm" className="h-8 w-28 text-xs">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {pairs.map((p) => (
+                  <SelectItem key={p} value={p}>
+                    {p}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          )}
+          <Button size="sm" onClick={handleDecide} disabled={deciding} className="h-8 gap-1.5 text-xs">
+            {deciding ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
+            今すぐ判断
+          </Button>
+        </div>
       </CardHeader>
       <CardContent className="space-y-3">
         {plans.length === 0 ? (

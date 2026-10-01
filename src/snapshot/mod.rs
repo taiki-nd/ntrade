@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 use crate::chart::{ChartPlotter, ChartPlotterConfig, PriceLevel, TimeframeChart};
 use crate::ctrader::CandleBar;
+use crate::strategy::types::ConditionalPlan;
 use measures::*;
 
 /// 生OHLC 1本（コンパクト表現）
@@ -99,10 +100,28 @@ pub struct RecentDecision {
     pub summary: String,
 }
 
+/// 前回までに立てた条件付きプランが、直近の確定 5M 足で成立したことの通知。
+///
+/// プランは成立しても自動では発注しない。成立足の終値はプランを立てた時の想定価格（`trigger_price`）から
+/// ずれるので、この通知を添えて「今の価格で入るか」を LLM に判断し直させる。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TriggeredPlan {
+    /// プランを立てた判断の時刻
+    pub planned_at: String,
+    /// 成立した 5M 足の開始時刻
+    pub triggered_bar: String,
+    /// 成立した 5M 足の終値
+    pub triggered_close: f64,
+    pub plan: ConditionalPlan,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AccountState {
     pub open_positions: Vec<OpenPositionSummary>,
     pub recent_decisions: Vec<RecentDecision>,
+    /// 直近の確定足で成立した条件付きプラン（無ければ JSON に出さない）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub triggered_plan: Option<TriggeredPlan>,
 }
 
 /// LLM に渡す客観的事実の集合

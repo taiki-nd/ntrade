@@ -33,14 +33,9 @@ pub async fn get_status(State(state): State<AppState>) -> Json<AccountMetrics> {
     metrics.free_margin = metrics.equity - metrics.margin;
     metrics.bot_state = *state.bot_state.read().await;
 
-    // 直近 Snapshot のスプレッドを反映
-    if let Some(bundle) = state.latest_snapshot.read().await.as_ref() {
-        let snap = &bundle.snapshot;
-        match snap.pair.to_uppercase().as_str() {
-            "USDJPY" => metrics.usdjpy_spread = snap.spread_pips,
-            "EURUSD" => metrics.eurusd_spread = snap.spread_pips,
-            _ => {}
-        }
+    // ペアごとの直近 Snapshot のスプレッドを反映
+    for (pair, bundle) in state.latest_snapshots.read().await.iter() {
+        metrics.spreads.insert(pair.clone(), bundle.snapshot.spread_pips);
     }
 
     if let Some(ctrader) = ctrader_opt {

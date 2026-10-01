@@ -16,6 +16,10 @@ pub struct Bucket {
     pub win_rate: Option<f64>,
     pub avg_pnl_pips: Option<f64>,
     pub total_pnl_pips: f64,
+    pub gross_win_pips: f64,
+    pub gross_loss_pips: f64,
+    /// 総利益 / 総損失。損失ゼロなら None
+    pub profit_factor: Option<f64>,
 }
 
 impl Bucket {
@@ -30,6 +34,11 @@ impl Bucket {
         }
         if let Some(p) = d.pnl_pips {
             self.total_pnl_pips += p;
+            if p > 0.0 {
+                self.gross_win_pips += p;
+            } else {
+                self.gross_loss_pips -= p;
+            }
         }
     }
 
@@ -37,6 +46,9 @@ impl Bucket {
         if self.trades > 0 {
             self.win_rate = Some(self.tp_hit as f64 / self.trades as f64);
             self.avg_pnl_pips = Some(self.total_pnl_pips / self.trades as f64);
+        }
+        if self.gross_loss_pips > 0.0 {
+            self.profit_factor = Some(self.gross_win_pips / self.gross_loss_pips);
         }
     }
 }
@@ -91,7 +103,9 @@ pub fn build_report(run_id: i64, rows: &[ReplayDecisionRow]) -> Report {
         let v: serde_json::Value = serde_json::from_str(&d.decision_json).unwrap_or_default();
         if v.get("conditional_plan").map(|p| !p.is_null()).unwrap_or(false) {
             plans += 1;
-            if matches!(d.outcome.as_str(), "TP_HIT" | "SL_HIT" | "SAME_BAR" | "TIMEOUT") && d.action == "HOLD" {
+            if matches!(d.outcome.as_str(), "TP_HIT" | "SL_HIT" | "SAME_BAR" | "TIMEOUT" | "PLAN_DECLINED" | "PLAN_REJECTED")
+                && d.action == "HOLD"
+            {
                 plan_triggered += 1;
             }
         }
@@ -102,7 +116,14 @@ pub fn build_report(run_id: i64, rows: &[ReplayDecisionRow]) -> Report {
         if d.guard_result == "PASS" {
             guard_pass += 1;
             overall.add(d);
-            let lo = ((d.confidence * 10.0).floor() / 10.0).clamp(0.0, 0.9);
+            // プラン成立の再判断で入った取引は、入ると決めた再判断の確信度で分ける
+            let confidence = d
+                .followup_json
+                .as_deref()
+                .and_then(|f| serde_json::from_str::<serde_json::Value>(f).ok())
+                .and_then(|f| f.pointer("/decision/confidence").and_then(|c| c.as_f64()))
+                .unwrap_or(d.confidence);
+            let lo = ((confidence * 10.0).floor() / 10.0).clamp(0.0, 0.9);
             let key = format!("{:.1}-{:.1}", lo, lo + 0.1);
             by_confidence.entry(key).or_default().add(d);
             by_session.entry(d.session.clone()).or_default().add(d);
@@ -154,7 +175,7 @@ pub fn format_report(r: &Report) -> String {
 
     let row = |label: &str, b: &Bucket| {
         format!(
-            "{:<12} n={:<4} trades={:<4} tp={:<4} sl={:<4} same={:<3} to={:<4} win={:<6} avg={:<8} total={:.1}\n",
+            "{:<12} n={:<4} trades={:<4} tp={:<4} sl={:<4} same={:<3} to={:<4} win={:<6} avg={:<8} pf={:<6} total={:.1}\n",
             label,
             b.n,
             b.trades,
@@ -164,6 +185,7 @@ pub fn format_report(r: &Report) -> String {
             b.timeout,
             b.win_rate.map(|w| format!("{:.2}", w)).unwrap_or("-".into()),
             b.avg_pnl_pips.map(|w| format!("{:.1}", w)).unwrap_or("-".into()),
+            b.profit_factor.map(|w| format!("{:.2}", w)).unwrap_or("-".into()),
             b.total_pnl_pips
         )
     };
@@ -177,22 +199,36 @@ pub fn format_report(r: &Report) -> String {
     s
 }
 
-/// 2つのレポートの差分（B - A）を主要指標だけ並べる
-pub fn format_diff(a: &Report, b: &Report) -> String {
+/// 複数のレポートの主要指標を横に並べる（`diff` と `rescore` で使う）
+pub fn format_compare(reports: &[Report]) -> String {
     let f = |x: Option<f64>| x.map(|v| format!("{:.2}", v)).unwrap_or("-".into());
     let mut s = String::new();
-    s.push_str(&format!("{:<22} {:>10} {:>10}\n", "metric", format!("run#{}", a.run_id), format!("run#{}", b.run_id)));
-    s.push_str(&format!("{:<22} {:>10} {:>10}\n", "decisions", a.total, b.total));
-    s.push_str(&format!("{:<22} {:>10} {:>10}\n", "guard_pass", a.guard_pass, b.guard_pass));
-    s.push_str(&format!("{:<22} {:>10} {:>10}\n", "trades", a.overall.trades, b.overall.trades));
-    s.push_str(&format!("{:<22} {:>10} {:>10}\n", "win_rate", f(a.overall.win_rate), f(b.overall.win_rate)));
-    s.push_str(&format!("{:<22} {:>10} {:>10}\n", "avg_pnl_pips", f(a.overall.avg_pnl_pips), f(b.overall.avg_pnl_pips)));
-    s.push_str(&format!("{:<22} {:>10.1} {:>10.1}\n", "total_pnl_pips", a.overall.total_pnl_pips, b.overall.total_pnl_pips));
-    s.push_str(&format!("{:<22} {:>10.2} {:>10.2}\n", "hold_rate", a.hold_rate, b.hold_rate));
-    s.push_str(&format!("{:<22} {:>10.2} {:>10.2}\n", "plan_rate", a.plan_rate, b.plan_rate));
-    s.push_str(&format!("{:<22} {:>10.2} {:>10.2}\n", "unobserved_rate", a.unobserved_rate, b.unobserved_rate));
-    s.push_str(&format!("{:<22} {:>10.2} {:>10.2}\n", "conflicts_empty_rate", a.conflicts_empty_rate, b.conflicts_empty_rate));
+    let mut line = |name: &str, cell: &dyn Fn(&Report) -> String| {
+        s.push_str(&format!("{:<22}", name));
+        for r in reports {
+            s.push_str(&format!(" {:>10}", cell(r)));
+        }
+        s.push('\n');
+    };
+    line("metric", &|r| format!("run#{}", r.run_id));
+    line("decisions", &|r| r.total.to_string());
+    line("guard_pass", &|r| r.guard_pass.to_string());
+    line("trades", &|r| r.overall.trades.to_string());
+    line("win_rate", &|r| f(r.overall.win_rate));
+    line("avg_pnl_pips", &|r| f(r.overall.avg_pnl_pips));
+    line("profit_factor", &|r| f(r.overall.profit_factor));
+    line("total_pnl_pips", &|r| format!("{:.1}", r.overall.total_pnl_pips));
+    line("rejected_total_pips", &|r| format!("{:.1}", r.rejected.total_pnl_pips));
+    line("hold_rate", &|r| format!("{:.2}", r.hold_rate));
+    line("plan_rate", &|r| format!("{:.2}", r.plan_rate));
+    line("unobserved_rate", &|r| format!("{:.2}", r.unobserved_rate));
+    line("conflicts_empty_rate", &|r| format!("{:.2}", r.conflicts_empty_rate));
     s
+}
+
+/// 2つのレポートの主要指標を並べる
+pub fn format_diff(a: &Report, b: &Report) -> String {
+    format_compare(&[a.clone(), b.clone()])
 }
 
 #[cfg(test)]
@@ -212,6 +248,7 @@ mod tests {
             session: "LONDON".into(),
             confidence: conf,
             action: action.into(),
+            followup_json: None,
         }
     }
 
@@ -228,6 +265,7 @@ mod tests {
         assert_eq!(r.guard_pass, 3);
         assert_eq!(r.overall.trades, 2);
         assert_eq!(r.overall.win_rate, Some(0.5));
+        assert_eq!(r.overall.profit_factor, Some(2.0));
         assert_eq!(r.by_confidence["0.8-0.9"].trades, 2);
         assert_eq!(r.rejected.trades, 1);
         assert!((r.unobserved_rate - 0.25).abs() < 1e-9);

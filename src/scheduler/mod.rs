@@ -1,30 +1,22 @@
-//! 常駐スケジューラ: 5分足確定ごとに判断サイクルを回し、ポジション同期と自己反省を行う。
+//! 常駐スケジューラ: 5分足確定ごとに全ペアの判断サイクルを並行に回し、ポジション同期と自己反省を行う。
+//!
+//! 対象ペアと足確定後の待ち秒数は取引設定（`settings::TradingSettings`、画面から変更可）を
+//! 毎サイクル読み直すので、変更は再起動なしで次の足から反映される。
 //!
 //! 環境変数:
 //! - `NTRADE_SCHEDULER=off`      … ループを起動しない
-//! - `NTRADE_PAIRS=USDJPY,EURUSD` … 対象ペア（既定 USDJPY）
-//! - `NTRADE_BAR_DELAY_SECS=15`  … 足確定からデータ取得までの待ち秒数
-//! - `NTRADE_LIVE_ORDERS=1`      … cTrader 接続時に実発注へ切り替え（既定はペーパー）
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use tracing::{info, warn};
 
 use crate::ctrader::{BarPeriod, CandleBar};
 use crate::reflection;
-use crate::server::handlers::decide::run_decision_cycle;
+use crate::server::handlers::decide::run_cycle_locked;
 use crate::server::state::AppState;
 use crate::server::types::{BotState, CloseReason, LessonLearned, TradeHistory};
 
 pub const LESSON_ADOPT_THRESHOLD: usize = 3;
 pub const LESSON_MAX_ACTIVE: usize = 10;
-
-pub fn pairs_from_env() -> Vec<String> {
-    std::env::var("NTRADE_PAIRS")
-        .ok()
-        .map(|s| s.split(',').map(|p| p.trim().to_uppercase()).filter(|p| !p.is_empty()).collect())
-        .filter(|v: &Vec<String>| !v.is_empty())
-        .unwrap_or_else(|| vec!["USDJPY".to_string()])
-}
 
 /// 次の 5M 境界 + 遅延
 pub fn next_tick(now: DateTime<Utc>, delay_secs: i64) -> DateTime<Utc> {
@@ -34,11 +26,13 @@ pub fn next_tick(now: DateTime<Utc>, delay_secs: i64) -> DateTime<Utc> {
 }
 
 pub async fn run(state: AppState) {
-    let pairs = pairs_from_env();
-    let delay: i64 = std::env::var("NTRADE_BAR_DELAY_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(15);
-    info!(?pairs, delay, "scheduler started (5M cadence)");
+    {
+        let s = state.settings.read().await;
+        info!(pairs = ?s.pairs, delay = s.bar_delay_secs, "scheduler started (5M cadence)");
+    }
 
     loop {
+        let delay = state.settings.read().await.bar_delay_secs;
         let now = Utc::now();
         let at = next_tick(now, delay);
         let wait = (at - now).to_std().unwrap_or_default();
@@ -55,16 +49,26 @@ pub async fn run(state: AppState) {
             continue;
         }
 
-        for pair in &pairs {
-            let _serial = state.decide_lock.lock().await;
-            match run_decision_cycle(&state, pair).await {
-                Ok(r) => info!(pair, action = ?r.decision.action, guard = r.guard.passed, executed = r.executed, "cycle ok"),
-                Err(e) => warn!(pair, "cycle failed: {e:#}"),
+        // ペアごとに並行に回す。発注まわりの排他は run_cycle_locked / order_lock 側で取る
+        let pairs = state.pairs().await;
+        let mut cycles = tokio::task::JoinSet::new();
+        for pair in pairs {
+            let state = state.clone();
+            cycles.spawn(async move {
+                match run_cycle_locked(&state, &pair).await {
+                    Ok(r) => info!(pair, action = ?r.decision.action, guard = r.guard.passed, executed = r.executed, "cycle ok"),
+                    Err(e) => warn!(pair, "cycle failed: {e:#}"),
+                }
+            });
+        }
+        while let Some(res) = cycles.join_next().await {
+            if let Err(e) = res {
+                warn!("cycle task panicked: {e}");
             }
-            drop(_serial);
-            if let Err(e) = after_cycle(&state, pair).await {
-                warn!(pair, "post-cycle sync failed: {e:#}");
-            }
+        }
+
+        if let Err(e) = after_cycle(&state).await {
+            warn!("post-cycle sync failed: {e:#}");
         }
     }
 }
@@ -72,7 +76,7 @@ pub async fn run(state: AppState) {
 /// サイクル後: ブローカー同期 → 決済トレードの自己反省
 ///
 /// 照合そのものは `AppState::reconcile_positions`（常駐ループと共有）に任せる。
-pub async fn after_cycle(state: &AppState, _pair: &str) -> anyhow::Result<()> {
+pub async fn after_cycle(state: &AppState) -> anyhow::Result<()> {
     let closed = state.reconcile_positions().await?;
     reflect_on_closed(state, closed).await;
     Ok(())
@@ -81,7 +85,7 @@ pub async fn after_cycle(state: &AppState, _pair: &str) -> anyhow::Result<()> {
 /// 確定した決済の自己反省（損切りのみ。判断ログとエントリー後の足を渡す）。
 /// 決済は判断サイクルと照合ループのどちらからでも確定しうるので、両方からここを通す。
 pub async fn reflect_on_closed(state: &AppState, closed: Vec<TradeHistory>) {
-    for t in closed.into_iter().filter(|t| matches!(t.close_reason, CloseReason::StopLoss)) {
+    for t in closed.into_iter().filter(|t| matches!(t.close_reason, CloseReason::StopLoss | CloseReason::Invalidated)) {
         let state = state.clone();
         let post_bars: Vec<CandleBar> = {
             let db = state.ctrader_service.read().await.clone();
@@ -91,14 +95,15 @@ pub async fn reflect_on_closed(state: &AppState, closed: Vec<TradeHistory>) {
             }
         };
         tokio::spawn(async move {
-            // 反省の材料は LLM の判断そのもの。成立ログは機械的な記録なので元の判断まで辿る
+            // 反省の材料は LLM の判断そのもの。プラン成立の再判断はそれ自体が LLM 判断なのでそのまま使い、
+            // 旧データの機械的な成立ログ（cot-plan-*）だけ元の判断まで辿る
             let cot = match t.cot_log_id.clone() {
                 Some(id) => state
                     .with_db(move |db| {
                         let Some(log) = db.cot_log(&id)? else { return Ok(None) };
                         match log.origin_cot_log_id.as_deref() {
-                            Some(origin) => Ok(db.cot_log(origin)?.or(Some(log))),
-                            None => Ok(Some(log)),
+                            Some(origin) if log.id.starts_with("cot-plan-") => Ok(db.cot_log(origin)?.or(Some(log))),
+                            _ => Ok(Some(log)),
                         }
                     })
                     .await

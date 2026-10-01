@@ -74,7 +74,7 @@ CREATE TABLE bars_history (
 
 - **初期方針**: 15分おき（各15M確定時）にサンプリング。3ヶ月で約 8,600 回/ペア。
 - **さらに絞る場合**: セッション（東京・ロンドン・NY）ごとに均等に抽出し、合計 1,000〜2,000 回程度から始めます。
-- **条件付きプランの評価**: LLMが `conditional_plan` を返した場合、次の評価時刻を待たずに、以降の5M足で `wait_for` / `invalidate_if` / `expires_at` を機械的に評価し、成立時点をエントリーとして採点します。これは本番の `executor` と同じロジックです。
+- **条件付きプランの評価**: LLMが `conditional_plan` を返した場合、次の評価時刻を待たずに、以降の5M足で `wait_for` / `invalidate_if` / `expires_at` を機械的に評価します（本番の `executor` と同じロジック）。成立したら、成立足の確定時刻で Snapshot を作り直し、`account_state.triggered_plan` を添えて LLM に判断し直させ、その判断を採点します（本番の判断サイクルと同じ）。再判断が新たに立てたプランは追いません。`run --mechanical-plans` を付けると、成立足の終値でプランの SL/TP のまま入ったとみなす旧方式で採点します。
 - **並列化**: `claude -p` の同時実行数はレート制限に合わせて設定値で制御します（初期値: 2）。
 
 ---
@@ -93,9 +93,22 @@ CREATE TABLE bars_history (
 
 同一足内の到達順序は5Mバーでは判別できないため、`SAME_BAR` は不利側に倒します。
 
+### 決済ルール（`--exit`）
+LLMの判断はそのままにして、SLの執行方法だけを変えて採点できます。数値は判断時刻の ATR(5M,14) に対する倍率です。
+
+| 指定 | 意味 |
+| :--- | :--- |
+| `touch`（既定） | ヒゲがSLに触れたらSL価格で決済。ブローカーにSLを置く今の本番と同じ |
+| `touch:0.5` | SLを 0.5×ATR だけ外側へずらし、ヒゲで判定 |
+| `close:0.5:2` | 5M確定足の終値が「SL + 0.5×ATR」を越えたらその終値で決済。さらに 2×ATR 外側にハードSL（ヒゲ判定）を置く |
+
+プロンプトは損切りを「実体で抜けたら無効になる価格」と定義しています。`close` はこの定義にそのまま合わせた執行方法です。TP と損切りが同じ足で起きた場合は、どのモードでも不利側に倒します。
+
+`rescore` を使うと、保存済みの run の判断を LLM を呼ばずに別のルールで採点し直せます。ルールごとに新しい run として保存され、主要指標が横に並んで表示されます。LLMの呼び出しは1回分で済み、決済ルールの比較には追加コストがかかりません。
+
 ### 見送り判断（HOLD）
 - HOLD 自体は採点しませんが、「HOLDした時刻の直後に大きく動いたか」を記録し、**見送りすぎ**の傾向を把握します。
-- 条件付きプランは、成立した場合はエントリー判断として採点し、期限切れ・無効化は `PLAN_EXPIRED` / `PLAN_INVALIDATED` として記録します。
+- 条件付きプランは、成立後の再判断で入った場合はその判断の価格・SL/TP で採点します。再判断が HOLD なら `PLAN_DECLINED`、入ろうとしてガードで止まれば `PLAN_REJECTED`、期限切れ・無効化は `PLAN_EXPIRED` / `PLAN_INVALIDATED` として記録します。再判断は `replay_decisions.followup_json` に残り、`rescore` もこれを使って採点し直します。
 
 ### 判断品質の補助指標
 - **観測整合**: `observed` の時刻が実際の最新足と一致するか。不一致は `UNOBSERVED` として別集計し、勝率計算からは除外します。
@@ -152,6 +165,7 @@ cargo run --bin replay -- fetch  --pair USDJPY --from 2026-06-01 --to 2026-09-01
 cargo run --bin replay -- run    --pair USDJPY --from 2026-06-01 --to 2026-07-31 --sampling 15m --label "prompt-v3"
 cargo run --bin replay -- report --run 12
 cargo run --bin replay -- diff   --run 11 --run 12
+cargo run --bin replay -- rescore --run 12 --exit touch:0.5 --exit touch:1 --exit close:0:2   # 決済ルール比較
 cargo run --bin replay -- check-leak --pair USDJPY --samples 200   # 未来漏れテスト
 ```
 
