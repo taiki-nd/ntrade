@@ -88,8 +88,8 @@ export function CoTViewer({ logs, pagination, search }: CoTViewerProps) {
                       <span className="truncate">{log.timestamp}</span>
                     </span>
                   </div>
-                  <p className="text-xs text-muted-foreground truncate mt-0.5" title={log.orderFlow}>
-                    {log.orderFlow}
+                  <p className="text-xs text-muted-foreground truncate mt-0.5" title={log.fundamentalView || log.orderFlow}>
+                    {log.fundamentalView || log.orderFlow}
                   </p>
                 </div>
               </div>

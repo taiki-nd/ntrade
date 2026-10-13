@@ -80,6 +80,7 @@ mod tests {
             stop_loss: None,
             take_profit: None,
             risk_reward_ratio: None,
+            fundamental_view: "f".into(),
             macro_context: "m".into(),
             order_flow: "o".into(),
             invalidation: "i".into(),

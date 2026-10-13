@@ -23,8 +23,19 @@ pub struct TradingSettings {
     pub pairs: Vec<String>,
     /// 5M 足確定からデータ取得までの待ち秒数
     pub bar_delay_secs: i64,
+    /// LLM に判断させる間隔（分。5 の倍数、UTC 0:00 起点）。条件付きプランと終値判定の損切りは
+    /// この間隔に関係なく 5M 足ごとに評価し、プランが成立したらその足で判断する
+    #[serde(default = "default_decision_interval")]
+    pub decision_interval_minutes: u32,
+    /// 重要指標の発表直後（5M 足 1 本確定後）に、判断間隔を待たずに判断する（既定はオフ）
+    #[serde(default)]
+    pub event_decisions: bool,
     /// 事後ガード（キーは snake_case のまま）
     pub guard: GuardConfig,
+}
+
+fn default_decision_interval() -> u32 {
+    std::env::var("NTRADE_DECISION_INTERVAL_MIN").ok().and_then(|s| s.parse().ok()).unwrap_or(5)
 }
 
 /// 初期値のペア。`NTRADE_PAIRS` は素の名前で書かれていることがあるので、`CTRADER_SYMBOL_SUFFIX` が
@@ -67,6 +78,8 @@ impl TradingSettings {
         Self {
             pairs: pairs_from_env(),
             bar_delay_secs: std::env::var("NTRADE_BAR_DELAY_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(15),
+            decision_interval_minutes: default_decision_interval(),
+            event_decisions: false,
             guard: GuardConfig::load_or_default(DEFAULT_GUARD_CONFIG_PATH),
         }
     }
@@ -86,7 +99,17 @@ impl TradingSettings {
         if !(0..=240).contains(&self.bar_delay_secs) {
             anyhow::bail!("足確定後の待ち秒数は 0〜240 秒");
         }
+        if self.decision_interval_minutes == 0 || !self.decision_interval_minutes.is_multiple_of(5) || self.decision_interval_minutes > 1440 {
+            anyhow::bail!("判断間隔は 5〜1440 分の 5 の倍数");
+        }
         self.guard.validate()
+    }
+
+    /// この 5M 足確定（`tick`）で LLM に判断させるか
+    pub fn is_decision_tick(&self, tick: chrono::DateTime<chrono::Utc>) -> bool {
+        use chrono::Timelike;
+        let minute_of_day = tick.hour() * 60 + tick.minute();
+        minute_of_day.is_multiple_of(self.decision_interval_minutes.max(5))
     }
 
     pub fn default_pair(&self) -> String {
@@ -136,7 +159,7 @@ mod tests {
 
     #[test]
     fn validate_requires_pairs_and_sane_guard() {
-        let mut s = TradingSettings { pairs: vec![], bar_delay_secs: 15, guard: GuardConfig::default() };
+        let mut s = TradingSettings { pairs: vec![], bar_delay_secs: 15, decision_interval_minutes: 5, event_decisions: true, guard: GuardConfig::default() };
         assert!(s.validate().is_err());
         s.pairs = vec!["USDJPY".into(), "EURUSD".into()];
         assert!(s.validate().is_ok());
@@ -145,11 +168,30 @@ mod tests {
         s.pairs.pop();
         s.guard.max_positions_total = 0;
         assert!(s.validate().is_err());
+        s.guard.max_positions_total = 1;
+        s.decision_interval_minutes = 7;
+        assert!(s.validate().is_err());
+    }
+
+    #[test]
+    fn decision_ticks_follow_the_interval_from_utc_midnight() {
+        use chrono::TimeZone;
+        let mut s = TradingSettings { pairs: vec!["USDJPY".into()], bar_delay_secs: 15, decision_interval_minutes: 60, event_decisions: true, guard: GuardConfig::default() };
+        // 足確定の待ち秒数ぶん遅れても、分で判定する
+        assert!(s.is_decision_tick(chrono::Utc.with_ymd_and_hms(2026, 10, 5, 9, 0, 15).unwrap()));
+        assert!(!s.is_decision_tick(chrono::Utc.with_ymd_and_hms(2026, 10, 5, 9, 5, 15).unwrap()));
+        s.decision_interval_minutes = 240;
+        assert!(s.is_decision_tick(chrono::Utc.with_ymd_and_hms(2026, 10, 5, 8, 0, 15).unwrap()));
+        assert!(!s.is_decision_tick(chrono::Utc.with_ymd_and_hms(2026, 10, 5, 9, 0, 15).unwrap()));
+        // 旧い保存値（項目なし）でも読める
+        let old: TradingSettings = serde_json::from_str(r#"{"pairs":["USDJPY"],"barDelaySecs":15,"guard":{}}"#).unwrap();
+        assert!(!old.event_decisions && old.decision_interval_minutes.is_multiple_of(5));
+        assert!(old.guard.max_spread_atr.is_none() && old.guard.max_margin_usage_pct.is_none());
     }
 
     #[test]
     fn settings_json_keeps_guard_keys_snake_case() {
-        let s = TradingSettings { pairs: vec!["USDJPY".into()], bar_delay_secs: 15, guard: GuardConfig::default() };
+        let s = TradingSettings { pairs: vec!["USDJPY".into()], bar_delay_secs: 15, decision_interval_minutes: 5, event_decisions: true, guard: GuardConfig::default() };
         let v = serde_json::to_value(&s).unwrap();
         assert!(v.get("barDelaySecs").is_some());
         assert!(v["guard"].get("max_positions_total").is_some());

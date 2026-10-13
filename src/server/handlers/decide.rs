@@ -33,8 +33,9 @@ pub struct DecideResponse {
 /// POST /api/decide?pair=USDJPY（省略時は設定の先頭ペア）
 pub async fn decide_now(State(state): State<AppState>, Query(q): Query<PairQuery>) -> Json<ApiResponse<DecideResponse>> {
     let pair = state.resolve_pair(q.pair.as_deref()).await;
-    match run_cycle_locked(&state, &pair).await {
-        Ok(r) => Json(ApiResponse::ok(r)),
+    match run_cycle_locked(&state, &pair, true).await {
+        Ok(Some(r)) => Json(ApiResponse::ok(r)),
+        Ok(None) => Json(ApiResponse::err("decision skipped")),
         Err(e) => {
             warn!("decision cycle failed: {e:#}");
             Json(ApiResponse::err(format!("{e:#}")))
@@ -47,11 +48,14 @@ pub async fn decide_now(State(state): State<AppState>, Query(q): Query<PairQuery
 /// ペアが違えば並行に走る（LLM 推論が1回数十秒かかるため、直列だと後ろのペアほど足確定から遅れる）。
 /// 同じペアはスケジューラと手動実行が重ならないよう直列にし、cTrader 接続の差し替え中は待つ。
 /// ロックの順序は「接続ゲート → ペア」で固定する（逆順だと接続差し替えの待ちと循環しうる）。
-pub async fn run_cycle_locked(state: &AppState, pair: &str) -> anyhow::Result<DecideResponse> {
+///
+/// `decide = false` のときは確定足でのプラン評価と終値判定の損切りだけを行い、LLM は呼ばない
+/// （判断間隔の合間の 5M 足）。ただしプランが成立したら、その足で LLM に判断させる。戻り値はそのとき None。
+pub async fn run_cycle_locked(state: &AppState, pair: &str, decide: bool) -> anyhow::Result<Option<DecideResponse>> {
     let _gate = state.cycle_gate.read().await;
     let pair_lock = state.pair_lock(pair);
     let _pair = pair_lock.lock().await;
-    run_decision_cycle(state, pair).await
+    run_decision_cycle(state, pair, decide).await
 }
 
 fn action_str(a: Action) -> String {
@@ -234,7 +238,7 @@ async fn process_close_stops(state: &AppState, pair: &str, bundle: &SnapshotBund
     closed
 }
 
-pub async fn run_decision_cycle(state: &AppState, pair: &str) -> anyhow::Result<DecideResponse> {
+pub async fn run_decision_cycle(state: &AppState, pair: &str, decide: bool) -> anyhow::Result<Option<DecideResponse>> {
     // 1. Snapshot（口座状態と直近判断を含む）
     let mut bundle = generate_snapshot_internal(state, pair).await?;
 
@@ -246,11 +250,19 @@ pub async fn run_decision_cycle(state: &AppState, pair: &str) -> anyhow::Result<
     if let Some(t) = &plan_trigger {
         bundle.snapshot.account_state.triggered_plan = Some(t.notice.clone());
     }
+    if !decide && plan_trigger.is_none() {
+        return Ok(None);
+    }
 
-    // 3. LLM 判断
+    // 3. LLM 判断（ファンダメンタルズの事実はキャッシュ済みのものを渡す）
     let lessons: Vec<String> =
         state.with_db(|db| db.lessons()).await?.into_iter().filter(|l| l.active).map(|l| l.rule).collect();
-    let prompt = PromptBuilder::new().with_lessons(lessons).build(&bundle.snapshot, &bundle.charts);
+    let ctrader = state.ctrader_service.read().await.clone();
+    let fundamentals = state.fundamentals.facts_for(pair, ctrader.as_deref(), Utc::now()).await;
+    let prompt = PromptBuilder::new()
+        .with_lessons(lessons)
+        .with_fundamentals(fundamentals)
+        .build(&bundle.snapshot);
     let decision = state.llm.infer(&prompt).await?;
 
     // 4. 事後ガード。建玉数の確認から建玉の記録までを他ペアの発注と重ねない
@@ -285,20 +297,31 @@ pub async fn run_decision_cycle(state: &AppState, pair: &str) -> anyhow::Result<
             } else {
                 let (broker_sl, close_stop) = protective_stops(decision.action, sl, atr_5m(&bundle.snapshot), &cfg);
                 let sl_pips = (entry - broker_sl).abs() / bundle.snapshot.pip_size.max(1e-9);
-                let req = OrderRequest {
-                    pair: pair.to_string(),
-                    action: decision.action,
-                    volume_lots: state.order_volume(&cfg, pair, sl_pips).await,
-                    entry_hint: entry,
-                    stop_loss: broker_sl,
-                    take_profit: tp,
-                    reason: cot_id.clone(),
-                };
-                match execute_order(state, req, &decision.analysis.invalidation, &cot_id, close_stop).await {
-                    Ok(_) => executed = true,
-                    Err(e) => {
-                        warn!("Failed to place order: {e:#}");
-                        execution_error = Some(format!("ORDER_FAILED: {e:#}"));
+                let volume_lots = state.order_volume(&cfg, pair, sl_pips).await;
+                // レバレッジを掛けるので、建てる前に必要証拠金と実効レバレッジを確かめる
+                match state.margin_check(&cfg, pair, decision.action, volume_lots, entry).await {
+                    Ok(detail) => {
+                        info!(pair, volume_lots, %detail, "margin check passed");
+                        let req = OrderRequest {
+                            pair: pair.to_string(),
+                            action: decision.action,
+                            volume_lots,
+                            entry_hint: entry,
+                            stop_loss: broker_sl,
+                            take_profit: tp,
+                            reason: cot_id.clone(),
+                        };
+                        match execute_order(state, req, &decision.analysis.invalidation, &cot_id, close_stop).await {
+                            Ok(_) => executed = true,
+                            Err(e) => {
+                                warn!("Failed to place order: {e:#}");
+                                execution_error = Some(format!("ORDER_FAILED: {e:#}"));
+                            }
+                        }
+                    }
+                    Err(reason) => {
+                        warn!(pair, volume_lots, %reason, "order skipped by margin check");
+                        execution_error = Some(reason);
                     }
                 }
             }
@@ -329,21 +352,23 @@ pub async fn run_decision_cycle(state: &AppState, pair: &str) -> anyhow::Result<
         stop_loss: decision.stop_loss,
         take_profit: decision.take_profit,
         risk_reward_ratio: rr,
-        macro_context: decision.analysis.macro_context.clone(),
+        fundamental_view: decision.analysis.fundamental_view.clone(),
+        // macro_context 列には価格の位置の読みを入れる（旧: チャート画像の環境認識）
+        macro_context: decision.analysis.price_levels.clone(),
         order_flow: decision.analysis.order_flow.clone(),
         invalidation: decision.analysis.invalidation.clone(),
         conflicts: decision.analysis.conflicts.clone(),
         guard_result,
         reasoning: decision.reasoning.clone(),
         executed,
-        spread_pips: bundle.snapshot.spread_pips,
+        spread_pips: bundle.snapshot.spread_pips.unwrap_or(0.0),
         // プラン成立を受けた再判断なら、プランを立てた判断へ辿れるようにする
         origin_cot_log_id: plan_trigger.and_then(|t| t.origin_cot_log_id),
     };
     state.record_cot_log(log).await;
     info!(pair, action = ?decision.action, guard = %verdict.summary(), executed, ?plan_id, "decision cycle done");
 
-    Ok(DecideResponse {
+    Ok(Some(DecideResponse {
         cot_log_id: cot_id,
         decision,
         guard: verdict,
@@ -351,7 +376,7 @@ pub async fn run_decision_cycle(state: &AppState, pair: &str) -> anyhow::Result<
         plan_id,
         plan_events,
         chart_dir: bundle.charts.dir.to_string_lossy().to_string(),
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -369,6 +394,8 @@ mod tests {
             stop_loss: Some(157.600),
             take_profit: Some(156.950),
             analysis: Analysis {
+                fundamental_view: String::new(),
+                price_levels: String::new(),
                 macro_context: String::new(),
                 order_flow: String::new(),
                 invalidation: "157.600 を実体で上抜けたら無効".into(),
@@ -445,7 +472,7 @@ mod tests {
                 bars_1h: &[],
                 bars_15m: &[],
                 bars_5m: &[b.clone()],
-                spread_pips: 0.0,
+                spread_pips: None,
                 current_price: None,
                 now: None,
                 account_state: AccountState::default(),

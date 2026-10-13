@@ -167,7 +167,7 @@ impl OrderSink for CTraderOrderSink {
             // 約定価格は発注時点では分からないので、まず想定価格からの相対距離で SL/TP を付ける。
             // 建玉が一瞬でも無防備にならないようにするための保険であって、意図した価格ではない。
             let rel = |p: f64| relative_points(req.entry_hint, p);
-            let volume = crate::ctrader::lots_to_volume(req.volume_lots);
+            let volume = self.service.lots_to_volume(&req.pair, req.volume_lots).await?;
             info!(pair = %req.pair, ?req.action, volume, sl = req.stop_loss, tp = req.take_profit, "LIVE order → cTrader");
             let ev = self
                 .service

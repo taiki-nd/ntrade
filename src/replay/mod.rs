@@ -86,7 +86,7 @@ pub async fn build_snapshot_at(
         bars_1h: &b1h,
         bars_15m: &b15,
         bars_5m: &b5,
-        spread_pips,
+        spread_pips: Some(spread_pips),
         current_price: b5.last().map(|b| b.close),
         now: Some(t),
         account_state,
@@ -296,7 +296,7 @@ async fn evaluate_one(
     t: DateTime<Utc>,
 ) -> Result<()> {
     let bundle = build_snapshot_at(source, pipeline, &cfg.pair, t, cfg.spread_pips, cfg.bars_per_tf, AccountState::default()).await?;
-    let prompt = PromptBuilder::new().with_lessons(cfg.lessons.clone()).build(&bundle.snapshot, &bundle.charts);
+    let prompt = PromptBuilder::new().with_lessons(cfg.lessons.clone()).build(&bundle.snapshot);
     let decision = llm.infer(&prompt).await?;
     // リプレイでは口座状態を持たないので、ポジション数・日次損失は常にゼロとして評価する
     let guard = guard::evaluate(&decision, &bundle.snapshot, &GuardContext { now: Some(t), ..Default::default() }, guard_cfg).summary();
@@ -377,7 +377,7 @@ async fn rejudge_plan(
         ..Default::default()
     };
     let bundle = build_snapshot_at(source, pipeline, &cfg.pair, t2, cfg.spread_pips, cfg.bars_per_tf, account_state).await?;
-    let prompt = PromptBuilder::new().with_lessons(cfg.lessons.clone()).build(&bundle.snapshot, &bundle.charts);
+    let prompt = PromptBuilder::new().with_lessons(cfg.lessons.clone()).build(&bundle.snapshot);
     let decision = llm.infer(&prompt).await?;
     let guard = guard::evaluate(&decision, &bundle.snapshot, &GuardContext { now: Some(t2), ..Default::default() }, guard_cfg).summary();
     info!(%planned_at, %t2, action = ?decision.action, %guard, "replay plan triggered; re-judged");
@@ -464,21 +464,14 @@ pub fn prompt_fingerprint(lessons: &[String]) -> String {
             bars_1h: &[],
             bars_15m: &[],
             bars_5m: &[],
-            spread_pips: 0.0,
+            spread_pips: None,
             current_price: Some(1.0),
             now: Some(Utc.with_ymd_and_hms(2000, 1, 1, 0, 0, 0).unwrap()),
             account_state: AccountState::default(),
         },
         &crate::snapshot::SnapshotConfig::default(),
     );
-    let charts = crate::snapshot::ChartSet {
-        dir: PathBuf::from("x"),
-        h4: PathBuf::from("x/4H.png"),
-        h1: PathBuf::from("x/1H.png"),
-        m15: PathBuf::from("x/15M.png"),
-        m5: PathBuf::from("x/5M.png"),
-    };
-    let text = PromptBuilder::new().with_lessons(lessons.to_vec()).build(&dummy_snapshot, &charts);
+    let text = PromptBuilder::new().with_lessons(lessons.to_vec()).build(&dummy_snapshot);
     let mut h = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut h);
     format!("{:016x}", h.finish())
@@ -572,7 +565,7 @@ mod tests {
                 bars_1h: &[],
                 bars_15m: &[],
                 bars_5m: &ok_bars,
-                spread_pips: 0.0,
+                spread_pips: None,
                 current_price: None,
                 now: Some(t),
                 account_state: AccountState::default(),
@@ -589,7 +582,7 @@ mod tests {
                 bars_1h: &[],
                 bars_15m: &[],
                 bars_5m: &leaky,
-                spread_pips: 0.0,
+                spread_pips: None,
                 current_price: None,
                 now: Some(t),
                 account_state: AccountState::default(),

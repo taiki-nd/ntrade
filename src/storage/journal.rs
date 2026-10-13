@@ -25,12 +25,13 @@ pub struct Page<T> {
 
 const COT_COLS: &str = "id, timestamp, symbol, action, confidence, entry_type, entry_price, stop_loss, take_profit,
     risk_reward_ratio, macro_context, order_flow, invalidation, conflicts, guard_result, reasoning, executed, spread_pips,
-    origin_cot_log_id";
+    origin_cot_log_id, fundamental_view";
 
 /// CoT ログの絞り込み条件（?1 = ペア / ?2 = 検索語。いずれも NULL なら無条件）
 const COT_SEARCH_WHERE: &str = r#"WHERE (?1 IS NULL OR symbol = ?1 COLLATE NOCASE)
       AND (?2 IS NULL OR lower(
             symbol || ' ' || action || ' ' || timestamp || ' ' || COALESCE(entry_type, '') || ' ' ||
+            COALESCE(fundamental_view, '') || ' ' ||
             macro_context || ' ' || order_flow || ' ' || invalidation || ' ' || conflicts || ' ' ||
             COALESCE(guard_result, '') || ' ' || reasoning
           ) LIKE ?2 ESCAPE '\')"#;
@@ -98,7 +99,8 @@ impl Db {
               reasoning         TEXT NOT NULL,
               executed          INTEGER NOT NULL,
               spread_pips       REAL NOT NULL,
-              origin_cot_log_id TEXT
+              origin_cot_log_id TEXT,
+              fundamental_view  TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_cot_logs_ts ON cot_logs (timestamp);
             CREATE INDEX IF NOT EXISTS idx_cot_logs_symbol_ts ON cot_logs (symbol, timestamp);
@@ -159,6 +161,7 @@ impl Db {
         // 既存 DB への列追加。既にあれば "duplicate column name" になるので無視する
         let _ = self.conn.execute("ALTER TABLE cot_logs ADD COLUMN origin_cot_log_id TEXT", []);
         let _ = self.conn.execute("ALTER TABLE positions ADD COLUMN close_stop REAL", []);
+        let _ = self.conn.execute("ALTER TABLE cot_logs ADD COLUMN fundamental_view TEXT", []);
 
         self.conn.execute_batch(
             r#"
@@ -178,7 +181,7 @@ impl Db {
 
     pub fn insert_cot_log(&self, log: &CoTLog) -> Result<()> {
         self.conn.execute(
-            &format!("INSERT OR REPLACE INTO cot_logs ({COT_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)"),
+            &format!("INSERT OR REPLACE INTO cot_logs ({COT_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)"),
             params![
                 log.id,
                 log.timestamp,
@@ -198,7 +201,8 @@ impl Db {
                 log.reasoning,
                 log.executed,
                 log.spread_pips,
-                log.origin_cot_log_id
+                log.origin_cot_log_id,
+                log.fundamental_view
             ],
         )?;
         Ok(())
@@ -435,6 +439,7 @@ fn row_to_cot(r: &Row) -> rusqlite::Result<CoTLog> {
         executed: r.get(16)?,
         spread_pips: r.get(17)?,
         origin_cot_log_id: r.get(18)?,
+        fundamental_view: r.get::<_, Option<String>>(19)?.unwrap_or_default(),
     })
 }
 
@@ -506,6 +511,7 @@ mod tests {
             stop_loss: Some(154.1),
             take_profit: None,
             risk_reward_ratio: None,
+            fundamental_view: "f".into(),
             macro_context: "m".into(),
             order_flow: "o".into(),
             invalidation: "i".into(),

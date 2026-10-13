@@ -1,6 +1,13 @@
-//! 常駐スケジューラ: 5分足確定ごとに全ペアの判断サイクルを並行に回し、ポジション同期と自己反省を行う。
+//! 常駐スケジューラ: 5分足確定ごとに全ペアのサイクルを並行に回し、ポジション同期と自己反省を行う。
 //!
-//! 対象ペアと足確定後の待ち秒数は取引設定（`settings::TradingSettings`、画面から変更可）を
+//! 5M 足ごとに行うのは確定足でのプラン評価と終値判定の損切り。LLM の判断は
+//! - 判断間隔（`decision_interval_minutes`）の足
+//! - 条件付きプランが成立した足
+//! - 重要指標の発表直後の足（`event_decisions` が有効なとき）
+//!
+//! に限る。ブローカーの取引時間外の銘柄はサイクルごと飛ばす（止まった足で判断させない）。
+//!
+//! 対象ペア・待ち秒数・判断間隔は取引設定（`settings::TradingSettings`、画面から変更可）を
 //! 毎サイクル読み直すので、変更は再起動なしで次の足から反映される。
 //!
 //! 環境変数:
@@ -28,7 +35,10 @@ pub fn next_tick(now: DateTime<Utc>, delay_secs: i64) -> DateTime<Utc> {
 pub async fn run(state: AppState) {
     {
         let s = state.settings.read().await;
-        info!(pairs = ?s.pairs, delay = s.bar_delay_secs, "scheduler started (5M cadence)");
+        info!(
+            pairs = ?s.pairs, delay = s.bar_delay_secs, decision_interval = s.decision_interval_minutes,
+            event_decisions = s.event_decisions, "scheduler started (5M cadence)"
+        );
     }
 
     loop {
@@ -43,20 +53,41 @@ pub async fn run(state: AppState) {
             info!(?bot_state, "scheduler: bot not running, skipping cycle");
             continue;
         }
-        let connected = state.ctrader_service.read().await.is_some();
-        if !connected {
+        let Some(ctrader) = state.ctrader_service.read().await.clone() else {
             warn!("scheduler: cTrader not connected, skipping cycle (no live bars)");
             continue;
-        }
+        };
+
+        let settings = state.settings.read().await.clone();
+        let scheduled = settings.is_decision_tick(at);
+        let tick_now = Utc::now();
 
         // ペアごとに並行に回す。発注まわりの排他は run_cycle_locked / order_lock 側で取る
-        let pairs = state.pairs().await;
         let mut cycles = tokio::task::JoinSet::new();
-        for pair in pairs {
+        for pair in settings.pairs.clone() {
+            match ctrader.market_status(&pair, tick_now).await {
+                Ok(m) if !m.open => {
+                    info!(pair, trading_mode = ?m.trading_mode, next_open = ?m.next_change, "scheduler: market closed, skipping");
+                    continue;
+                }
+                Ok(_) => {}
+                // 仕様が引けないときは従来どおり回す（足の取得で失敗すればそこで止まる）
+                Err(e) => warn!(pair, "scheduler: market status unknown: {e:#}"),
+            }
+            let event = if settings.event_decisions && !scheduled {
+                state.fundamentals.take_event_trigger(&pair, tick_now).await
+            } else {
+                None
+            };
+            if let Some(e) = &event {
+                info!(pair, event = %e.title, currency = %e.currency, at = %e.time, "scheduler: decision after a scheduled release");
+            }
+            let decide = scheduled || event.is_some();
             let state = state.clone();
             cycles.spawn(async move {
-                match run_cycle_locked(&state, &pair).await {
-                    Ok(r) => info!(pair, action = ?r.decision.action, guard = r.guard.passed, executed = r.executed, "cycle ok"),
+                match run_cycle_locked(&state, &pair, decide).await {
+                    Ok(Some(r)) => info!(pair, action = ?r.decision.action, guard = r.guard.passed, executed = r.executed, "cycle ok"),
+                    Ok(None) => tracing::debug!(pair, "cycle: plans/stops checked, no decision this bar"),
                     Err(e) => warn!(pair, "cycle failed: {e:#}"),
                 }
             });

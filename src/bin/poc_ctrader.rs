@@ -73,7 +73,11 @@ async fn main() -> Result<()> {
     // 3. 主要通貨ペアのシンボル解決
     // 銘柄名はブローカーの表記どおりに指定する（ゼロ口座は USDJPY_z。素の USDJPY は発注できない）
     let suffix = ntrade::ctrader::symbol_suffix_from_env().unwrap_or_default();
-    let pairs = [format!("USDJPY{suffix}"), format!("EURUSD{suffix}")];
+    // --symbols=XAUUSD_z,US500_z で確認する銘柄を足せる（CFD の仕様確認用）
+    let mut pairs = vec![format!("USDJPY{suffix}"), format!("EURUSD{suffix}")];
+    if let Some(list) = std::env::args().find_map(|a| a.strip_prefix("--symbols=").map(str::to_string)) {
+        pairs.extend(list.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
+    }
     println!("[3/4] 主要シンボル ({}) の確認:", pairs.join(", "));
     for pair in &pairs {
         match service.get_symbol_id(pair).await {
@@ -84,13 +88,30 @@ async fn main() -> Result<()> {
                 };
                 println!("  ✓ {} -> Symbol ID: {} | 取引モード: {}", pair, id, mode);
                 match (service.symbol_spec(pair).await, service.pip_value_per_lot(pair).await) {
-                    (Ok(spec), Ok(pv)) => println!(
-                        "      pip {} | 1 lot = {} 通貨 | 1 lot・1 pip = {:.2}（口座通貨 {}）",
-                        spec.pip_size(),
-                        spec.lot_units,
-                        pv,
-                        service.account_currency().await.unwrap_or_else(|_| "不明".into())
-                    ),
+                    (Ok(spec), Ok(pv)) => {
+                        println!(
+                            "      {} / {} | pip {} | 1 lot = {} {} | 最小 {:?} lot | 1 lot・1 pip = {:.2}（口座通貨 {}）",
+                            spec.asset_class.as_deref().unwrap_or("資産クラス不明"),
+                            spec.description.as_deref().unwrap_or("-"),
+                            spec.pip_size(),
+                            spec.lot_units,
+                            spec.measurement_units.as_deref().unwrap_or("units"),
+                            spec.min_lots(),
+                            pv,
+                            service.account_currency().await.unwrap_or_else(|_| "不明".into())
+                        );
+                        let now = chrono::Utc::now();
+                        println!(
+                            "      取引時間: {} 区間（TZ {}）| 今は{} | 次の切り替え {:?}",
+                            spec.schedule.len(),
+                            spec.schedule_time_zone.as_deref().unwrap_or("-"),
+                            if spec.is_open_at(now) { "取引時間内" } else { "取引時間外" },
+                            spec.next_transition(now)
+                        );
+                        if let Ok((buy, sell)) = service.expected_margin(pair, spec.min_lots().unwrap_or(0.01)).await {
+                            println!("      最小ロットの必要証拠金: 買い {buy:.0} / 売り {sell:.0}");
+                        }
+                    }
                     (Err(e), _) | (_, Err(e)) => println!("      pip 価値の取得失敗: {e:#}"),
                 }
             }
@@ -151,7 +172,7 @@ async fn main() -> Result<()> {
             pairs[0],
             if with_sltp { "SL 10 pips・TP 20 pips" } else { "SL・TP なし" }
         );
-        let volume = ntrade::ctrader::lots_to_volume(0.01);
+        let volume = service.lots_to_volume(&pairs[0], 0.01).await?;
         match service.place_market_order_with_sltp(&pairs[0], true, volume, rel_sl, rel_tp).await {
             Ok(ev) => {
                 let position_id = ev

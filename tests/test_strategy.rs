@@ -22,7 +22,7 @@ fn bars(count: usize, step_min: i64, end: chrono::DateTime<Utc>) -> Vec<CandleBa
 }
 
 #[test]
-fn prompt_references_all_four_images_and_contains_no_judgment_labels() {
+fn prompt_carries_price_facts_without_chart_images_or_judgment_labels() {
     let now = Utc.with_ymd_and_hms(2026, 9, 15, 9, 35, 0).unwrap();
     let (b4, b1, b15, b5) = (bars(60, 240, now), bars(60, 60, now), bars(60, 15, now), bars(60, 5, now));
     let root = std::env::temp_dir().join(format!("ntrade_prompt_test_{}", std::process::id()));
@@ -34,7 +34,7 @@ fn prompt_references_all_four_images_and_contains_no_judgment_labels() {
             bars_1h: &b1,
             bars_15m: &b15,
             bars_5m: &b5,
-            spread_pips: 0.2,
+            spread_pips: Some(0.2),
             current_price: None,
             now: Some(now),
             account_state: AccountState::default(),
@@ -43,11 +43,12 @@ fn prompt_references_all_four_images_and_contains_no_judgment_labels() {
 
     let prompt = PromptBuilder::new()
         .with_lessons(vec!["テスト教訓".to_string()])
-        .build(&bundle.snapshot, &bundle.charts);
+        .build(&bundle.snapshot);
 
+    // チャート画像は LLM に渡さない（方向はファンダメンタルズの事実から決める）
     for (_, p) in bundle.charts.ordered() {
         let abs = std::fs::canonicalize(p).unwrap();
-        assert!(prompt.contains(abs.to_str().unwrap()), "prompt must reference {:?}", abs);
+        assert!(!prompt.contains(abs.to_str().unwrap()), "prompt must not reference {:?}", abs);
     }
     assert!(prompt.contains("USDJPY"));
     assert!(prompt.contains("テスト教訓"));
@@ -108,7 +109,7 @@ fn error_envelope_and_garbage_fall_back_to_hold() {
 fn json_schema_matches_serialized_decision_shape() {
     let schema = TradeDecision::json_schema();
     let props = schema["properties"].as_object().unwrap();
-    for key in ["action", "confidence", "analysis", "conditional_plan", "observed", "reasoning"] {
+    for key in ["action", "confidence", "analysis", "conditional_plan", "reasoning"] {
         assert!(props.contains_key(key), "schema missing {key}");
     }
     let d = TradeDecision::fallback_hold("x");
@@ -116,4 +117,7 @@ fn json_schema_matches_serialized_decision_shape() {
     for key in props.keys() {
         assert!(v.get(key).is_some(), "serialized decision missing {key}");
     }
+    assert!(!props.contains_key("observed"), "chart observation is no longer requested");
+    let analysis = schema["properties"]["analysis"]["required"].as_array().unwrap();
+    assert!(analysis.iter().any(|k| k == "fundamental_view") && analysis.iter().any(|k| k == "price_levels"));
 }

@@ -52,6 +52,8 @@ export interface CoTLog {
   stopLoss?: number;
   takeProfit?: number;
   riskRewardRatio?: number;
+  /** ファンダメンタルズの読み（事実から読んだ地合い・根拠・イベントリスク）。旧データは空 */
+  fundamentalView?: string;
   /** 環境認識（4H/1H） */
   macroContext: string;
   /** 注文の攻防（15M/5M） */

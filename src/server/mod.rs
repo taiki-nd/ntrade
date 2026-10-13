@@ -58,6 +58,13 @@ pub fn create_router(state: AppState) -> Router {
         // 10. 取引設定（対象ペア・待ち秒数・事後ガード）。SQLite に保存し再起動なしで反映
         .route("/api/settings", get(handlers::settings::get_settings).put(handlers::settings::update_settings))
         .route("/api/runtime", get(handlers::plans::runtime_info))
+        // 11. 銘柄一覧（ブローカーの全銘柄。資産クラス付き）と銘柄仕様
+        .route("/api/symbols", get(handlers::symbols::list_symbols))
+        .route("/api/symbols/spec", get(handlers::symbols::symbol_spec))
+        // 12. ファンダメンタルズの事実（判断に渡すもの）と情報源の取得状況
+        .route("/api/fundamentals", get(handlers::fundamentals::get_facts))
+        .route("/api/fundamentals/status", get(handlers::fundamentals::get_status))
+        .route("/api/fundamentals/refresh", post(handlers::fundamentals::refresh))
         // 8. cTrader OAuth 認証連携
         .route("/api/auth/ctrader/url", get(handlers::auth::get_oauth_url))
         .route("/api/auth/ctrader/exchange", post(handlers::auth::exchange_oauth_code))

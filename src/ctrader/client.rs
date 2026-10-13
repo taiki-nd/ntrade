@@ -1,13 +1,16 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use ctrader_rs::proto::common::{
-    ProtoMessage, ProtoOaAccessRights, ProtoOaAssetListReq, ProtoOaAssetListRes, ProtoOaClosePositionReq, ProtoOaErrorRes,
-    ProtoOaExecutionEvent, ProtoOaExecutionType, ProtoOaGetTrendbarsReq, ProtoOaGetTrendbarsRes, ProtoOaOrderErrorEvent,
-    ProtoOaPayloadType, ProtoOaSymbol, ProtoOaSymbolByIdReq, ProtoOaSymbolByIdRes, ProtoOaTradeSide, ProtoOaTradingMode,
+    ProtoMessage, ProtoOaAccessRights, ProtoOaAssetClassListReq, ProtoOaAssetClassListRes, ProtoOaAssetListReq,
+    ProtoOaAssetListRes, ProtoOaClosePositionReq, ProtoOaErrorRes, ProtoOaExecutionEvent, ProtoOaExecutionType,
+    ProtoOaGetTrendbarsReq, ProtoOaGetTrendbarsRes, ProtoOaOrderErrorEvent, ProtoOaPayloadType, ProtoOaSpotEvent,
+    ProtoOaSymbol, ProtoOaSymbolByIdReq, ProtoOaSymbolByIdRes, ProtoOaSymbolCategoryListReq,
+    ProtoOaSymbolCategoryListRes, ProtoOaTradeSide, ProtoOaTradingMode,
 };
 use ctrader_rs::{Client, Config};
 use prost::Message as _;
-use std::collections::HashMap;
+use serde::Serialize;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, RwLock};
@@ -16,9 +19,29 @@ use tracing::{debug, info, warn};
 
 use super::config::CTraderConfig;
 use super::types::{
-    quote_currency_from_name, volume_to_lots, AccountSummary, BarPeriod, BrokerPosition, CandleBar, ClosedDeal, SymbolInfo,
-    SymbolSpec,
+    quote_currency_from_name, AccountSummary, BarPeriod, BrokerPosition, CandleBar, ClosedDeal, Quote, SymbolInfo,
 };
+use crate::instrument::{self, Holiday, InstrumentSpec, WeeklyInterval};
+
+/// 銘柄一覧（画面の銘柄選択用）の1行
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SymbolCatalogEntry {
+    pub symbol_id: i64,
+    pub symbol_name: String,
+    pub description: Option<String>,
+    pub category: Option<String>,
+    pub asset_class: Option<String>,
+    pub base_asset: Option<String>,
+    pub quote_asset: Option<String>,
+    pub enabled: bool,
+}
+
+/// 銘柄仕様の再取得間隔。取引時間・休場日・取引可否はブローカー側で変わりうる
+const SPEC_TTL: Duration = Duration::from_secs(6 * 3600);
+
+/// cTrader の価格（Spot・Trendbar）は 10^5 倍の整数
+const PRICE_SCALE: f64 = 100_000.0;
 
 /// 注文に対するサーバーからの非同期な応答
 ///
@@ -50,6 +73,10 @@ pub enum TradingPermission {
 /// 注文応答を待つ上限。ctrader-rs 側の deadline(5s) を含む余裕を見た値。
 const ORDER_OUTCOME_TIMEOUT: Duration = Duration::from_secs(12);
 
+/// 過去データ要求（Trendbars）の最小間隔。cTrader は過去データ要求を毎秒5件までに制限しており、
+/// 超えると BLOCKED_PAYLOAD_TYPE（rate limited）で弾かれる。全ペア並行のサイクルでも超えないよう余裕を見る
+const HISTORICAL_REQ_INTERVAL: Duration = Duration::from_millis(250);
+
 /// cTrader Open API サービス
 pub struct CTraderService {
     config: CTraderConfig,
@@ -59,10 +86,16 @@ pub struct CTraderService {
     assets: Arc<RwLock<HashMap<i64, String>>>,
     /// 口座通貨（get_account_info のたびに更新）
     account_currency: Arc<RwLock<Option<String>>>,
-    /// symbol_id → 取引仕様（pip 位置・lot サイズ）。銘柄仕様は取引中に変わらないのでキャッシュする
-    specs: Arc<RwLock<HashMap<i64, SymbolSpec>>>,
+    /// symbol_id → 取引仕様（pip 位置・lot サイズ・発注量の刻み・取引時間）と取得時刻
+    specs: Arc<RwLock<HashMap<i64, (InstrumentSpec, Instant)>>>,
+    /// symbol_id → 直近の気配値（Spot 購読。受信ハンドラが更新する）
+    quotes: Arc<std::sync::RwLock<HashMap<i64, Quote>>>,
+    /// Spot を購読済みの symbol_id
+    subscribed: Arc<tokio::sync::Mutex<HashSet<i64>>>,
     /// 非請求メッセージから復元した注文応答の配信元
     order_events: broadcast::Sender<OrderOutcome>,
+    /// 直近の過去データ要求の送信時刻（要求間隔を空けるため）
+    last_historical_req: Arc<tokio::sync::Mutex<Option<Instant>>>,
 }
 
 impl CTraderService {
@@ -81,9 +114,11 @@ impl CTraderService {
         // 1. アプリケーション認証 & 接続 & Heartbeat開始
         let (order_events, _) = broadcast::channel::<OrderOutcome>(64);
         let handler_tx = order_events.clone();
+        let quotes: Arc<std::sync::RwLock<HashMap<i64, Quote>>> = Arc::default();
+        let handler_quotes = quotes.clone();
         let client = Client::start_with_handler(
             client_config,
-            Some(move |msg: ProtoMessage| handle_unsolicited_event(msg, &handler_tx)),
+            Some(move |msg: ProtoMessage| handle_unsolicited_event(msg, &handler_tx, &handler_quotes)),
         )
         .await
         .context("Failed to connect & authenticate application with cTrader")?;
@@ -177,7 +212,10 @@ impl CTraderService {
             assets: Arc::new(RwLock::new(HashMap::new())),
             account_currency: Arc::new(RwLock::new(None)),
             specs: Arc::new(RwLock::new(HashMap::new())),
+            quotes,
+            subscribed: Arc::default(),
             order_events,
+            last_historical_req: Arc::default(),
         };
 
         // 4. シンボルリストを初期取得
@@ -214,12 +252,27 @@ impl CTraderService {
             .await
             .context("Failed to fetch symbols list")?;
 
+        // カテゴリ → 資産クラス（Forex / Metals / Indices など）。取れなくても銘柄の解決には困らない
+        let categories = match self.fetch_categories().await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("Failed to fetch symbol categories / asset classes: {e:#}");
+                HashMap::new()
+            }
+        };
+
         let mut symbols_map = HashMap::new();
         for sym in res.symbol {
             if let Some(name) = sym.symbol_name {
-                let mut info = SymbolInfo::new_with_defaults(sym.symbol_id, name.clone());
+                let mut info = SymbolInfo::new(sym.symbol_id, name.clone());
                 info.base_asset = sym.base_asset_id.and_then(|id| assets.get(&id).cloned());
                 info.quote_asset = sym.quote_asset_id.and_then(|id| assets.get(&id).cloned());
+                if let Some((category, class)) = sym.symbol_category_id.and_then(|id| categories.get(&id)) {
+                    info.category = Some(category.clone());
+                    info.asset_class = class.clone();
+                }
+                info.description = sym.description.filter(|d| !d.is_empty());
+                info.enabled = sym.enabled.unwrap_or(true);
                 symbols_map.insert(name.to_uppercase(), info);
             }
         }
@@ -229,6 +282,63 @@ impl CTraderService {
         *lock = symbols_map;
 
         Ok(())
+    }
+
+    /// カテゴリ ID → （カテゴリ名, 資産クラス名）
+    async fn fetch_categories(&self) -> Result<HashMap<i64, (String, Option<String>)>> {
+        let classes: ProtoOaAssetClassListRes = self
+            .client
+            .command(
+                ProtoOaPayloadType::ProtoOaAssetClassListReq as u32,
+                ProtoOaAssetClassListReq {
+                    payload_type: Some(ProtoOaPayloadType::ProtoOaAssetClassListReq as i32),
+                    ctid_trader_account_id: self.config.account_id,
+                },
+                ProtoOaPayloadType::ProtoOaAssetClassListRes as u32,
+            )
+            .await
+            .map_err(|e| anyhow!(e).context("Failed to fetch asset classes"))?;
+        let class_names: HashMap<i64, String> =
+            classes.asset_class.into_iter().filter_map(|c| Some((c.id?, c.name?))).collect();
+        let cats: ProtoOaSymbolCategoryListRes = self
+            .client
+            .command(
+                ProtoOaPayloadType::ProtoOaSymbolCategoryReq as u32,
+                ProtoOaSymbolCategoryListReq {
+                    payload_type: Some(ProtoOaPayloadType::ProtoOaSymbolCategoryReq as i32),
+                    ctid_trader_account_id: self.config.account_id,
+                },
+                ProtoOaPayloadType::ProtoOaSymbolCategoryRes as u32,
+            )
+            .await
+            .map_err(|e| anyhow!(e).context("Failed to fetch symbol categories"))?;
+        Ok(cats
+            .symbol_category
+            .into_iter()
+            .map(|c| (c.id, (c.name, class_names.get(&c.asset_class_id).cloned())))
+            .collect())
+    }
+
+    /// 銘柄一覧（ブローカーの全銘柄）。資産クラス・名前順
+    pub async fn catalog(&self) -> Vec<SymbolCatalogEntry> {
+        let mut list: Vec<SymbolCatalogEntry> = self
+            .symbols
+            .read()
+            .await
+            .values()
+            .map(|s| SymbolCatalogEntry {
+                symbol_id: s.symbol_id,
+                symbol_name: s.symbol_name.clone(),
+                description: s.description.clone(),
+                category: s.category.clone(),
+                asset_class: s.asset_class.clone(),
+                base_asset: s.base_asset.clone(),
+                quote_asset: s.quote_asset.clone(),
+                enabled: s.enabled,
+            })
+            .collect();
+        list.sort_by(|a, b| (&a.asset_class, &a.symbol_name).cmp(&(&b.asset_class, &b.symbol_name)));
+        list
     }
 
     /// 銘柄名（例: "USDJPY_z"）から symbol_id を解決する。
@@ -287,6 +397,10 @@ impl CTraderService {
     /// 正しくデコードできないため、command を直接呼ぶ。
     async fn fetch_symbol_details(&self, symbol_name: &str) -> Result<ProtoOaSymbol> {
         let symbol_id = self.get_symbol_id(symbol_name).await?;
+        self.fetch_symbol_details_by_id(symbol_id).await
+    }
+
+    async fn fetch_symbol_details_by_id(&self, symbol_id: i64) -> Result<ProtoOaSymbol> {
         let req = ProtoOaSymbolByIdReq {
             payload_type: Some(ProtoOaPayloadType::ProtoOaSymbolByIdReq as i32),
             ctid_trader_account_id: self.config.account_id,
@@ -300,29 +414,108 @@ impl CTraderService {
                 ProtoOaPayloadType::ProtoOaSymbolByIdRes as u32,
             )
             .await
-            .map_err(|e| anyhow!(e).context(format!("Failed to fetch symbol details for {symbol_name}")))?;
+            .map_err(|e| anyhow!(e).context(format!("Failed to fetch symbol details for symbol {symbol_id}")))?;
         res.symbol
             .into_iter()
             .next()
-            .ok_or_else(|| anyhow!("cTrader returned no symbol details for {symbol_name}"))
+            .ok_or_else(|| anyhow!("cTrader returned no symbol details for symbol {symbol_id}"))
     }
 
-    /// 銘柄の取引仕様（pip 位置・lot サイズ）
-    pub async fn symbol_spec(&self, symbol_name: &str) -> Result<SymbolSpec> {
+    /// 銘柄の取引仕様（pip 位置・lot サイズ・発注量の刻み・取引時間）。取得したら `instrument` に登録する
+    pub async fn symbol_spec(&self, symbol_name: &str) -> Result<InstrumentSpec> {
         let symbol_id = self.get_symbol_id(symbol_name).await?;
-        if let Some(spec) = self.specs.read().await.get(&symbol_id) {
-            return Ok(*spec);
+        self.spec_by_id(symbol_id).await
+    }
+
+    pub async fn spec_by_id(&self, symbol_id: i64) -> Result<InstrumentSpec> {
+        if let Some((spec, at)) = self.specs.read().await.get(&symbol_id) {
+            if at.elapsed() < SPEC_TTL {
+                return Ok(spec.clone());
+            }
         }
-        let sym = self.fetch_symbol_details(symbol_name).await?;
-        let spec = SymbolSpec {
-            pip_position: sym.pip_position,
-            digits: sym.digits,
-            // lotSize は数量の 1/100 単位（FX の 1 lot = 100,000 通貨 → 10,000,000）
-            lot_units: sym.lot_size.filter(|v| *v > 0).map(|v| v as f64 / 100.0).unwrap_or(100_000.0),
-        };
-        debug!(symbol = symbol_name, ?spec, "symbol spec resolved");
-        self.specs.write().await.insert(symbol_id, spec);
+        let sym = self.fetch_symbol_details_by_id(symbol_id).await?;
+        let info = self.symbols.read().await.values().find(|s| s.symbol_id == symbol_id).cloned();
+        let spec = to_instrument_spec(&sym, info.as_ref());
+        debug!(symbol = %spec.symbol_name, ?spec, "symbol spec resolved");
+        instrument::register(spec.clone());
+        self.specs.write().await.insert(symbol_id, (spec.clone(), Instant::now()));
         Ok(spec)
+    }
+
+    /// ロット → 発注量（ブローカーの lot サイズ・刻み・最小・最大に合わせる）
+    pub async fn lots_to_volume(&self, symbol_name: &str, lots: f64) -> Result<i64> {
+        let spec = self.symbol_spec(symbol_name).await?;
+        spec.lots_to_volume(lots).ok_or_else(|| {
+            anyhow!(
+                "VOLUME_BELOW_MIN: {lots} lot は {symbol_name} の最小発注量（{} lot）未満です",
+                spec.min_lots().map(|v| v.to_string()).unwrap_or_else(|| "不明".into())
+            )
+        })
+    }
+
+    /// 発注量 → ロット。仕様が取れなければ FX の 1 lot = 100,000 通貨とみなす
+    async fn volume_to_lots_by_id(&self, symbol_id: i64, volume: i64) -> f64 {
+        match self.spec_by_id(symbol_id).await {
+            Ok(spec) => spec.volume_to_lots(volume),
+            Err(e) => {
+                warn!(symbol_id, "failed to resolve symbol spec; assuming 100,000 units per lot: {e:#}");
+                volume as f64 / 10_000_000.0
+            }
+        }
+    }
+
+    /// 指定ロットを建てるのに必要な証拠金（口座通貨。(買い, 売り)）
+    pub async fn expected_margin(&self, symbol_name: &str, lots: f64) -> Result<(f64, f64)> {
+        let symbol_id = self.get_symbol_id(symbol_name).await?;
+        let volume = self.lots_to_volume(symbol_name, lots).await?;
+        let res = self
+            .client
+            .get_expected_margin(self.config.account_id, symbol_id, vec![volume])
+            .await
+            .map_err(|e| anyhow!(e).context(format!("Failed to fetch expected margin for {symbol_name}")))?;
+        let scale = 10f64.powi(res.money_digits.unwrap_or(2) as i32);
+        let m = res.margin.first().ok_or_else(|| anyhow!("cTrader returned no expected margin"))?;
+        Ok((m.buy_margin as f64 / scale, m.sell_margin as f64 / scale))
+    }
+
+    /// 取引時間内か（ブローカーの取引スケジュール・休場日・取引可否）
+    pub async fn market_status(&self, symbol_name: &str, now: chrono::DateTime<Utc>) -> Result<MarketStatus> {
+        let spec = self.symbol_spec(symbol_name).await?;
+        let tradable = spec.trading_mode.as_deref().is_none_or(|m| m == "ENABLED");
+        Ok(MarketStatus {
+            open: tradable && spec.is_open_at(now),
+            trading_mode: spec.trading_mode.clone(),
+            next_change: spec.next_transition(now),
+        })
+    }
+
+    /// Spot（気配値）を購読する。購読済みの銘柄は飛ばす
+    pub async fn subscribe_spots(&self, symbol_names: &[String]) -> Result<()> {
+        let mut ids = Vec::new();
+        for name in symbol_names {
+            ids.push(self.get_symbol_id(name).await?);
+        }
+        let mut subscribed = self.subscribed.lock().await;
+        let fresh: Vec<i64> = ids.into_iter().filter(|id| !subscribed.contains(id)).collect();
+        if fresh.is_empty() {
+            return Ok(());
+        }
+        match self.client.subscribe_symbol(fresh.clone(), self.config.account_id).await {
+            Ok(_) => {}
+            // 別経路で購読済みなら問題ない
+            Err(ctrader_rs::Error::Api { error_code, .. }) if error_code.contains("ALREADY_SUBSCRIBED") => {}
+            Err(e) => return Err(anyhow!(e).context("Failed to subscribe spots")),
+        }
+        info!(symbols = ?symbol_names, "subscribed to spot quotes");
+        subscribed.extend(fresh);
+        Ok(())
+    }
+
+    /// 直近の気配値（Spot 購読中のみ）。`max_age` より古ければ None（休場中など）
+    pub async fn quote(&self, symbol_name: &str, max_age: chrono::Duration) -> Option<Quote> {
+        let id = self.get_symbol_id(symbol_name).await.ok()?;
+        let q = *self.quotes.read().unwrap_or_else(|e| e.into_inner()).get(&id)?;
+        (Utc::now() - q.time <= max_age && q.bid > 0.0 && q.ask > 0.0).then_some(q)
     }
 
     /// 口座通貨（JPY など）
@@ -377,13 +570,27 @@ impl CTraderService {
         Err(anyhow!("no symbol to convert {from} into {to}"))
     }
 
+    /// 建値通貨 1 単位を口座通貨に換算するレート
+    pub async fn quote_to_account_rate(&self, symbol_name: &str) -> Result<f64> {
+        let quote = self.quote_currency(symbol_name).await?;
+        let account = self.account_currency().await?;
+        self.conversion_rate(&quote, &account).await
+    }
+
     /// 1 lot・1 pip あたりの損益（口座通貨）。ブローカーの銘柄仕様と直近レートから求める
     pub async fn pip_value_per_lot(&self, symbol_name: &str) -> Result<f64> {
         let spec = self.symbol_spec(symbol_name).await?;
-        let quote = self.quote_currency(symbol_name).await?;
-        let account = self.account_currency().await?;
-        let rate = self.conversion_rate(&quote, &account).await?;
+        let rate = self.quote_to_account_rate(symbol_name).await?;
         Ok(spec.pip_value_per_lot(rate))
+    }
+
+    /// 過去データ要求の順番待ち。前回の要求から `HISTORICAL_REQ_INTERVAL` 空くまで待つ
+    async fn wait_historical_slot(&self) {
+        let mut last = self.last_historical_req.lock().await;
+        if let Some(t) = *last {
+            tokio::time::sleep_until(t + HISTORICAL_REQ_INTERVAL).await;
+        }
+        *last = Some(Instant::now());
     }
 
     /// 過去のローソク足（Trendbars）を取得
@@ -406,6 +613,7 @@ impl CTraderService {
             from_timestamp: None,
         };
 
+        self.wait_historical_slot().await;
         let res: ProtoOaGetTrendbarsRes = self
             .client
             .command(
@@ -465,6 +673,7 @@ impl CTraderService {
                 from_timestamp: Some(cursor.timestamp_millis()),
                 to_timestamp: Some(chunk_end.timestamp_millis()),
             };
+            self.wait_historical_slot().await;
             let res: ProtoOaGetTrendbarsRes = self
                 .client
                 .command(
@@ -478,8 +687,6 @@ impl CTraderService {
             all.extend(res.trendbar.iter().map(CandleBar::from_proto));
             debug!("Fetched {} {:?} bars for {} ({} .. {})", n, period, symbol_name, cursor, chunk_end);
             cursor = chunk_end;
-            // レート制限への配慮
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         }
 
         all.sort_by_key(|b| b.timestamp);
@@ -531,18 +738,17 @@ impl CTraderService {
             .reconcile(self.config.account_id, false)
             .await
             .context("Failed to reconcile positions from cTrader")?;
-        let symbols = self.symbols.read().await;
-        let by_id: HashMap<i64, String> = symbols.values().map(|s| (s.symbol_id, s.symbol_name.clone())).collect();
-        Ok(res
-            .position
-            .iter()
-            .map(|p| BrokerPosition {
+        let by_id: HashMap<i64, String> =
+            self.symbols.read().await.values().map(|s| (s.symbol_id, s.symbol_name.clone())).collect();
+        let mut out = Vec::with_capacity(res.position.len());
+        for p in &res.position {
+            out.push(BrokerPosition {
                 position_id: p.position_id,
                 symbol_id: p.trade_data.symbol_id,
                 // 設定・発注と同じく、ブローカーの銘柄名（USDJPY_z など）のまま扱う
                 symbol_name: by_id.get(&p.trade_data.symbol_id).cloned(),
                 is_buy: p.trade_data.trade_side == ProtoOaTradeSide::Buy as i32,
-                volume_lots: volume_to_lots(p.trade_data.volume),
+                volume_lots: self.volume_to_lots_by_id(p.trade_data.symbol_id, p.trade_data.volume).await,
                 entry_price: p.price,
                 stop_loss: p.stop_loss,
                 take_profit: p.take_profit,
@@ -550,8 +756,12 @@ impl CTraderService {
                     .trade_data
                     .open_timestamp
                     .and_then(|ms| chrono::TimeZone::timestamp_millis_opt(&Utc, ms).single()),
-            })
-            .collect())
+                used_margin: p
+                    .used_margin
+                    .map(|m| m as f64 / 10f64.powi(p.money_digits.unwrap_or(2) as i32)),
+            });
+        }
+        Ok(out)
     }
 
     /// 指定ポジションの決済（closing deal）をブローカーの約定履歴から取得する。
@@ -603,7 +813,9 @@ impl CTraderService {
             gross_profit,
             swap,
             commission,
-            volume_lots: volume_to_lots(detail.closed_volume.unwrap_or(d.filled_volume)),
+            volume_lots: self
+                .volume_to_lots_by_id(d.symbol_id, detail.closed_volume.unwrap_or(d.filled_volume))
+                .await,
         }))
     }
 
@@ -728,8 +940,8 @@ impl CTraderService {
     }
 
     /// サーバーサイドSL/TP付き成行注文の発行（デモ検証・本番兼用）
-    /// `volume`: 0.01 lot = 100
-    /// `rel_sl_points`: 1 pip = 10 points = 1000 in protocol (5-digit pair)
+    /// `volume`: 数量の 1/100 単位（`lots_to_volume` で銘柄の lot サイズから求める）
+    /// `rel_sl_points`: 価格差の 10^5 倍（`executor::relative_points`）
     pub async fn place_market_order_with_sltp(
         &self,
         symbol_name: &str,
@@ -890,9 +1102,17 @@ fn order_error_hint(error_code: &str) -> &'static str {
 ///
 /// 成行注文の結果は clientMsgId を持たないためライブラリの request/response 機構では
 /// 受け取れない。ここでデコードしてログに残し、発注側へ配信する。
-fn handle_unsolicited_event(msg: ProtoMessage, tx: &broadcast::Sender<OrderOutcome>) {
+fn handle_unsolicited_event(
+    msg: ProtoMessage,
+    tx: &broadcast::Sender<OrderOutcome>,
+    quotes: &std::sync::RwLock<HashMap<i64, Quote>>,
+) {
     let payload = msg.payload.as_deref().unwrap_or_default();
     match msg.payload_type {
+        t if t == ProtoOaPayloadType::ProtoOaSpotEvent as u32 => match ProtoOaSpotEvent::decode(payload) {
+            Ok(ev) => apply_spot(quotes, &ev),
+            Err(e) => warn!("Failed to decode ProtoOASpotEvent: {e}"),
+        },
         t if t == ProtoOaPayloadType::ProtoOaExecutionEvent as u32 => {
             match ProtoOaExecutionEvent::decode(payload) {
                 Ok(ev) => {
@@ -947,16 +1167,102 @@ fn handle_unsolicited_event(msg: ProtoMessage, tx: &broadcast::Sender<OrderOutco
     }
 }
 
+/// 取引時間の判定結果
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MarketStatus {
+    pub open: bool,
+    pub trading_mode: Option<String>,
+    /// 次に開く（閉じる）時刻
+    pub next_change: Option<chrono::DateTime<Utc>>,
+}
+
+/// ProtoOASymbol → 銘柄仕様
+fn to_instrument_spec(sym: &ProtoOaSymbol, info: Option<&SymbolInfo>) -> InstrumentSpec {
+    InstrumentSpec {
+        symbol_name: info.map(|i| i.symbol_name.clone()).unwrap_or_else(|| format!("symbol-{}", sym.symbol_id)),
+        pip_position: sym.pip_position,
+        digits: sym.digits,
+        // lotSize は数量の 1/100 単位（FX の 1 lot = 100,000 通貨 → 10,000,000）
+        lot_units: sym.lot_size.filter(|v| *v > 0).map(|v| v as f64 / 100.0).unwrap_or(100_000.0),
+        min_volume: sym.min_volume,
+        step_volume: sym.step_volume,
+        max_volume: sym.max_volume,
+        asset_class: info.and_then(|i| i.asset_class.clone()),
+        category: info.and_then(|i| i.category.clone()),
+        description: info.and_then(|i| i.description.clone()),
+        base_asset: info.and_then(|i| i.base_asset.clone()),
+        quote_asset: info.and_then(|i| i.quote_asset.clone()),
+        measurement_units: sym.measurement_units.clone().filter(|u| !u.is_empty()),
+        trading_mode: sym
+            .trading_mode
+            .and_then(|m| ProtoOaTradingMode::try_from(m).ok())
+            .map(|m| m.as_str_name().to_string()),
+        schedule: sym
+            .schedule
+            .iter()
+            .map(|i| WeeklyInterval { start_second: i.start_second, end_second: i.end_second })
+            .collect(),
+        schedule_time_zone: sym.schedule_time_zone.clone().filter(|t| !t.is_empty()),
+        holidays: sym
+            .holiday
+            .iter()
+            .map(|h| Holiday {
+                name: h.name.clone(),
+                date_days: h.holiday_date,
+                recurring: h.is_recurring,
+                start_second: h.start_second,
+                end_second: h.end_second,
+                time_zone: h.schedule_time_zone.clone(),
+            })
+            .collect(),
+    }
+}
+
+/// Spot イベントで気配値を更新する。bid/ask は変化した側しか送られてこないので、前回値を引き継ぐ
+fn apply_spot(quotes: &std::sync::RwLock<HashMap<i64, Quote>>, ev: &ProtoOaSpotEvent) {
+    let mut map = quotes.write().unwrap_or_else(|e| e.into_inner());
+    let prev = map.get(&ev.symbol_id).copied();
+    let bid = ev.bid.map(|b| b as f64 / PRICE_SCALE).or(prev.map(|q| q.bid));
+    let ask = ev.ask.map(|a| a as f64 / PRICE_SCALE).or(prev.map(|q| q.ask));
+    if let (Some(bid), Some(ask)) = (bid, ask) {
+        let time = ev
+            .timestamp
+            .and_then(|ms| chrono::TimeZone::timestamp_millis_opt(&Utc, ms).single())
+            .unwrap_or_else(Utc::now);
+        map.insert(ev.symbol_id, Quote { bid, ask, time });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spot_events_carry_over_the_unchanged_side() {
+        let quotes = std::sync::RwLock::new(HashMap::new());
+        let ev = |bid: Option<u64>, ask: Option<u64>| ProtoOaSpotEvent {
+            symbol_id: 41,
+            bid,
+            ask,
+            timestamp: Some(1_790_000_000_000),
+            ..Default::default()
+        };
+        // 片側だけでは気配値にならない
+        apply_spot(&quotes, &ev(Some(265_012_000), None));
+        assert!(quotes.read().unwrap().get(&41).is_none());
+        apply_spot(&quotes, &ev(Some(265_012_000), Some(265_030_000)));
+        apply_spot(&quotes, &ev(None, Some(265_040_000)));
+        let q = quotes.read().unwrap()[&41];
+        assert!((q.bid - 2650.12).abs() < 1e-9 && (q.ask - 2650.40).abs() < 1e-9);
+        assert!((q.spread() - 0.28).abs() < 1e-9);
+    }
 
     #[test]
     fn unknown_symbol_lists_names_containing_the_input() {
         let symbols: HashMap<String, SymbolInfo> = ["USDJPY", "USDJPY_z", "EURUSD_z"]
             .into_iter()
             .enumerate()
-            .map(|(i, n)| (n.to_uppercase(), SymbolInfo::new_with_defaults(i as i64, n.to_string())))
+            .map(|(i, n)| (n.to_uppercase(), SymbolInfo::new(i as i64, n.to_string())))
             .collect();
         let msg = unknown_symbol_message("usdjp", &symbols);
         assert!(msg.ends_with("candidates: USDJPY, USDJPY_z"), "{msg}");

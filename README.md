@@ -1,6 +1,8 @@
-# ntrade: LLM駆動型 FX自動売買システム
+# ntrade: LLM駆動型 CFD・FX自動売買システム
 
-主要通貨ペア（USD/JPY, EUR/USD）を対象とし、マルチタイムフレーム（5分足〜4時間足）の市場データ（数値指標・チャート画像）を元に、LLM（Gemini / Claude / ChatGPT等）の推論を活用して自動売買を行うローカル運用型のトレードシステムです。
+FX・貴金属（XAUUSD など）・株価指数・エネルギーの CFD をレバレッジを掛けて取引する、ローカル運用型の自動売買システムです。
+公的統計・国債利回り・CFTC 建玉明細・指標予定・公式発表といった**ファンダメンタルズの事実**（API で取得、見解を含まないもの）から LLM が地合いを読み、
+価格の数値（ATR・前日高安・スイングなど）でエントリーと損切りの位置を決めます。LLM は判断時に Web にアクセスせず、チャート画像も読みません。
 
 - **バックエンド**: Rust 1.98 (Tokio + Axum + cTrader Open API + plotters + SQLite)
 - **フロントエンド**: Next.js 16 (App Router) + React 19 + Tailwind CSS v4 + shadcn/ui
@@ -53,3 +55,4 @@ make clean
 - [04. ロードマップ & 確定技術スタック](./docs/04_roadmap_and_tech_stack.md)
 - [05. AI学習プロセス & プロンプト改善サイクル](./docs/05_ai_learning_and_prompt_tuning.md)
 - [06. リプレイ環境（LLM判断の評価・較正基盤）](./docs/06_replay_environment.md)
+- [07. ファンダメンタルズ判断とマルチアセット（CFD・貴金属）対応](./docs/07_fundamentals_and_multi_asset.md)

@@ -410,6 +410,21 @@ export const tradingApi = {
     return await request<ApiResponse<TradingSettings>>("/api/settings");
   },
 
+  /** ブローカーの銘柄一覧（資産クラス付き）。q は銘柄名・説明・資産クラスの部分一致 */
+  async getSymbols(q?: string): Promise<ApiResponse<SymbolCatalogEntry[]>> {
+    return await request<ApiResponse<SymbolCatalogEntry[]>>(`/api/symbols${q ? `?q=${encodeURIComponent(q)}` : ""}`);
+  },
+
+  /** 判断に渡すファンダメンタルズの事実（銘柄ごと） */
+  async getFundamentals(pair?: string): Promise<ApiResponse<FundamentalFacts>> {
+    return await request<ApiResponse<FundamentalFacts>>(`/api/fundamentals${pairQuery(pair)}`);
+  },
+
+  /** 情報源ごとの取得状況 */
+  async getFundamentalsStatus(): Promise<ApiResponse<SourceStatus[]>> {
+    return await request<ApiResponse<SourceStatus[]>>("/api/fundamentals/status");
+  },
+
   /** 取引設定を保存（SQLite）。次の判断サイクルから反映 */
   async saveSettings(settings: TradingSettings): Promise<ApiResponse<TradingSettings>> {
     return await request<ApiResponse<TradingSettings>>("/api/settings", {
@@ -428,7 +443,79 @@ function pairQuery(pair?: string): string {
 export interface TradingSettings {
   pairs: string[];
   barDelaySecs: number;
+  /** LLM に判断させる間隔（分。5 の倍数、UTC 0:00 起点）。プランと終値判定は 5M 足ごと */
+  decisionIntervalMinutes: number;
+  /** 重要指標の発表直後に、判断間隔を待たずに判断する */
+  eventDecisions: boolean;
   guard: GuardConfig;
+}
+
+/** ブローカーの銘柄一覧の1行 */
+export interface SymbolCatalogEntry {
+  symbolId: number;
+  symbolName: string;
+  description: string | null;
+  category: string | null;
+  assetClass: string | null;
+  baseAsset: string | null;
+  quoteAsset: string | null;
+  enabled: boolean;
+}
+
+export interface FundamentalObservation {
+  date: string;
+  value: number;
+}
+
+/** Rust 側 FundamentalFacts（snake_case のまま） */
+export interface FundamentalFacts {
+  symbol: string;
+  as_of: string;
+  profile: string | null;
+  series: {
+    id: string;
+    title: string;
+    units: string | null;
+    source: string;
+    latest: FundamentalObservation | null;
+    previous: FundamentalObservation | null;
+    about_1m_ago: FundamentalObservation | null;
+    about_3m_ago: FundamentalObservation | null;
+    about_12m_ago: FundamentalObservation | null;
+  }[];
+  positioning_cftc: {
+    code: string;
+    market: string;
+    trader_group: string;
+    weeks: { report_date: string; long: number; short: number; net: number; open_interest: number | null }[];
+    net_52w_high: number | null;
+    net_52w_low: number | null;
+  }[];
+  economic_calendar: {
+    time_utc: string;
+    currency: string;
+    title: string;
+    impact?: string;
+    forecast?: string;
+    previous: string | null;
+    released: boolean;
+  }[];
+  official_releases: { source: string; published_utc: string; title: string }[];
+  related_markets: {
+    symbol: string;
+    last_daily_close: number;
+    last_daily_bar: string;
+    change_1d_pct: number | null;
+    change_5d_pct: number | null;
+    change_20d_pct: number | null;
+  }[];
+  unavailable: SourceStatus[];
+}
+
+export interface SourceStatus {
+  source: string;
+  fetched_at: string | null;
+  error: string | null;
 }
 
 export interface RuntimeInfo {
@@ -455,6 +542,8 @@ export interface GuardConfig {
   min_rr: number;
   sl_atr_min: number;
   sl_atr_max: number;
+  /** SL 幅の上限を測る ATR の時間足（下限は常に 5M ATR） */
+  sl_atr_max_tf: "5m" | "15m" | "1h" | "4h";
   sl_min_pips: number;
   max_positions_per_pair: number;
   max_positions_total: number;
@@ -463,7 +552,14 @@ export interface GuardConfig {
   fixed_volume_lots: number;
   risk_pct: number | null;
   pip_value_per_lot: number | null;
+  /** 銘柄ごとのスプレッド上限（pips）。default は FX にだけ適用 */
   max_spread_pips: Record<string, number>;
+  /** スプレッド上限（5M ATR 比、全銘柄）。null なら使わない */
+  max_spread_atr: number | null;
+  /** 発注後の証拠金使用率の上限（%）。null なら見ない */
+  max_margin_usage_pct: number | null;
+  /** 発注後の実効レバレッジの上限（倍）。null なら見ない */
+  max_effective_leverage: number | null;
   news_blackout: { time: string; before_min: number; after_min: number; label: string }[];
   /** 損切りの執行方法。touch = ブローカーの SL（ヒゲ判定） / close = 5M 確定足の終値で判定 */
   stop_mode: "touch" | "close";
@@ -591,8 +687,17 @@ export interface MarketSnapshot {
   pair: string;
   timestamp: string;
   session: string;
+  instrument: {
+    asset_class: string | null;
+    description: string | null;
+    lot_units: number | null;
+    measurement_units: string | null;
+    digits: number;
+    next_market_change: string | null;
+  };
   current_price: number;
-  spread_pips: number;
+  /** 気配値が取れていなければ null */
+  spread_pips: number | null;
   volatility: {
     atr14_5m_pips: number | null;
     atr14_15m_pips: number | null;

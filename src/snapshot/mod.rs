@@ -59,6 +59,42 @@ pub struct Volatility {
     pub today_range_vs_avg: Option<f64>,
 }
 
+/// ガードで ATR を測る時間足
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum AtrTimeframe {
+    #[serde(rename = "5m")]
+    M5,
+    #[serde(rename = "15m")]
+    M15,
+    #[default]
+    #[serde(rename = "1h")]
+    H1,
+    #[serde(rename = "4h")]
+    H4,
+}
+
+impl AtrTimeframe {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::M5 => "5M",
+            Self::M15 => "15M",
+            Self::H1 => "1H",
+            Self::H4 => "4H",
+        }
+    }
+}
+
+impl Volatility {
+    pub fn atr_pips(&self, tf: AtrTimeframe) -> Option<f64> {
+        match tf {
+            AtrTimeframe::M5 => self.atr14_5m_pips,
+            AtrTimeframe::M15 => self.atr14_15m_pips,
+            AtrTimeframe::H1 => self.atr14_1h_pips,
+            AtrTimeframe::H4 => self.atr14_4h_pips,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReferenceLevels {
     pub prev_day_high: Option<f64>,
@@ -124,14 +160,51 @@ pub struct AccountState {
     pub triggered_plan: Option<TriggeredPlan>,
 }
 
+/// 銘柄の素性（ブローカーの銘柄仕様から。未取得なら銘柄名と pip 幅だけ）
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InstrumentFacts {
+    /// ブローカーの資産クラス（Forex / Metals / Indices / Energy など。ブローカーの表記のまま）
+    pub asset_class: Option<String>,
+    pub description: Option<String>,
+    pub base_asset: Option<String>,
+    pub quote_asset: Option<String>,
+    /// 1 lot の数量と単位（100,000 通貨、100 oz など）
+    pub lot_units: Option<f64>,
+    pub measurement_units: Option<String>,
+    pub digits: usize,
+    /// ブローカーの取引時間で、次に市場が閉じる（開く）時刻。スケジュールが無ければ null
+    pub next_market_change: Option<String>,
+}
+
+impl InstrumentFacts {
+    fn of(pair: &str, now: DateTime<Utc>) -> Self {
+        let spec = crate::instrument::get(pair);
+        Self {
+            asset_class: spec.as_ref().and_then(|s| s.asset_class.clone()),
+            description: spec.as_ref().and_then(|s| s.description.clone()),
+            base_asset: spec.as_ref().and_then(|s| s.base_asset.clone()),
+            quote_asset: spec.as_ref().and_then(|s| s.quote_asset.clone()),
+            lot_units: spec.as_ref().map(|s| s.lot_units),
+            measurement_units: spec.as_ref().and_then(|s| s.measurement_units.clone()),
+            digits: crate::instrument::price_digits(pair),
+            next_market_change: spec
+                .as_ref()
+                .and_then(|s| s.next_transition(now))
+                .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string()),
+        }
+    }
+}
+
 /// LLM に渡す客観的事実の集合
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MarketSnapshot {
     pub pair: String,
     pub timestamp: String,
     pub session: Session,
+    pub instrument: InstrumentFacts,
     pub current_price: f64,
-    pub spread_pips: f64,
+    /// 直近の気配値のスプレッド（pips）。気配値が取れていなければ null
+    pub spread_pips: Option<f64>,
     pub pip_size: f64,
     pub volatility: Volatility,
     pub reference_levels: ReferenceLevels,
@@ -162,7 +235,7 @@ pub struct SnapshotInput<'a> {
     pub bars_1h: &'a [CandleBar],
     pub bars_15m: &'a [CandleBar],
     pub bars_5m: &'a [CandleBar],
-    pub spread_pips: f64,
+    pub spread_pips: Option<f64>,
     /// None なら 5M 最新足の終値
     pub current_price: Option<f64>,
     /// None なら 5M 最新足の時刻（リプレイ時は評価時刻を明示的に渡す）
@@ -231,6 +304,7 @@ impl MarketSnapshot {
             pair: input.pair.to_string(),
             timestamp: now.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
             session: session_at(now),
+            instrument: InstrumentFacts::of(input.pair, now),
             current_price,
             spread_pips: input.spread_pips,
             pip_size: pip,
@@ -479,7 +553,7 @@ mod tests {
                 bars_1h: &b1h,
                 bars_15m: &b15,
                 bars_5m: &b5,
-                spread_pips: 0.2,
+                spread_pips: Some(0.2),
                 current_price: None,
                 now: Some(now),
                 account_state: AccountState::default(),
@@ -509,7 +583,7 @@ mod tests {
                 bars_1h: &[],
                 bars_15m: &[],
                 bars_5m: &[],
-                spread_pips: 0.3,
+                spread_pips: Some(0.3),
                 current_price: None,
                 now: None,
                 account_state: AccountState::default(),
@@ -538,7 +612,7 @@ mod tests {
                 bars_1h: &b1h,
                 bars_15m: &b15,
                 bars_5m: &b5,
-                spread_pips: 0.2,
+                spread_pips: Some(0.2),
                 current_price: None,
                 now: Some(now),
                 account_state: AccountState::default(),

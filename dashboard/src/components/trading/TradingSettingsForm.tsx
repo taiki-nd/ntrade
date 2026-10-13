@@ -8,15 +8,16 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Separator } from "@/components/ui/separator";
-import { ShieldCheck, Loader2, Plus, Save, Undo2, X } from "lucide-react";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { ShieldCheck, Loader2, Plus, Save, Search, Undo2, X } from "lucide-react";
 import { toast } from "sonner";
-import { tradingApi, type GuardConfig, type TradingSettings } from "@/lib/trading-api";
+import { tradingApi, type GuardConfig, type SymbolCatalogEntry, type TradingSettings } from "@/lib/trading-api";
 
 type NumericGuardKey = {
   [K in keyof GuardConfig]: GuardConfig[K] extends number ? K : never;
 }[keyof GuardConfig];
 
-type NullableGuardKey = "risk_pct" | "pip_value_per_lot";
+type NullableGuardKey = "risk_pct" | "pip_value_per_lot" | "max_spread_atr" | "max_margin_usage_pct" | "max_effective_leverage";
 
 interface NumberFieldProps {
   label: string;
@@ -26,6 +27,8 @@ interface NumberFieldProps {
   placeholder?: string;
   onChange: (v: number | null) => void;
 }
+
+const ATR_TF_LABELS: Record<GuardConfig["sl_atr_max_tf"], string> = { "5m": "5M", "15m": "15M", "1h": "1H", "4h": "4H" };
 
 /** 空欄は null として返す（必須項目は呼び出し側で 0 に倒し、エンジン側の検証で弾く） */
 function NumberField({ label, hint, value, step = "any", placeholder, onChange }: NumberFieldProps) {
@@ -50,6 +53,25 @@ export function TradingSettingsForm() {
   const [draft, setDraft] = React.useState<TradingSettings | null>(null);
   const [newPair, setNewPair] = React.useState("");
   const [saving, setSaving] = React.useState(false);
+  const [symbolHits, setSymbolHits] = React.useState<SymbolCatalogEntry[]>([]);
+
+  // ブローカーの銘柄一覧から候補を出す（入力 2 文字以上、少し待ってから問い合わせる）
+  React.useEffect(() => {
+    const q = newPair.trim();
+    const id = setTimeout(async () => {
+      if (q.length < 2) {
+        setSymbolHits([]);
+        return;
+      }
+      try {
+        const res = await tradingApi.getSymbols(q);
+        setSymbolHits(res.success && res.data ? res.data.filter((s) => s.enabled).slice(0, 12) : []);
+      } catch {
+        setSymbolHits([]);
+      }
+    }, 300);
+    return () => clearTimeout(id);
+  }, [newPair]);
 
   const load = React.useCallback(async () => {
     try {
@@ -84,9 +106,9 @@ export function TradingSettingsForm() {
   const setNum = (key: NumericGuardKey) => (v: number | null) => setGuard({ [key]: v ?? 0 } as Partial<GuardConfig>);
   const setNullable = (key: NullableGuardKey) => (v: number | null) => setGuard({ [key]: v } as Partial<GuardConfig>);
 
-  const addPair = () => {
+  const addPair = (name?: string) => {
     // ブローカーの銘柄名をそのまま使う（ゼロ口座は USDJPY_z）。表記の正規化は保存時にエンジンが一覧に合わせて行う
-    const p = newPair.trim().replace("/", "");
+    const p = (name ?? newPair).trim().replace("/", "");
     if (!p) return;
     if (!draft.pairs.some((x) => x.toLowerCase() === p.toLowerCase())) setDraft({ ...draft, pairs: [...draft.pairs, p] });
     setNewPair("");
@@ -147,10 +169,11 @@ export function TradingSettingsForm() {
         {/* 対象ペア */}
         <section className="space-y-3">
           <div>
-            <h3 className="text-sm font-medium">対象ペア</h3>
+            <h3 className="text-sm font-medium">対象銘柄</h3>
             <p className="text-xs text-muted-foreground">
-              cTrader の銘柄名をそのまま入力します（ゼロ口座なら <code className="font-mono">USDJPY_z</code>。素の <code className="font-mono">USDJPY</code> は発注できません）。
-              5分足確定ごとに全ペアを並行に判断し、先頭のペアが画面と API の既定になります（クリックで先頭へ）。
+              FX・貴金属・株価指数・エネルギーの CFD を選べます。名前や資産クラス（gold, Metals, Indices など）で検索すると、cTrader の銘柄一覧から候補が出ます
+              （ゼロ口座なら <code className="font-mono">USDJPY_z</code> のようにサフィックス付き。素の <code className="font-mono">USDJPY</code> は発注できません）。
+              ロットサイズ・最小発注量・取引時間はブローカーの銘柄仕様から自動で取ります。先頭の銘柄が画面と API の既定になります（クリックで先頭へ）。
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-1.5">
@@ -165,26 +188,56 @@ export function TradingSettingsForm() {
               </Badge>
             ))}
           </div>
-          <div className="flex items-center gap-2 max-w-xs">
-            <Input
-              value={newPair}
-              placeholder="EURUSD_z"
-              onChange={(e) => setNewPair(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && addPair()}
-              className="h-8 text-xs font-mono"
-            />
-            <Button variant="outline" size="sm" onClick={addPair} className="h-8 gap-1 text-xs">
+          <div className="flex items-center gap-2 max-w-sm">
+            <div className="relative flex-1">
+              <Search className="absolute left-2 top-2 h-4 w-4 text-muted-foreground" />
+              <Input
+                value={newPair}
+                placeholder="XAUUSD_z / gold / Indices"
+                onChange={(e) => setNewPair(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && addPair()}
+                className="h-8 pl-8 text-xs font-mono"
+              />
+            </div>
+            <Button variant="outline" size="sm" onClick={() => addPair()} className="h-8 gap-1 text-xs">
               <Plus className="h-3.5 w-3.5" />
               追加
             </Button>
           </div>
-          <div className="max-w-xs">
+          {symbolHits.length > 0 && (
+            <div className="flex flex-wrap gap-1.5">
+              {symbolHits.map((s) => (
+                <Badge
+                  key={s.symbolId}
+                  variant="secondary"
+                  className="cursor-pointer gap-1.5 font-normal"
+                  title={s.description ?? undefined}
+                  onClick={() => addPair(s.symbolName)}
+                >
+                  <span className="font-mono">{s.symbolName}</span>
+                  <span className="text-muted-foreground">{s.assetClass ?? s.category ?? ""}</span>
+                </Badge>
+              ))}
+            </div>
+          )}
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
             <NumberField
               label="足確定後の待ち秒数"
               step="1"
               value={draft.barDelaySecs}
               onChange={(v) => setDraft({ ...draft, barDelaySecs: v ?? 0 })}
             />
+            <NumberField
+              label="LLM の判断間隔（分）"
+              step="5"
+              value={draft.decisionIntervalMinutes}
+              onChange={(v) => setDraft({ ...draft, decisionIntervalMinutes: v ?? 5 })}
+              hint="5 の倍数（UTC 0:00 起点）。プランの成立と終値判定の損切りは 5 分足ごとに見ます"
+            />
+          </div>
+          <div className="flex items-center gap-2">
+            <Switch checked={draft.eventDecisions} onCheckedChange={(v) => setDraft({ ...draft, eventDecisions: v })} />
+            <Label className="text-xs">重要指標の発表直後（5 分足 1 本確定後）に、判断間隔を待たずに判断する</Label>
           </div>
         </section>
 
@@ -193,16 +246,36 @@ export function TradingSettingsForm() {
         {/* エントリー検証 */}
         <section className="space-y-3">
           <h3 className="text-sm font-medium">エントリー検証</h3>
-          <div className="flex items-center gap-2">
-            <Switch checked={g.observed_check} onCheckedChange={(v) => setGuard({ observed_check: v })} />
-            <Label className="text-xs">観測整合チェック（LLM が読んだ最新足時刻が Snapshot と一致しなければ HOLD）</Label>
-          </div>
           <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
             <NumberField label="確信度の下限 (0〜1)" value={g.min_confidence} onChange={setNum("min_confidence")} />
             <NumberField label="リスクリワード下限" value={g.min_rr} onChange={setNum("min_rr")} />
-            <NumberField label="SL 最小幅 (pips)" value={g.sl_min_pips} onChange={setNum("sl_min_pips")} />
+            <NumberField label="SL 最小幅 (pips, FX のみ)" value={g.sl_min_pips} onChange={setNum("sl_min_pips")} />
             <NumberField label="SL 幅 下限 (5M ATR 比)" value={g.sl_atr_min} onChange={setNum("sl_atr_min")} />
-            <NumberField label="SL 幅 上限 (5M ATR 比)" value={g.sl_atr_max} onChange={setNum("sl_atr_max")} />
+            <NumberField
+              label={`SL 幅 上限 (${ATR_TF_LABELS[g.sl_atr_max_tf]} ATR 比)`}
+              value={g.sl_atr_max}
+              onChange={setNum("sl_atr_max")}
+            />
+            <div className="space-y-1.5">
+              <Label className="text-xs text-muted-foreground">SL 幅 上限を測る時間足</Label>
+              <Select
+                value={g.sl_atr_max_tf}
+                items={ATR_TF_LABELS}
+                onValueChange={(v) => setGuard({ sl_atr_max_tf: v as GuardConfig["sl_atr_max_tf"] })}
+              >
+                <SelectTrigger size="sm" className="h-8 w-full text-xs">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {Object.entries(ATR_TF_LABELS).map(([v, l]) => (
+                    <SelectItem key={v} value={v}>
+                      {l}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-[11px] text-muted-foreground">LLM は上位足の構造で SL を置くため、5M だと値幅の大きい銘柄はほぼ弾かれます</p>
+            </div>
             <NumberField label="条件付きプラン最長 (時間)" value={g.plan_max_hours} onChange={setNum("plan_max_hours")} />
           </div>
         </section>
@@ -259,7 +332,21 @@ export function TradingSettingsForm() {
               value={g.pip_value_per_lot}
               placeholder="自動（ブローカーのレート）"
               onChange={setNullable("pip_value_per_lot")}
-              hint="空欄ならペアごとにレートから自動計算"
+              hint="空欄なら銘柄ごとに仕様とレートから自動計算（CFD は空欄を推奨）"
+            />
+            <NumberField
+              label="証拠金使用率の上限 (%)"
+              value={g.max_margin_usage_pct}
+              placeholder="制限なし"
+              onChange={setNullable("max_margin_usage_pct")}
+              hint="発注後の 使用証拠金 / 有効証拠金。必要証拠金はブローカーに問い合わせる"
+            />
+            <NumberField
+              label="実効レバレッジの上限 (倍)"
+              value={g.max_effective_leverage}
+              placeholder="制限なし"
+              onChange={setNullable("max_effective_leverage")}
+              hint="発注後の 想定元本合計 / 有効証拠金"
             />
           </div>
         </section>
@@ -269,8 +356,19 @@ export function TradingSettingsForm() {
         {/* スプレッド上限 */}
         <section className="space-y-3">
           <div>
-            <h3 className="text-sm font-medium">スプレッド上限 (pips)</h3>
-            <p className="text-xs text-muted-foreground">銘柄名（USDJPY_z など）ごとに上書きできます。一致しない銘柄は default を使います。</p>
+            <h3 className="text-sm font-medium">スプレッド上限</h3>
+            <p className="text-xs text-muted-foreground">
+              銘柄名（USDJPY_z など）ごとに pips で指定できます。default は FX にだけ当てます（XAUUSD や株価指数は pip の大きさが違うため）。
+              5M ATR 比の上限は全銘柄に当てます。スプレッドは cTrader の気配値から取ります。
+            </p>
+          </div>
+          <div className="max-w-xs">
+            <NumberField
+              label="5M ATR 比の上限"
+              value={g.max_spread_atr}
+              placeholder="使わない"
+              onChange={setNullable("max_spread_atr")}
+            />
           </div>
           <div className="space-y-2 max-w-md">
             {spreads.map(([k, v], i) => (
@@ -301,7 +399,7 @@ export function TradingSettingsForm() {
             ))}
             <Button variant="outline" size="sm" onClick={() => setSpreads([...spreads, ["", 1.0]])} className="h-8 gap-1 text-xs">
               <Plus className="h-3.5 w-3.5" />
-              ペアを追加
+              銘柄を追加
             </Button>
           </div>
         </section>

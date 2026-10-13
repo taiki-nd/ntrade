@@ -1,7 +1,9 @@
 pub mod chart;
 pub mod ctrader;
 pub mod executor;
+pub mod fundamentals;
 pub mod guard;
+pub mod instrument;
 pub mod llm;
 pub mod reflection;
 pub mod replay;

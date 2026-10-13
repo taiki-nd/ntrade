@@ -22,10 +22,9 @@ pub trait LlmBackend: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct LlmClientConfig {
     pub cli_binary: String,
-    /// 画像4枚の Read が各1ターン入るため、テキストのみの場合より長めに取る
     pub timeout_secs: u64,
     pub max_turns: u32,
-    /// 許可するツール。画像を読むために Read が必要。
+    /// 許可するツール。判断はプロンプトの事実だけで行うので既定は空（すべて無効）
     pub allowed_tools: Vec<String>,
     /// None なら CLI のデフォルトモデル
     pub model: Option<String>,
@@ -36,12 +35,15 @@ impl Default for LlmClientConfig {
         Self {
             cli_binary: "claude".to_string(),
             timeout_secs: 120,
-            max_turns: 8,
-            allowed_tools: vec!["Read".to_string()],
+            max_turns: 3,
+            allowed_tools: Vec::new(),
             model: None,
         }
     }
 }
+
+/// 判断時に使わせないツール（外部の情報を取りに行けるもの）
+const WEB_TOOLS: [&str; 2] = ["WebSearch", "WebFetch"];
 
 /// `claude -p` を使う LLM クライアント
 pub struct LlmClient {
@@ -105,7 +107,12 @@ impl LlmClient {
             .arg("--max-turns")
             .arg(self.config.max_turns.to_string())
             .arg("--tools")
-            .arg(self.config.allowed_tools.join(","));
+            .arg(self.config.allowed_tools.join(","))
+            // 判断はプロンプトに渡した事実だけで行わせる。Web 系ツールを明示的に禁じ、
+            // ユーザー設定の MCP サーバー（Web 検索や外部コネクタを含みうる）も読み込ませない
+            .arg("--disallowedTools")
+            .arg(WEB_TOOLS.join(","))
+            .arg("--strict-mcp-config");
         if let Some(model) = &self.config.model {
             cmd.arg("--model").arg(model);
         }

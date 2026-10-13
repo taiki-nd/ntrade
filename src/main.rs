@@ -32,6 +32,9 @@ async fn main() -> Result<()> {
     // cTrader トークンの期限監視・自動更新（SQLite に保存）と切断時の再接続
     tokio::spawn(state.clone().run_token_refresh_loop());
 
+    // ファンダメンタルズの事実データの定期取得（判断サイクルはキャッシュを読むだけ）
+    tokio::spawn(ntrade::fundamentals::run_loop(state.fundamentals.clone()));
+
     // ブローカーとの建玉照合（SL/TP 執行の取り込み）。bot の稼働状態に依らず常時回す
     tokio::spawn(state.clone().run_reconcile_loop());
 
@@ -65,6 +68,8 @@ async fn main() -> Result<()> {
     info!("  - GET  /api/plans, DELETE /api/plans/:id");
     info!("  - GET  /api/guard/config");
     info!("  - GET  /api/settings, PUT /api/settings");
+    info!("  - GET  /api/symbols?q=, /api/symbols/spec?pair=");
+    info!("  - GET  /api/fundamentals?pair=, /api/fundamentals/status, POST /api/fundamentals/refresh");
     info!("  - GET  /api/replay/runs, /api/replay/runs/:id, /api/replay/coverage");
     info!("  - GET  /api/auth/ctrader/url");
     info!("  - POST /api/auth/ctrader/exchange");

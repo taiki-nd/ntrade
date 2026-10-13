@@ -35,7 +35,10 @@ pub async fn get_status(State(state): State<AppState>) -> Json<AccountMetrics> {
 
     // ペアごとの直近 Snapshot のスプレッドを反映
     for (pair, bundle) in state.latest_snapshots.read().await.iter() {
-        metrics.spreads.insert(pair.clone(), bundle.snapshot.spread_pips);
+        match bundle.snapshot.spread_pips {
+            Some(spread) => metrics.spreads.insert(pair.clone(), spread),
+            None => metrics.spreads.remove(pair),
+        };
     }
 
     if let Some(ctrader) = ctrader_opt {

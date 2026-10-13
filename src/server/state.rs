@@ -9,6 +9,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::ctrader::{token, BarPeriod, CTraderConfig, CTraderService, TokenSet};
 use crate::executor::{CTraderOrderSink, DisconnectedOrderSink, OrderSink, PlanBook};
+use crate::fundamentals::FundamentalsService;
 use crate::guard::GuardConfig;
 use crate::llm::{LlmClient, LlmClientConfig};
 use crate::snapshot::measures;
@@ -39,6 +40,8 @@ pub struct AppState {
     pub plan_book: Arc<RwLock<PlanBook>>,
     /// LLM 推論クライアント
     pub llm: Arc<LlmClient>,
+    /// ファンダメンタルズの事実データ（公的統計・建玉報告・指標予定・公式発表）
+    pub fundamentals: Arc<FundamentalsService>,
     /// 発注先（cTrader 接続時は CTraderOrderSink、未接続時は DisconnectedOrderSink）
     pub order_sink: Arc<RwLock<Arc<dyn OrderSink>>>,
     /// 判断サイクル（読み取り側・ペア間で並行可）と cTrader 接続の差し替え（書き込み側）の排他
@@ -287,6 +290,7 @@ impl AppState {
             None => cfg,
         });
 
+        let fundamentals = Arc::new(FundamentalsService::new(db_path.clone()));
         Self {
             bot_state: Arc::new(RwLock::new(BotState::Running)),
             metrics: Arc::new(RwLock::new(metrics)),
@@ -300,6 +304,7 @@ impl AppState {
             settings: Arc::new(RwLock::new(settings)),
             plan_book: Arc::new(RwLock::new(PlanBook::default())),
             llm: Arc::new(LlmClient::new(LlmClientConfig::default())),
+            fundamentals,
             order_sink: Arc::new(RwLock::new(Arc::new(DisconnectedOrderSink))),
             cycle_gate: Arc::new(RwLock::new(())),
             pair_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -359,7 +364,8 @@ impl AppState {
         *self.ctrader_service.write().await = Some(service_arc.clone());
         *self.ctrader_config.write().await = Some(cfg.clone());
         info!("cTrader connected: live order sink installed ({})", if cfg.is_live { "LIVE" } else { "DEMO" });
-        *self.order_sink.write().await = self.build_order_sink(service_arc).await;
+        *self.order_sink.write().await = self.build_order_sink(service_arc.clone()).await;
+        self.prepare_symbols(&service_arc, &self.pairs().await).await;
         {
             let mut m_lock = self.metrics.write().await;
             m_lock.connection_status.ctrader = "connected".to_string();
@@ -371,6 +377,22 @@ impl AppState {
             self.on_account_connected().await;
         } else {
             self.sync_broker_account().await;
+        }
+    }
+
+    /// 対象銘柄の仕様（lot サイズ・取引時間など）を取得し、気配値を購読する
+    pub async fn prepare_symbols(&self, ctrader: &CTraderService, pairs: &[String]) {
+        for p in pairs {
+            match ctrader.symbol_spec(p).await {
+                Ok(spec) => info!(
+                    pair = %p, asset_class = ?spec.asset_class, lot_units = spec.lot_units, pip = spec.pip_size(),
+                    min_lots = ?spec.min_lots(), schedule_tz = ?spec.schedule_time_zone, "symbol spec loaded"
+                ),
+                Err(e) => warn!(pair = %p, "failed to load symbol spec: {e:#}"),
+            }
+        }
+        if let Err(e) = ctrader.subscribe_spots(pairs).await {
+            warn!(?pairs, "failed to subscribe spot quotes: {e:#}");
         }
     }
 
@@ -388,7 +410,7 @@ impl AppState {
             .parse()
             .with_context(|| format!("Position id {} is not a cTrader position id", position.id))?;
 
-        let volume = crate::ctrader::lots_to_volume(position.volume_lots);
+        let volume = service.lots_to_volume(&position.symbol, position.volume_lots).await?;
         service
             .close_position_by_id(position_id, volume)
             .await
@@ -534,6 +556,12 @@ impl AppState {
 
         self.sync_broker_account().await;
         let broker = ctrader.get_open_positions().await.context("Failed to reconcile positions")?;
+        {
+            // 使用証拠金はブローカーの建玉ごとの値の合計
+            let mut m = self.metrics.write().await;
+            m.margin = broker.iter().filter_map(|b| b.used_margin).sum();
+            m.free_margin = m.equity - m.margin;
+        }
 
         // 1. ローカルにあってブローカーに無い建玉 = 決済済み
         let local = self.positions.read().await.clone();
@@ -762,6 +790,9 @@ impl AppState {
         self.with_db(move |db| db.save_setting(crate::settings::SETTINGS_KEY, &saved)).await?;
         let prev_pairs = std::mem::replace(&mut *self.settings.write().await, next.clone()).pairs;
         info!(pairs = ?next.pairs, ?prev_pairs, "trading settings updated");
+        if let Some(ctrader) = self.ctrader_service.read().await.clone() {
+            self.prepare_symbols(&ctrader, &next.pairs).await;
+        }
         Ok(next)
     }
 
@@ -792,6 +823,67 @@ impl AppState {
             None
         };
         cfg.volume_lots(balance, sl_pips, live)
+    }
+
+    /// 発注前の証拠金・実効レバレッジの確認。通れば内訳、だめなら理由（`MARGIN_LIMIT: ...` など）を返す。
+    ///
+    /// 必要証拠金はブローカーに問い合わせる（銘柄ごとのレバレッジ設定を ntrade 側で再現しないため）。
+    /// 問い合わせに失敗したときは発注しない（レバレッジを掛ける以上、証拠金が分からないまま建てない）。
+    pub async fn margin_check(
+        &self,
+        cfg: &GuardConfig,
+        pair: &str,
+        action: crate::strategy::types::Action,
+        lots: f64,
+        price: f64,
+    ) -> std::result::Result<String, String> {
+        // どちらの上限も設定されていなければ確認しない（設定していない制約で発注を止めない）
+        if cfg.max_margin_usage_pct.is_none() && cfg.max_effective_leverage.is_none() {
+            return Ok("margin limits not configured; not checked".into());
+        }
+        let ctrader = self.ctrader_service.read().await.clone().ok_or("MARGIN_UNKNOWN: cTrader is not connected")?;
+        let (buy, sell) = ctrader.expected_margin(pair, lots).await.map_err(|e| {
+            let msg = format!("{e:#}");
+            if msg.contains("VOLUME_BELOW_MIN") { msg } else { format!("MARGIN_UNKNOWN: {msg}") }
+        })?;
+        let new_margin = if action == crate::strategy::types::Action::Buy { buy } else { sell };
+        let positions = self.positions.read().await.clone();
+        let (balance, used) = {
+            let m = self.metrics.read().await;
+            (m.balance, m.margin)
+        };
+        let equity = balance + positions.iter().map(|p| p.pnl_amount).sum::<f64>();
+        if equity <= 0.0 {
+            return Err(format!("MARGIN_LIMIT: equity {equity:.0} <= 0"));
+        }
+        let usage = (used + new_margin) / equity * 100.0;
+        let mut detail = format!("margin +{new_margin:.0} (used {used:.0}) / equity {equity:.0} = {usage:.1}%");
+        if let Some(max) = cfg.max_margin_usage_pct.filter(|max| usage > *max) {
+            return Err(format!("MARGIN_LIMIT: {detail} > {max:.1}%"));
+        }
+        if let Some(max_lev) = cfg.max_effective_leverage {
+            // 想定元本 = lot × 1 lot の数量 × 価格 × 建値通貨→口座通貨
+            let notional = |symbol: String, lots: f64, price: f64| {
+                let ctrader = ctrader.clone();
+                async move {
+                    let spec = ctrader.symbol_spec(&symbol).await?;
+                    let rate = ctrader.quote_to_account_rate(&symbol).await?;
+                    anyhow::Ok(lots * spec.lot_units * price * rate)
+                }
+            };
+            let mut total = notional(pair.to_string(), lots, price).await.map_err(|e| format!("MARGIN_UNKNOWN: {e:#}"))?;
+            for p in &positions {
+                total += notional(p.symbol.clone(), p.volume_lots, p.current_price)
+                    .await
+                    .map_err(|e| format!("MARGIN_UNKNOWN: {e:#}"))?;
+            }
+            let lev = total / equity;
+            detail.push_str(&format!(", effective leverage {lev:.1}x"));
+            if lev > max_lev {
+                return Err(format!("LEVERAGE_LIMIT: {detail} > {max_lev:.1}x"));
+            }
+        }
+        Ok(detail)
     }
 
     /// SQLite を開いて `f` を専用スレッドで実行する
@@ -897,6 +989,7 @@ mod tests {
             stop_loss: sl,
             take_profit: tp,
             open_time: None,
+            used_margin: None,
         }
     }
 

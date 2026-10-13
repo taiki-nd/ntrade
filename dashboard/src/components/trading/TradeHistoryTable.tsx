@@ -1,5 +1,6 @@
 "use client";
 
+import { priceDigits } from "@/lib/price";
 import * as React from "react";
 import { TradeHistory, CloseReason } from "@/types/trading";
 import {
@@ -512,10 +513,10 @@ export function TradeHistoryTable({ trades, pagination, filter, onDelete }: Trad
                         {trd.volumeLots.toFixed(2)} lot
                       </TableCell>
                       <TableCell className="text-right font-mono tabular-nums text-sm">
-                        {trd.entryPrice.toFixed(trd.symbol.includes("JPY") ? 3 : 5)}
+                        {trd.entryPrice.toFixed(priceDigits(trd.symbol))}
                       </TableCell>
                       <TableCell className="text-right font-mono tabular-nums text-sm font-medium">
-                        {trd.closePrice.toFixed(trd.symbol.includes("JPY") ? 3 : 5)}
+                        {trd.closePrice.toFixed(priceDigits(trd.symbol))}
                       </TableCell>
                       <TableCell
                         className={cn(

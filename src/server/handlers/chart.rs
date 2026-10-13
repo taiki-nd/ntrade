@@ -123,13 +123,25 @@ pub async fn generate_snapshot_internal(state: &AppState, pair: &str) -> anyhow:
 
     // 実データが取れないときは作らない（模擬データのチャートを LLM の判断や画面に使わないため）
     let ctrader = ctrader_opt.ok_or_else(|| anyhow::anyhow!("cTrader is not connected; snapshot needs live bars"))?;
+    // 銘柄仕様（pip 位置・桁数・取引時間）を先に引いておく。Snapshot・チャート・ガードがこれを使う
+    if let Err(e) = ctrader.symbol_spec(pair).await {
+        warn!(pair, "failed to resolve symbol spec; falling back to name-based pip size: {e:#}");
+    }
+    // スプレッドは Spot 購読の気配値から取る（初回はここで購読し、次のサイクルから値が入る）
+    if let Err(e) = ctrader.subscribe_spots(&[pair.to_string()]).await {
+        warn!(pair, "failed to subscribe spot quotes: {e:#}");
+    }
     info!(pair, "Fetching real trendbars from connected cTrader...");
     let b4h = ctrader.get_trendbars(pair, BarPeriod::H4, 200).await.context("failed to fetch 4H bars")?;
     let b1h = ctrader.get_trendbars(pair, BarPeriod::H1, 200).await.context("failed to fetch 1H bars")?;
     let b15m = ctrader.get_trendbars(pair, BarPeriod::M15, 200).await.context("failed to fetch 15M bars")?;
     let b5m = ctrader.get_trendbars(pair, BarPeriod::M5, 200).await.context("failed to fetch 5M bars")?;
 
-    let spread_pips = state.metrics.read().await.spreads.get(pair).copied().unwrap_or_default();
+    let pip = crate::snapshot::measures::get_pip_size(pair);
+    let spread_pips = ctrader
+        .quote(pair, chrono::Duration::minutes(10))
+        .await
+        .map(|q| crate::snapshot::measures::to_pips(q.spread(), pip));
 
     // 口座状態: 保有ポジションと直近の判断（フリップフロップ防止のため LLM に渡す）
     let recent_cot = {
@@ -162,7 +174,11 @@ pub async fn generate_snapshot_internal(state: &AppState, pair: &str) -> anyhow:
                 .map(|c| RecentDecision {
                     time: c.timestamp.clone(),
                     action: c.action.clone(),
-                    summary: c.order_flow.chars().take(120).collect(),
+                    // 旧データは注文の攻防、新しいデータはファンダメンタルズの読みを要約にする
+                    summary: if c.fundamental_view.is_empty() { &c.order_flow } else { &c.fundamental_view }
+                        .chars()
+                        .take(160)
+                        .collect(),
                 })
                 .collect(),
             // 成立したプランは判断サイクルがプラン評価の後で差し込む

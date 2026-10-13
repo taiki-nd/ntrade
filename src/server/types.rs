@@ -81,6 +81,9 @@ pub struct CoTLog {
     pub take_profit: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub risk_reward_ratio: Option<f64>,
+    /// ファンダメンタルズの読み（事実から読んだ方向感・根拠・指標発表のリスク）
+    #[serde(default)]
+    pub fundamental_view: String,
     /// 環境認識（4H/1H）
     pub macro_context: String,
     /// 注文の攻防（15M/5M）

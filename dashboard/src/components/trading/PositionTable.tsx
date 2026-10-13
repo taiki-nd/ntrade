@@ -1,5 +1,6 @@
 "use client";
 
+import { priceDigits } from "@/lib/price";
 import * as React from "react";
 import { Position } from "@/types/trading";
 import {
@@ -101,23 +102,23 @@ export function PositionTable({ positions, onClosePosition }: PositionTableProps
                         {pos.volumeLots.toFixed(2)} lot
                       </TableCell>
                       <TableCell className="text-right font-mono tabular-nums text-sm">
-                        {pos.entryPrice.toFixed(pos.symbol.includes("JPY") ? 3 : 5)}
+                        {pos.entryPrice.toFixed(priceDigits(pos.symbol))}
                       </TableCell>
                       <TableCell className="text-right font-mono tabular-nums text-sm font-semibold">
-                        {pos.currentPrice.toFixed(pos.symbol.includes("JPY") ? 3 : 5)}
+                        {pos.currentPrice.toFixed(priceDigits(pos.symbol))}
                       </TableCell>
                       <TableCell className="text-right">
                         <div className="flex flex-col items-end gap-0.5">
                           {pos.closeStop != null && (
                             <span className="font-mono tabular-nums text-xs text-rose-600 dark:text-rose-400">
-                              終値SL: {pos.closeStop.toFixed(pos.symbol.includes("JPY") ? 3 : 5)}
+                              終値SL: {pos.closeStop.toFixed(priceDigits(pos.symbol))}
                             </span>
                           )}
                           <span className="font-mono tabular-nums text-xs text-rose-600 dark:text-rose-400">
-                            {pos.closeStop != null ? "ハードSL" : "SL"}: {pos.stopLoss.toFixed(pos.symbol.includes("JPY") ? 3 : 5)}
+                            {pos.closeStop != null ? "ハードSL" : "SL"}: {pos.stopLoss.toFixed(priceDigits(pos.symbol))}
                           </span>
                           <span className="font-mono tabular-nums text-xs text-emerald-600 dark:text-emerald-400">
-                            TP: {pos.takeProfit.toFixed(pos.symbol.includes("JPY") ? 3 : 5)}
+                            TP: {pos.takeProfit.toFixed(priceDigits(pos.symbol))}
                           </span>
                         </div>
                       </TableCell>

@@ -46,7 +46,7 @@ async fn main() -> Result<()> {
         bars_1h: &bars_1h,
         bars_15m: &bars_15m,
         bars_5m: &bars_5m,
-        spread_pips,
+        spread_pips: Some(spread_pips),
         current_price: None,
         now: None,
         account_state: AccountState::default(),
@@ -66,7 +66,7 @@ async fn main() -> Result<()> {
         .with_lessons(vec![
             "ロンドン開場直後の初動ブレイクは反転しやすい。追認の足を待って読む。".to_string(),
         ])
-        .build(&bundle.snapshot, &bundle.charts);
+        .build(&bundle.snapshot);
     println!("  ✓ プロンプト {} 文字", prompt.chars().count());
 
     if std::env::var("NTRADE_SKIP_LLM").is_ok() {
@@ -79,7 +79,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    println!("  claude -p で推論中（画像4枚を Read で読ませる）...");
+    println!("  claude -p で推論中（ファンダメンタルズの事実は渡していない。価格の数値のみ）...");
     let client = LlmClient::new(LlmClientConfig::default());
     let started = std::time::Instant::now();
     let decision = client.infer(&prompt).await?;
@@ -90,8 +90,8 @@ async fn main() -> Result<()> {
     println!("  Confidence:  {:.2}", decision.confidence);
     println!("  Entry type:  {:?}", decision.entry_type);
     println!("  Entry/SL/TP: {:?} / {:?} / {:?}", decision.entry_price, decision.stop_loss, decision.take_profit);
-    println!("  Macro:       {}", decision.analysis.macro_context);
-    println!("  Order flow:  {}", decision.analysis.order_flow);
+    println!("  Fundamental: {}", decision.analysis.fundamental_view);
+    println!("  Price levels:{}", decision.analysis.price_levels);
     println!("  Invalidation:{}", decision.analysis.invalidation);
     println!("  Conflicts:   {}", decision.analysis.conflicts);
     if let Some(plan) = &decision.conditional_plan {
@@ -99,24 +99,6 @@ async fn main() -> Result<()> {
             plan.wait_for, plan.then_action, plan.invalidate_if, plan.expires_at);
     }
     println!("  Reasoning:   {}", decision.reasoning);
-
-    // 観測整合: LLM が報告した最新足時刻と Snapshot の最新足時刻を突き合わせる
-    let lb = &bundle.snapshot.latest_bars;
-    let ob = &decision.observed;
-    let checks = [
-        ("4H", lb.h4.as_deref(), ob.latest_bar_4h.as_deref()),
-        ("1H", lb.h1.as_deref(), ob.latest_bar_1h.as_deref()),
-        ("15M", lb.m15.as_deref(), ob.latest_bar_15m.as_deref()),
-        ("5M", lb.m5.as_deref(), ob.latest_bar_5m.as_deref()),
-    ];
-    println!("\n  === 観測整合チェック (observed vs latest_bars) ===");
-    let mut all_ok = true;
-    for (tf, expected, got) in checks {
-        let ok = expected.is_some() && expected == got;
-        all_ok &= ok;
-        println!("  {:<3} expected={:?} observed={:?} {}", tf, expected, got, if ok { "OK" } else { "MISMATCH" });
-    }
-    println!("  => {}", if all_ok { "LLM は4枚とも読んで回答した" } else { "不一致あり: ガードなら HOLD に倒す対象" });
 
     Ok(())
 }

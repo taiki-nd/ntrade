@@ -8,31 +8,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::ctrader::CandleBar;
 
-/// 通貨ペアに応じた1 pipの価格幅を返す
+/// 1 pip の価格幅。ブローカーの銘柄仕様（`instrument`）を優先し、未取得なら銘柄名から推測する
 pub fn get_pip_size(pair: &str) -> f64 {
-    let p = pair.to_uppercase();
-    if p.contains("JPY") {
-        0.01
-    } else if p.contains("XAU") || p.contains("GOLD") {
-        0.1
-    } else {
-        0.0001
-    }
+    crate::instrument::pip_size(pair)
 }
 
-/// 通貨ペアに応じた価格表示桁数
+/// 価格表示桁数
 pub fn price_digits(pair: &str) -> usize {
-    let p = pair.to_uppercase();
-    if p.contains("JPY") {
-        3
-    } else if p.contains("XAU") || p.contains("GOLD") {
-        2
-    } else {
-        5
-    }
+    crate::instrument::price_digits(pair)
 }
 
 /// 1 lot・1 pip あたりの損益額（口座通貨建ての概算）。JPY口座 + JPYクロス想定。
+/// ブローカーから pip 価値が取れないときだけ使う（FX 以外では当てにならない）
 pub fn pip_value_per_lot(pair: &str) -> f64 {
     if pair.to_uppercase().contains("JPY") {
         1000.0
@@ -157,16 +144,21 @@ pub fn find_swing_points(bars: &[CandleBar], window: usize) -> Vec<SwingPoint> {
     points
 }
 
+/// キリ番の刻み。FX は慣習の刻み（JPY 0.50 / その他 0.0050）、それ以外は価格の桁から決める
+/// （XAUUSD 2,650 → 50、US500 5,800 → 50、原油 70 → 0.5）
+pub fn round_number_step(pair: &str, current_price: f64) -> f64 {
+    if crate::instrument::is_forex(pair) {
+        return if pair.to_uppercase().contains("JPY") { 0.50 } else { 0.0050 };
+    }
+    if current_price <= 0.0 {
+        return 1.0;
+    }
+    10f64.powi(current_price.log10().floor() as i32 - 1) * 0.5
+}
+
 /// キリ番（Round numbers）の候補を現在価格の周辺から算出する
 pub fn find_round_numbers(pair: &str, current_price: f64, count: usize) -> Vec<f64> {
-    let p = pair.to_uppercase();
-    let step = if p.contains("JPY") {
-        0.50
-    } else if p.contains("XAU") {
-        5.0
-    } else {
-        0.0050
-    };
+    let step = round_number_step(pair, current_price);
 
     let base = (current_price / step).round() * step;
     let half = (count / 2) as i32;
@@ -365,6 +357,16 @@ mod tests {
         let (avg, days) = avg_daily_range(&bars, now, 20).unwrap();
         assert_eq!(days, 1);
         assert!((avg - 0.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn round_number_steps_follow_the_instrument() {
+        assert_eq!(round_number_step("USDJPY_z", 150.0), 0.5);
+        assert_eq!(round_number_step("EURUSD", 1.08), 0.005);
+        assert_eq!(round_number_step("XAUUSD", 2650.0), 50.0);
+        assert_eq!(round_number_step("US500", 5800.0), 50.0);
+        assert!((round_number_step("XTIUSD", 70.0) - 0.5).abs() < 1e-12);
+        assert_eq!(find_round_numbers("XAUUSD", 2661.0, 5), vec![2550.0, 2600.0, 2650.0, 2700.0, 2750.0]);
     }
 
     #[test]

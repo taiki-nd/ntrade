@@ -135,6 +135,14 @@ impl Db {
               value         TEXT NOT NULL,
               updated_at    INTEGER NOT NULL
             );
+            -- 外部 API から取得したデータのキャッシュ（設定とは分けて持つ）
+            CREATE TABLE IF NOT EXISTS api_cache (
+              key           TEXT PRIMARY KEY,
+              value         TEXT NOT NULL,
+              updated_at    INTEGER NOT NULL
+            );
+            -- 以前は設定テーブルにキャッシュを置いていた。設定以外のものは設定テーブルに残さない
+            DELETE FROM app_settings WHERE key = 'fundamentals_cache';
             "#,
         )?;
         // 既存 DB への列追加（既にあればエラーになるので無視する）
@@ -158,6 +166,26 @@ impl Db {
     pub fn save_setting<T: serde::Serialize>(&self, key: &str, value: &T) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO app_settings (key, value, updated_at) VALUES (?1, ?2, ?3)",
+            params![key, serde_json::to_string(value)?, Utc::now().timestamp()],
+        )?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------ api cache
+
+    /// 外部 API のキャッシュ（JSON）。無ければ None
+    pub fn load_cache<T: serde::de::DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row("SELECT value FROM api_cache WHERE key = ?1", params![key], |r| r.get(0))
+            .optional()?;
+        raw.map(|s| serde_json::from_str(&s).with_context(|| format!("invalid cache {key}")))
+            .transpose()
+    }
+
+    pub fn save_cache<T: serde::Serialize>(&self, key: &str, value: &T) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO api_cache (key, value, updated_at) VALUES (?1, ?2, ?3)",
             params![key, serde_json::to_string(value)?, Utc::now().timestamp()],
         )?;
         Ok(())

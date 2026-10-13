@@ -127,15 +127,6 @@ impl From<BarPeriod> for i32 {
     }
 }
 
-/// ロット → cTrader プロトコルのボリューム（1/100 単位。1 lot = 100,000 units = 10,000,000）
-pub fn lots_to_volume(lots: f64) -> i64 {
-    (lots * 10_000_000.0).round() as i64
-}
-
-pub fn volume_to_lots(volume: i64) -> f64 {
-    volume as f64 / 10_000_000.0
-}
-
 /// 口座サマリー（get_trader の結果）
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AccountSummary {
@@ -165,6 +156,23 @@ pub struct BrokerPosition {
     pub stop_loss: Option<f64>,
     pub take_profit: Option<f64>,
     pub open_time: Option<DateTime<Utc>>,
+    /// この建玉が使っている証拠金（口座通貨）
+    #[serde(default)]
+    pub used_margin: Option<f64>,
+}
+
+/// Spot 購読で受け取った直近の気配値
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Quote {
+    pub bid: f64,
+    pub ask: f64,
+    pub time: DateTime<Utc>,
+}
+
+impl Quote {
+    pub fn spread(&self) -> f64 {
+        (self.ask - self.bid).max(0.0)
+    }
 }
 
 /// ブローカー側で確定した決済（closing deal）。
@@ -187,41 +195,26 @@ pub struct ClosedDeal {
     pub volume_lots: f64,
 }
 
-/// シンボル（通貨ペア）情報
+/// シンボル（銘柄一覧の1行）。仕様の詳細は `instrument::InstrumentSpec`（`CTraderService::symbol_spec`）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolInfo {
     pub symbol_id: i64,
     pub symbol_name: String,
-    pub digits: i32,
-    pub pip_position: i32,
-    /// 基軸通貨（EURUSD なら EUR）。ブローカーの資産一覧から引けなかった場合は None
+    /// 基軸通貨・資産（EURUSD なら EUR、XAUUSD なら XAU）。ブローカーの資産一覧から引けなかった場合は None
     #[serde(default)]
     pub base_asset: Option<String>,
     /// 建値通貨（EURUSD なら USD）。ブローカーの資産一覧から引けなかった場合は None
     #[serde(default)]
     pub quote_asset: Option<String>,
-}
-
-/// ブローカーが持つ銘柄の取引仕様（ProtoOASymbol）
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct SymbolSpec {
-    /// 1 pip = 10^-pip_position
-    pub pip_position: i32,
-    pub digits: i32,
-    /// 1 lot あたりの数量（通貨単位。FX は通常 100,000）
-    pub lot_units: f64,
-}
-
-impl SymbolSpec {
-    pub fn pip_size(&self) -> f64 {
-        10f64.powi(-self.pip_position)
-    }
-
-    /// 1 lot・1 pip あたりの損益（口座通貨）。
-    /// `quote_to_account` は建値通貨 1 単位を口座通貨に換算するレート（同じ通貨なら 1.0）。
-    pub fn pip_value_per_lot(&self, quote_to_account: f64) -> f64 {
-        self.pip_size() * self.lot_units * quote_to_account
-    }
+    /// ブローカーの銘柄カテゴリ名と資産クラス名（Forex / Metals / Indices など。ブローカーの表記のまま）
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub asset_class: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// 6文字の通貨ペア名から建値通貨を推定する（資産一覧が引けないときの代替）
@@ -232,24 +225,16 @@ pub fn quote_currency_from_name(pair: &str) -> Option<String> {
 }
 
 impl SymbolInfo {
-    /// 通貨名から標準的な桁数とpip位置を推定
-    pub fn new_with_defaults(symbol_id: i64, symbol_name: String) -> Self {
-        let name_upper = symbol_name.to_uppercase();
-        let (digits, pip_position) = if name_upper.contains("JPY") {
-            (3, 2)
-        } else if name_upper.contains("XAU") || name_upper.contains("GOLD") {
-            (2, 2)
-        } else {
-            (5, 4)
-        };
-
+    pub fn new(symbol_id: i64, symbol_name: String) -> Self {
         Self {
             symbol_id,
             symbol_name,
-            digits,
-            pip_position,
             base_asset: None,
             quote_asset: None,
+            category: None,
+            asset_class: None,
+            description: None,
+            enabled: true,
         }
     }
 }
@@ -257,18 +242,6 @@ impl SymbolInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn pip_value_follows_pip_position_lot_size_and_conversion() {
-        let usdjpy = SymbolSpec { pip_position: 2, digits: 3, lot_units: 100_000.0 };
-        // JPY 口座で JPY 建て: 0.01 * 100,000 = 1,000 円
-        assert!((usdjpy.pip_value_per_lot(1.0) - 1000.0).abs() < 1e-6);
-        let eurusd = SymbolSpec { pip_position: 4, digits: 5, lot_units: 100_000.0 };
-        // JPY 口座で USD 建て: 10 USD * USDJPY 150 = 1,500 円
-        assert!((eurusd.pip_value_per_lot(150.0) - 1500.0).abs() < 1e-6);
-        // USD 口座で JPY 建て: 1,000 円 / USDJPY 150
-        assert!((usdjpy.pip_value_per_lot(1.0 / 150.0) - 6.666_666).abs() < 1e-3);
-    }
 
     #[test]
     fn quote_currency_is_inferred_from_six_letter_names() {

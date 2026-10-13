@@ -10,6 +10,7 @@ import { TradeHistoryTable } from "@/components/trading/TradeHistoryTable";
 import { LessonsManager } from "@/components/trading/LessonsManager";
 import { ReplayViewer } from "@/components/trading/ReplayViewer";
 import { PlanMonitor } from "@/components/trading/PlanMonitor";
+import { FundamentalsPanel } from "@/components/trading/FundamentalsPanel";
 import { Tabs, TabsContent } from "@/components/ui/tabs";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -34,7 +35,7 @@ import { PlugZap } from "lucide-react";
 
 type EngineStatus = "connecting" | "online" | "offline";
 
-const TAB_IDS = ["overview", "cot", "chart", "trades", "lessons", "replay"];
+const TAB_IDS = ["overview", "cot", "chart", "fundamentals", "trades", "lessons", "replay"];
 
 /** 概要タブに出す直近件数 */
 const RECENT_COUNT = 3;
@@ -350,6 +351,11 @@ export default function TradingDashboard() {
 
         {/* メインビュータブ */}
         <Tabs value={activeTab} className="space-y-4">
+          {/* ファンダメンタルズの事実 タブ */}
+          <TabsContent value="fundamentals" className="space-y-4">
+            {activeTab === "fundamentals" && <FundamentalsPanel />}
+          </TabsContent>
+
           {/* リプレイ結果 タブ */}
           <TabsContent value="replay" className="space-y-4">
             <ReplayViewer />

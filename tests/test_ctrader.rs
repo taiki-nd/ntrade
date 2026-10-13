@@ -1,5 +1,5 @@
 use ctrader_rs::proto::common::ProtoOaTrendbar;
-use ntrade::ctrader::{BarPeriod, CandleBar, SymbolInfo};
+use ntrade::ctrader::{BarPeriod, CandleBar};
 
 #[test]
 fn test_candle_bar_from_proto() {
@@ -36,16 +36,12 @@ fn test_bar_period_conversions() {
 }
 
 #[test]
-fn test_symbol_info_defaults() {
-    let usdjpy = SymbolInfo::new_with_defaults(1, "USDJPY".to_string());
-    assert_eq!(usdjpy.digits, 3);
-    assert_eq!(usdjpy.pip_position, 2);
-
-    let eurusd = SymbolInfo::new_with_defaults(2, "EURUSD".to_string());
-    assert_eq!(eurusd.digits, 5);
-    assert_eq!(eurusd.pip_position, 4);
-
-    let xauusd = SymbolInfo::new_with_defaults(3, "XAUUSD".to_string());
-    assert_eq!(xauusd.digits, 2);
-    assert_eq!(xauusd.pip_position, 2);
+fn test_pip_size_fallbacks_without_broker_specs() {
+    // ブローカーの仕様が未取得のときだけ使う、銘柄名からの推測
+    assert_eq!(ntrade::instrument::pip_size("USDJPY"), 0.01);
+    assert_eq!(ntrade::instrument::price_digits("USDJPY"), 3);
+    assert_eq!(ntrade::instrument::pip_size("EURUSD"), 0.0001);
+    assert_eq!(ntrade::instrument::price_digits("EURUSD"), 5);
+    assert_eq!(ntrade::instrument::pip_size("XAUUSD"), 0.1);
+    assert_eq!(ntrade::instrument::price_digits("XAUUSD"), 2);
 }

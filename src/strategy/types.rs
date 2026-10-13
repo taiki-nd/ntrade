@@ -19,12 +19,20 @@ pub enum EntryType {
     Conditional,
 }
 
-/// LLM の相場解釈（環境認識 → 攻防 → 無効化 → 反対材料）
+/// LLM の相場解釈（ファンダメンタルズ → 価格の位置 → 無効化 → 反対材料）
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Analysis {
-    /// 4H/1H: どちらの勢力が優勢か、押し目/戻り形成中か、天井圏/底値圏か
+    /// ファンダメンタルズの事実から読んだ方向感と、その根拠にした事実・指標発表のリスク
+    #[serde(default)]
+    pub fundamental_view: String,
+    /// 価格の位置（前日高安・スイング・ATR から見た現在値）と、エントリー・利確の価格の根拠
+    #[serde(default)]
+    pub price_levels: String,
+    /// 旧: 4H/1H の環境認識（チャート画像の読み）。プライスアクション判断の廃止で今は出力しない
+    #[serde(default)]
     pub macro_context: String,
-    /// 15M/5M: 直近数本で主導権を握り直したのはどちらか、ブレイク試行と拒絶の兆候
+    /// 旧: 15M/5M の注文の攻防（チャート画像の読み）。今は出力しない
+    #[serde(default)]
     pub order_flow: String,
     /// どこを抜けたらこの相場観は間違いになるか（SLの根拠）
     pub invalidation: String,
@@ -81,7 +89,7 @@ impl ConditionalPlan {
     }
 }
 
-/// LLM が画像で実際に確認した各時間足の最新足時刻（読まずに答えた場合の検出用）
+/// 旧: LLM が画像で確認した各時間足の最新足時刻。チャート画像を渡さなくなったので今は出力させない
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Observed {
     #[serde(default)]
@@ -132,8 +140,10 @@ impl TradeDecision {
             stop_loss: None,
             take_profit: None,
             analysis: Analysis {
-                macro_context: "N/A (system fallback)".into(),
-                order_flow: "N/A (system fallback)".into(),
+                fundamental_view: "N/A (system fallback)".into(),
+                price_levels: "N/A (system fallback)".into(),
+                macro_context: String::new(),
+                order_flow: String::new(),
                 invalidation: "N/A".into(),
                 conflicts: "N/A".into(),
             },
@@ -148,7 +158,7 @@ impl TradeDecision {
         serde_json::json!({
             "type": "object",
             "additionalProperties": false,
-            "required": ["action", "confidence", "analysis", "observed", "reasoning"],
+            "required": ["action", "confidence", "analysis", "reasoning"],
             "properties": {
                 "action": { "type": "string", "enum": ["BUY", "SELL", "HOLD"] },
                 "confidence": {
@@ -164,10 +174,10 @@ impl TradeDecision {
                 "analysis": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": ["macro_context", "order_flow", "invalidation", "conflicts"],
+                    "required": ["fundamental_view", "price_levels", "invalidation", "conflicts"],
                     "properties": {
-                        "macro_context": { "type": "string" },
-                        "order_flow": { "type": "string" },
+                        "fundamental_view": { "type": "string" },
+                        "price_levels": { "type": "string" },
                         "invalidation": { "type": "string" },
                         "conflicts": { "type": "string" }
                     }
@@ -189,17 +199,6 @@ impl TradeDecision {
                         "invalidate_condition": { "type": ["string", "null"], "enum": ["CLOSE_ABOVE", "CLOSE_BELOW", null] },
                         "stop_loss": { "type": ["number", "null"] },
                         "take_profit": { "type": ["number", "null"] }
-                    }
-                },
-                "observed": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": ["latest_bar_4h", "latest_bar_1h", "latest_bar_15m", "latest_bar_5m"],
-                    "properties": {
-                        "latest_bar_4h": { "type": ["string", "null"] },
-                        "latest_bar_1h": { "type": ["string", "null"] },
-                        "latest_bar_15m": { "type": ["string", "null"] },
-                        "latest_bar_5m": { "type": ["string", "null"] }
                     }
                 },
                 "reasoning": { "type": "string" }

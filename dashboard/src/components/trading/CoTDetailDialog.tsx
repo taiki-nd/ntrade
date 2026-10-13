@@ -3,6 +3,7 @@
 import * as React from "react";
 import { ActionType, CoTDetail } from "@/types/trading";
 import { tradingApi } from "@/lib/trading-api";
+import { priceDigits } from "@/lib/price";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -25,6 +26,7 @@ import {
   Receipt,
   ShieldAlert,
   GitBranch,
+  Landmark,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -78,6 +80,10 @@ export function getGuardShortLabel(guardResult?: string): string | null {
     PLAN_SL_WRONG_SIDE: "プランSL不正",
     PLAN_TP_WRONG_SIDE: "プランTP不正",
     ORDER_FAILED: "発注エラー",
+    MARGIN_LIMIT: "証拠金上限",
+    MARGIN_UNKNOWN: "証拠金不明",
+    LEVERAGE_LIMIT: "レバレッジ上限",
+    VOLUME_BELOW_MIN: "最小ロット未満",
   };
 
   const rawFirst = parts[0];
@@ -188,6 +194,30 @@ function getGuardReasonDetails(code: string, log?: CoTDetail["log"]): GuardReaso
   }
 
   switch (key) {
+    case "MARGIN_LIMIT":
+      return {
+        code: key,
+        title: "証拠金使用率の上限",
+        description: `発注すると証拠金使用率が上限を超えるため見送りました${extraDetail ? `（${extraDetail}）` : ""}。`,
+      };
+    case "MARGIN_UNKNOWN":
+      return {
+        code: key,
+        title: "必要証拠金を確認できない",
+        description: `ブローカーから必要証拠金を取得できなかったため、レバレッジ取引の安全のため見送りました${extraDetail ? `（${extraDetail}）` : ""}。`,
+      };
+    case "LEVERAGE_LIMIT":
+      return {
+        code: key,
+        title: "実効レバレッジの上限",
+        description: `発注すると実効レバレッジが上限を超えるため見送りました${extraDetail ? `（${extraDetail}）` : ""}。`,
+      };
+    case "VOLUME_BELOW_MIN":
+      return {
+        code: key,
+        title: "最小発注量未満",
+        description: `許容リスクから求めたロットがブローカーの最小発注量に届かないため見送りました（最小まで増やすと許容リスクを超えるため）${extraDetail ? `: ${extraDetail}` : ""}。`,
+      };
     case "CONFIDENCE_LOW":
       return {
         code: key,
@@ -393,7 +423,7 @@ export function CoTDetailDialog({ cotLogId, onClose }: CoTDetailDialogProps) {
   const detail = current?.detail;
   const error = current?.error;
   const log = detail?.log;
-  const digits = log?.symbol.includes("JPY") ? 3 : 5;
+  const digits = log ? priceDigits(log.symbol) : 5;
   const guardReasons = React.useMemo(() => parseGuardReasons(log?.guardResult, log), [log]);
   const effectiveRR = React.useMemo(() => getEffectiveRiskRewardRatio(log), [log]);
 
@@ -656,23 +686,36 @@ export function CoTDetailDialog({ cotLogId, onClose }: CoTDetailDialogProps) {
               </div>
             )}
 
-            {/* 上位足環境認識 (4H / 1H) */}
+            {/* ファンダメンタルズの読み（旧データには無い） */}
+            {log.fundamentalView && (
+              <div className="space-y-1.5 p-3 rounded-lg border bg-card">
+                <div className="flex items-center gap-2 text-xs font-semibold text-muted-foreground">
+                  <Landmark className="h-4 w-4 text-primary" />
+                  <span>0. ファンダメンタルズ（事実からの読み）</span>
+                </div>
+                <p className="text-sm leading-relaxed">{log.fundamentalView}</p>
+              </div>
+            )}
+
+            {/* 価格の位置（ファンダ判断以降）／ 旧データは 4H・1H の環境認識 */}
             <div className="space-y-1.5 p-3 rounded-lg border bg-card">
               <div className="flex items-center gap-2 text-xs font-semibold text-muted-foreground">
                 <TrendingUp className="h-4 w-4 text-blue-500" />
-                <span>1. 環境認識 (4H / 1H)</span>
+                <span>{log.fundamentalView ? "1. 価格の位置とエントリー・利確の根拠" : "1. 環境認識 (4H / 1H)"}</span>
               </div>
               <p className="text-sm leading-relaxed">{log.macroContext}</p>
             </div>
 
-            {/* 注文の攻防 (15M / 5M) */}
-            <div className="space-y-1.5 p-3 rounded-lg border bg-card">
-              <div className="flex items-center gap-2 text-xs font-semibold text-muted-foreground">
-                <Sparkles className="h-4 w-4 text-amber-500" />
-                <span>2. 注文の攻防 (15M / 5M)</span>
+            {/* 注文の攻防 (15M / 5M)。プライスアクション判断だった旧データのみ */}
+            {log.orderFlow && (
+              <div className="space-y-1.5 p-3 rounded-lg border bg-card">
+                <div className="flex items-center gap-2 text-xs font-semibold text-muted-foreground">
+                  <Sparkles className="h-4 w-4 text-amber-500" />
+                  <span>2. 注文の攻防 (15M / 5M)</span>
+                </div>
+                <p className="text-sm leading-relaxed font-medium">{log.orderFlow}</p>
               </div>
-              <p className="text-sm leading-relaxed font-medium">{log.orderFlow}</p>
-            </div>
+            )}
 
             {/* シナリオ無効化価格 (客観的SL理由) */}
             <div className="space-y-1.5 p-3 rounded-lg border border-rose-500/20 bg-rose-50/30 dark:bg-rose-950/20">
