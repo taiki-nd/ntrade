@@ -1,59 +1,50 @@
-# ntrade: LLM駆動型 CFD・FX自動売買システム
+# ntrade: ロジック戦略による CFD・FX 自動売買システム
 
-FX・貴金属（XAUUSD など）・株価指数の CFD をレバレッジを掛けて取引する、ローカル運用型の自動売買システムです。
-保有 15 分〜2 時間程度の**日中の短期取引**を、価格の数値（1H/15M/5M の足・スイング高安・前日/セッション高安・ATR）から LLM が判断し、
-**予約注文（指値・逆指値）**としてブローカーに置きます。LLM の判断の遅れが約定価格に響かないよう、成行は使いません。
-LLM は判断時に Web にアクセスせず、チャート画像も読みません。
+FX・貴金属（XAUUSD など）・株価指数の CFD を取引する、ローカル運用型の自動売買システムです。
+売買判断はすべて Rust で書いたロジック戦略が行い、**バックテストと本番で同じ戦略コード・同じリスクチェック**を通します。
+ブローカー接続・発注は cTrader Open API です。
 
-- **バックエンド**: Rust 1.98 (Tokio + Axum + cTrader Open API + plotters + SQLite)
+- **バックエンド**: Rust (Tokio + Axum + cTrader Open API + SQLite + plotters)
 - **フロントエンド**: Next.js 16 (App Router) + React 19 + Tailwind CSS v4 + shadcn/ui
-- **推論パイプライン**: ローカル CLI 連携 (`claude -p` / `agy -p`)
+
+```
+戦略（src/strategy）── 確定足 → 注文の意図（成行・指値・逆指値 / 決済 / 取消 / SL・TP 変更）
+   │
+   ├─ バックテスト（src/backtest）: SQLite の過去の足 → 約定シミュレーター → 成績・資産推移
+   └─ 本番（src/live + scheduler）: cTrader の確定足 → リスクチェック → cTrader へ発注 → 照合
+```
 
 ---
 
 ## クイックスタート (Makefile)
 
-プロジェクトルートから以下の `make` コマンドで起動・操作が可能です。
-
 ```bash
-# コマンド一覧を表示
-make help
+make help            # コマンド一覧
 
-# 1. フロントエンド（Next.js 管理画面）のみ起動 (http://localhost:3000)
-make ui
+# 過去データの取得（cTrader の認証情報が必要。DB に無い期間だけ取る）
+make bt-fetch PAIRS="USDJPY_z EURUSD_z" FROM=2023-01-01
+make bt-coverage
 
-# 2. Rust コアエンジンのみ起動
-make engine
+# バックテスト
+make bt-strategies
+make bt-run   PAIR=USDJPY_z FROM=2024-01-01 STRATEGY=ema_cross TF=M15 PARAMS="fast=20 slow=50"
+make bt-sweep PAIR=USDJPY_z FROM=2024-01-01 STRATEGY=ema_cross TF=M15 GRID="fast=10..30:5 slow=50,100,200"
+make bt-wf    PAIR=USDJPY_z FROM=2024-01-01 STRATEGY=ema_cross TF=M15 GRID="fast=10..30:5 slow=50,100" TRAIN=180 TEST=60
+make bt-list
 
-# 3. フロントエンドとRustエンジンを並行起動
-make dev
-
-# 4. LLM CLI推論 (claude -p) のPoCを実行
-make poc
-
-# 5. Rust 単体テストの実行
-make test
-
-# 6. プロジェクト全体のビルド (Rust + Next.js)
-make build
-
-# 7. 依存パッケージの再インストール
-make install
-
-# 8. ビルドキャッシュのクリーンアップ
-make clean
+# 本番エンジンと管理画面
+make dev             # UI (http://localhost:3000) + エンジン (http://localhost:4000)
+make test            # Rust のテスト
 ```
+
+戦略を本番で動かすには、管理画面の設定で「戦略のデプロイ」を追加します（既定はドライラン = 発注せずシグナルを記録するだけ）。
 
 ---
 
-## ドキュメント構成
-
-詳細は [`docs/`](./docs) ディレクトリをご参照ください。
+## ドキュメント
 
 - [01. システム全体アーキテクチャ](./docs/01_system_architecture.md)
-- [02. プライスアクション特化型 取引戦略 & プロンプト設計](./docs/02_trading_strategy.md)
+- [02. 戦略の書き方とリスク管理](./docs/02_trading_strategy.md)
 - [03. cTrader Open API 連携仕様](./docs/03_ctrader_spec.md)
-- [04. ロードマップ & 確定技術スタック](./docs/04_roadmap_and_tech_stack.md)
-- [05. AI学習プロセス & プロンプト改善サイクル](./docs/05_ai_learning_and_prompt_tuning.md)
-- [06. リプレイ環境（LLM判断の評価・較正基盤）](./docs/06_replay_environment.md)
-- [08. 日中短期取引 × LLM（予約注文ベース）](./docs/08_intraday_pending_orders.md) … 現行の判断ロジック。01〜06 と食い違う箇所はこちらが正
+- [04. ロードマップ & 技術スタック](./docs/04_roadmap_and_tech_stack.md)
+- [06. バックテスト](./docs/06_backtest.md)

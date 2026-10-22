@@ -12,10 +12,10 @@ Next.js 16 (App Router) + React 19 + Tailwind CSS v4 + shadcn/ui
 [バックエンド: コアエンジン]
 Rust 1.98 (Tokio 非同期ランタイム + Axum Webフレームワーク)
        ├── cTrader Open API (Protobuf / TLS ソケット通信)
-       ├── チャート画像生成 (plotters クレート、時間足ごと1枚)
-       ├── LLM推論 (ローカルCLI: claude -p + 画像Read + --json-schema)
-       ├── リプレイ環境 (ヒストリカルバー → Snapshot再生 → 採点)
-       └── 永続化 (SQLite: rusqlite / sqlx)
+       ├── ロジック戦略 (Rust。バックテストと本番で共通)
+       ├── バックテスト (ヒストリカルバー → 約定シミュレーター → 成績・最適化)
+       ├── チャート画像生成 (plotters クレート)
+       └── 永続化 (SQLite: rusqlite)
 ```
 
 ### なぜこのスタックなのか？
@@ -26,7 +26,6 @@ Rust 1.98 (Tokio 非同期ランタイム + Axum Webフレームワーク)
    - Python環境を介さず、Rust単体でプライスアクション専用のマルチタイムフレームローソク足チャート（PNG）を高速生成可能。
 3. **`next-scaffold` による洗練された管理画面**:
    - 金融UIに必須のダークモード、`DashboardLayout`（サイドバー＋ヘッダー）、shadcn/ui（Table, Card, Dialog等）が完成しており、UI構築コストを最小化。
-   - LLMの思考プロセス（CoT）を視覚的に追跡できるUIを即座に実現。
 
 ---
 
@@ -125,3 +124,34 @@ Step 4 で実装した `PriceActionAnalyzer` は、ピンバー・包み足・�
 - ブローカー同期: 実発注時は各サイクル後に reconcile し、ブローカー側で消えたポジションを除去。
 - 自己反省（`src/reflection`）: 損切りトレードごとに判断ログとエントリー後の 5M 足を渡して LLM に振り返らせ、教訓「候補」（無効）として保存。同カテゴリ・同ペアの候補が 3 件に達したら最新を採用、採用上限 10 件。判断が妥当で結果だけ悪かった場合は教訓にしない。
 - **未検証**: デモ口座での実発注（ボリューム単位・相対 SL/TP の実値）と、決済イベントからの約定履歴生成。実発注前に `NTRADE_LIVE_ORDERS=1` で最小ロットの疎通確認が必要。
+
+---
+
+## 3. 方針転換: LLM からロジック戦略へ（2026-10-22）
+
+LLM による判断（Step 6〜9、条件付きプラン・予約注文・自己反省）をやめ、売買判断を Rust のロジック戦略に切り替えた。
+上の Step 6〜9 の記述は経緯として残すが、LLM 関連のコード（`llm` / `reflection` / プロンプト / CoT ログ / 教訓 / LLM リプレイ）は削除した。
+cTrader 連携・照合・リスクチェック・管理画面は引き継いでいる。
+
+### Step 10: 戦略の土台とリスクチェックの作り直し (完了 ✓)
+- `strategy`: `Strategy` トレイト、`OrderIntent` / `Action`、パラメータの定義と検証、戦略の一覧。動作確認用に `ema_cross`・`donchian_breakout`
+- `guard`: 入力を LLM の判断 JSON から `OrderIntent` + `MarketView` に変更。確信度・終値判定の損切り（`stop_mode`）を廃止、`plan_max_hours` → `order_max_hours`
+- `executor`: 成行注文を追加（相対 SL/TP で建てて、約定後に絶対価格へ付け替え）
+
+### Step 11: バックテスト (完了 ✓)
+- `backtest`: 約定シミュレーター（Bid/Ask・滑り・手数料・スワップ）、成績指標、1 分足での約定判定、`config/backtest.toml`
+- `bin/backtest`: `fetch`（差分取得・区切って保存）/ `run` / `sweep` / `walk-forward` / `list` / `show`
+- 詳細は [06_backtest.md](./06_backtest.md)
+
+### Step 12: 本番の戦略実行 (完了 ✓ / 実発注は未検証)
+- `live` + `scheduler`: 足の確定ごとにデプロイした戦略を実行、シグナルログ（`signals`）、ドライラン
+- 建玉・注文・取引に `strategy`（デプロイ ID）と `signal_id` を持たせ、comment で再起動・取り込み後も持ち主を復元
+- 未検証: デモ口座での成行注文（相対 SL/TP → 絶対価格への付け替え）。ドライランで挙動を確かめてから発注に切り替える
+
+### Step 13: 管理画面 (完了 ✓)
+- CoT・教訓・リプレイのタブを削除し、シグナル・バックテストのタブと、設定画面に戦略のデプロイの編集を追加
+
+### Step 14: 次の候補
+- 本命の戦略の実装と、ウォークフォワードでの検証
+- 複数銘柄をまとめたポートフォリオのバックテスト（口座全体の建玉上限・日次損失の再現）
+- スプレッドの時間帯別モデル

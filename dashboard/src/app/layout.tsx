@@ -16,8 +16,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "ntrade - LLM駆動型 FX自動売買ダッシュボード",
-  description: "Rust コアエンジンと LLM 推論によるプライスアクション自動売買のローカル管理画面",
+  title: "ntrade - ルールベース FX自動売買ダッシュボード",
+  description: "Rust コアエンジンのルールベース戦略とバックテストによる自動売買のローカル管理画面",
 };
 
 export default function RootLayout({

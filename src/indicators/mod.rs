@@ -1,12 +1,81 @@
-//! 客観的な測定関数群。
+//! テクニカル指標と価格の測定関数。戦略・リスクチェック・バックテストが共通で使う。
 //!
-//! ここにある関数は「再現可能な測定値」だけを返す。
-//! 「トレンドである」「支持線である」「ピンバーである」といった解釈は行わない。
+//! どの関数も渡された足だけから値を決める（同じ足を渡せば、本番でもバックテストでも同じ値になる）。
 
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::ctrader::CandleBar;
+use crate::ctrader::{BarPeriod, CandleBar};
+
+/// 単純移動平均。`period` 本そろうまでは None
+pub fn calculate_sma(bars: &[CandleBar], period: usize) -> Vec<Option<f64>> {
+    let mut out = vec![None; bars.len()];
+    if period == 0 || bars.len() < period {
+        return out;
+    }
+    let mut sum: f64 = bars.iter().take(period).map(|b| b.close).sum();
+    out[period - 1] = Some(sum / period as f64);
+    for i in period..bars.len() {
+        sum += bars[i].close - bars[i - period].close;
+        out[i] = Some(sum / period as f64);
+    }
+    out
+}
+
+/// 直近 `period` 本（最新足を含む）の最高値・最安値。足りなければ None
+pub fn channel(bars: &[CandleBar], period: usize) -> Option<HighLow> {
+    if period == 0 || bars.len() < period {
+        return None;
+    }
+    high_low_of(bars[bars.len() - period..].iter())
+}
+
+/// RSI（Wilder 平滑化）の最新値。足りなければ None
+pub fn calculate_rsi(bars: &[CandleBar], period: usize) -> Option<f64> {
+    if period == 0 || bars.len() < period + 1 {
+        return None;
+    }
+    let changes: Vec<f64> = bars.windows(2).map(|w| w[1].close - w[0].close).collect();
+    let (mut gain, mut loss) = changes.iter().take(period).fold((0.0, 0.0), |(g, l), c| (g + c.max(0.0), l + (-c).max(0.0)));
+    gain /= period as f64;
+    loss /= period as f64;
+    for c in changes.iter().skip(period) {
+        gain = (gain * (period as f64 - 1.0) + c.max(0.0)) / period as f64;
+        loss = (loss * (period as f64 - 1.0) + (-c).max(0.0)) / period as f64;
+    }
+    if loss == 0.0 {
+        return Some(100.0);
+    }
+    Some(100.0 - 100.0 / (1.0 + gain / loss))
+}
+
+/// 足を上位の時間足にまとめる（UTC 0:00 起点で区切る）。最後の区間が埋まりきっていなくても1本として返す
+pub fn resample(bars: &[CandleBar], period: BarPeriod) -> Vec<CandleBar> {
+    let step = period.duration().num_seconds();
+    let mut out: Vec<CandleBar> = Vec::new();
+    for b in bars {
+        let start = b.timestamp.timestamp().div_euclid(step) * step;
+        match out.last_mut() {
+            Some(last) if last.timestamp.timestamp() == start => {
+                last.high = last.high.max(b.high);
+                last.low = last.low.min(b.low);
+                last.close = b.close;
+                last.volume += b.volume;
+            }
+            _ => out.push(CandleBar {
+                timestamp: DateTime::from_timestamp(start, 0).unwrap_or(b.timestamp),
+                ..b.clone()
+            }),
+        }
+    }
+    out
+}
+
+/// `now` の時点で確定している足だけを残す（開始時刻 + 足の長さ <= now）
+pub fn closed_bars(mut bars: Vec<CandleBar>, period: BarPeriod, now: DateTime<Utc>) -> Vec<CandleBar> {
+    bars.retain(|b| b.timestamp + period.duration() <= now);
+    bars
+}
 
 /// 1 pip の価格幅。ブローカーの銘柄仕様（`instrument`）を優先し、未取得なら銘柄名から推測する
 pub fn get_pip_size(pair: &str) -> f64 {

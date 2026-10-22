@@ -1,7 +1,13 @@
-//! SQLite 永続化。ヒストリカルバー・リプレイ結果・cTrader OAuth トークン、
-//! および本番の判断ログ・ポジション・決済履歴・教訓（`journal`）を保存する。
+//! SQLite 永続化。ヒストリカルバー・cTrader OAuth トークン・設定、
+//! 本番のシグナルログ・ポジション・決済履歴（`journal`）、バックテスト結果（`backtest`）を保存する。
+//!
+//! LLM 時代のテーブル（cot_logs / lessons / replay_runs / replay_decisions）は作らなくなったが、
+//! 既存の DB に残っているデータは消さない。
 
+mod backtest;
 mod journal;
+
+pub use backtest::{BacktestRunRow, NewBacktestRun};
 
 pub use journal::Page;
 
@@ -28,41 +34,6 @@ pub struct Coverage {
     pub count: i64,
     pub first: Option<String>,
     pub last: Option<String>,
-}
-
-/// replay_runs 1行
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ReplayRunRow {
-    pub id: i64,
-    pub created_at: String,
-    pub label: String,
-    pub pair: String,
-    pub from_ts: String,
-    pub to_ts: String,
-    pub sampling: String,
-    pub prompt_hash: String,
-    pub snapshot_ver: String,
-    pub guard_config: String,
-    pub decisions: i64,
-}
-
-/// replay_decisions 1行
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ReplayDecisionRow {
-    pub run_id: i64,
-    pub t: String,
-    pub decision_json: String,
-    pub guard_result: String,
-    pub outcome: String,
-    pub pnl_pips: Option<f64>,
-    pub bars_to_exit: Option<i64>,
-    pub chart_dir: String,
-    pub session: String,
-    pub confidence: f64,
-    pub action: String,
-    /// 条件付きプランが成立したときの再判断（`replay::PlanFollowup` の JSON）。成立しなければ None
-    #[serde(default)]
-    pub followup_json: Option<String>,
 }
 
 impl Db {
@@ -96,33 +67,6 @@ impl Db {
               volume  INTEGER,
               PRIMARY KEY (pair, period, ts)
             );
-            CREATE TABLE IF NOT EXISTS replay_runs (
-              id            INTEGER PRIMARY KEY AUTOINCREMENT,
-              created_at    INTEGER NOT NULL,
-              label         TEXT NOT NULL DEFAULT '',
-              pair          TEXT NOT NULL,
-              from_ts       INTEGER NOT NULL,
-              to_ts         INTEGER NOT NULL,
-              sampling      TEXT NOT NULL,
-              prompt_hash   TEXT NOT NULL,
-              snapshot_ver  TEXT NOT NULL,
-              guard_config  TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS replay_decisions (
-              run_id        INTEGER NOT NULL REFERENCES replay_runs(id),
-              t             INTEGER NOT NULL,
-              decision_json TEXT NOT NULL,
-              guard_result  TEXT NOT NULL,
-              outcome       TEXT NOT NULL,
-              pnl_pips      REAL,
-              bars_to_exit  INTEGER,
-              chart_dir     TEXT NOT NULL,
-              session       TEXT NOT NULL,
-              confidence    REAL NOT NULL,
-              action        TEXT NOT NULL,
-              followup_json TEXT,
-              PRIMARY KEY (run_id, t)
-            );
             CREATE TABLE IF NOT EXISTS oauth_tokens (
               provider      TEXT PRIMARY KEY,
               access_token  TEXT NOT NULL,
@@ -145,9 +89,8 @@ impl Db {
             DELETE FROM app_settings WHERE key = 'fundamentals_cache';
             "#,
         )?;
-        // 既存 DB への列追加（既にあればエラーになるので無視する）
-        let _ = self.conn.execute("ALTER TABLE replay_decisions ADD COLUMN followup_json TEXT", []);
         self.migrate_journal()?;
+        self.migrate_backtest()?;
         Ok(())
     }
 
@@ -189,6 +132,22 @@ impl Db {
             params![key, serde_json::to_string(value)?, Utc::now().timestamp()],
         )?;
         Ok(())
+    }
+
+    /// ブローカーから取得した銘柄仕様を保存する（未接続のバックテストで lot サイズ・pip 位置を使うため）
+    pub fn save_instrument(&self, spec: &crate::instrument::InstrumentSpec) -> Result<()> {
+        self.save_cache(&instrument_key(&spec.symbol_name), spec)
+    }
+
+    /// 保存済みの銘柄仕様を `instrument` に登録する。無ければ false（名前からの推測で動く）
+    pub fn register_saved_instrument(&self, symbol: &str) -> Result<bool> {
+        match self.load_cache::<crate::instrument::InstrumentSpec>(&instrument_key(symbol))? {
+            Some(spec) => {
+                crate::instrument::register(spec);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     // -------------------------------------------------------------- tokens
@@ -261,6 +220,32 @@ impl Db {
         Ok(rows)
     }
 
+    /// 開始時刻が `[from, to)` の足を昇順で返す
+    pub fn bars_range(&self, pair: &str, period: BarPeriod, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<Vec<CandleBar>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ts, open, high, low, close, volume FROM bars_history
+             WHERE pair = ?1 AND period = ?2 AND ts >= ?3 AND ts < ?4
+             ORDER BY ts ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![pair.to_uppercase(), period.as_str(), from.timestamp(), to.timestamp()], row_to_bar)?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn first_bar_ts(&self, pair: &str, period: BarPeriod) -> Result<Option<DateTime<Utc>>> {
+        let ts: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT MIN(ts) FROM bars_history WHERE pair = ?1 AND period = ?2",
+                params![pair.to_uppercase(), period.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(ts.and_then(|s| Utc.timestamp_opt(s, 0).single()))
+    }
+
     /// `t` 以降に開始する足を昇順で最大 `limit` 本
     pub fn bars_from(&self, pair: &str, period: BarPeriod, t: DateTime<Utc>, limit: usize) -> Result<Vec<CandleBar>> {
         let mut stmt = self.conn.prepare(
@@ -307,127 +292,10 @@ impl Db {
         Ok(rows)
     }
 
-    // -------------------------------------------------------------- replay
+}
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn create_run(
-        &self,
-        label: &str,
-        pair: &str,
-        from: DateTime<Utc>,
-        to: DateTime<Utc>,
-        sampling: &str,
-        prompt_hash: &str,
-        snapshot_ver: &str,
-        guard_config: &str,
-    ) -> Result<i64> {
-        self.conn.execute(
-            "INSERT INTO replay_runs (created_at, label, pair, from_ts, to_ts, sampling, prompt_hash, snapshot_ver, guard_config)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                Utc::now().timestamp(),
-                label,
-                pair.to_uppercase(),
-                from.timestamp(),
-                to.timestamp(),
-                sampling,
-                prompt_hash,
-                snapshot_ver,
-                guard_config
-            ],
-        )?;
-        Ok(self.conn.last_insert_rowid())
-    }
-
-    pub fn insert_decision(&self, row: &ReplayDecisionRow) -> Result<()> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO replay_decisions
-             (run_id, t, decision_json, guard_result, outcome, pnl_pips, bars_to_exit, chart_dir, session, confidence, action, followup_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![
-                row.run_id,
-                parse_ts(&row.t)?,
-                row.decision_json,
-                row.guard_result,
-                row.outcome,
-                row.pnl_pips,
-                row.bars_to_exit,
-                row.chart_dir,
-                row.session,
-                row.confidence,
-                row.action,
-                row.followup_json
-            ],
-        )?;
-        Ok(())
-    }
-
-    /// 既に評価済みの時刻（再開用）
-    pub fn decided_ts(&self, run_id: i64) -> Result<Vec<DateTime<Utc>>> {
-        let mut stmt = self.conn.prepare("SELECT t FROM replay_decisions WHERE run_id = ?1")?;
-        let rows = stmt
-            .query_map(params![run_id], |r| r.get::<_, i64>(0))?
-            .filter_map(|r| r.ok())
-            .filter_map(|s| Utc.timestamp_opt(s, 0).single())
-            .collect();
-        Ok(rows)
-    }
-
-    pub fn list_runs(&self) -> Result<Vec<ReplayRunRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT r.id, r.created_at, r.label, r.pair, r.from_ts, r.to_ts, r.sampling, r.prompt_hash, r.snapshot_ver, r.guard_config,
-                    (SELECT COUNT(*) FROM replay_decisions d WHERE d.run_id = r.id)
-             FROM replay_runs r ORDER BY r.id DESC",
-        )?;
-        let rows = stmt
-            .query_map([], |r| {
-                Ok(ReplayRunRow {
-                    id: r.get(0)?,
-                    created_at: fmt_ts(r.get(1)?),
-                    label: r.get(2)?,
-                    pair: r.get(3)?,
-                    from_ts: fmt_ts(r.get(4)?),
-                    to_ts: fmt_ts(r.get(5)?),
-                    sampling: r.get(6)?,
-                    prompt_hash: r.get(7)?,
-                    snapshot_ver: r.get(8)?,
-                    guard_config: r.get(9)?,
-                    decisions: r.get(10)?,
-                })
-            })?
-            .collect::<std::result::Result<_, _>>()?;
-        Ok(rows)
-    }
-
-    pub fn get_run(&self, run_id: i64) -> Result<Option<ReplayRunRow>> {
-        Ok(self.list_runs()?.into_iter().find(|r| r.id == run_id))
-    }
-
-    pub fn decisions(&self, run_id: i64) -> Result<Vec<ReplayDecisionRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT run_id, t, decision_json, guard_result, outcome, pnl_pips, bars_to_exit, chart_dir, session, confidence, action, followup_json
-             FROM replay_decisions WHERE run_id = ?1 ORDER BY t ASC",
-        )?;
-        let rows = stmt
-            .query_map(params![run_id], |r| {
-                Ok(ReplayDecisionRow {
-                    run_id: r.get(0)?,
-                    t: fmt_ts(r.get(1)?),
-                    decision_json: r.get(2)?,
-                    guard_result: r.get(3)?,
-                    outcome: r.get(4)?,
-                    pnl_pips: r.get(5)?,
-                    bars_to_exit: r.get(6)?,
-                    chart_dir: r.get(7)?,
-                    session: r.get(8)?,
-                    confidence: r.get(9)?,
-                    action: r.get(10)?,
-                    followup_json: r.get(11)?,
-                })
-            })?
-            .collect::<std::result::Result<_, _>>()?;
-        Ok(rows)
-    }
+fn instrument_key(symbol: &str) -> String {
+    format!("instrument:{}", symbol.trim().to_uppercase())
 }
 
 fn row_to_bar(r: &rusqlite::Row) -> rusqlite::Result<CandleBar> {
@@ -487,34 +355,6 @@ mod tests {
         let after = db.bars_from("USDJPY", BarPeriod::M5, t, 100).unwrap();
         assert_eq!(after.first().unwrap().timestamp, base + Duration::minutes(15));
         assert_eq!(after.len(), 7);
-    }
-
-    #[test]
-    fn run_and_decision_roundtrip() {
-        let db = Db::open_in_memory().unwrap();
-        let from = Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap();
-        let to = Utc.with_ymd_and_hms(2026, 9, 2, 0, 0, 0).unwrap();
-        let id = db.create_run("test", "USDJPY", from, to, "15m", "abc", "v2", "{}").unwrap();
-        db.insert_decision(&ReplayDecisionRow {
-            run_id: id,
-            t: "2026-09-01 09:00:00".into(),
-            decision_json: "{}".into(),
-            guard_result: "PASS".into(),
-            outcome: "TP_HIT".into(),
-            pnl_pips: Some(12.5),
-            bars_to_exit: Some(7),
-            chart_dir: "charts/x".into(),
-            session: "LONDON".into(),
-            confidence: 0.8,
-            action: "BUY".into(),
-            followup_json: None,
-        })
-        .unwrap();
-        let runs = db.list_runs().unwrap();
-        assert_eq!(runs[0].decisions, 1);
-        let d = db.decisions(id).unwrap();
-        assert_eq!(d[0].outcome, "TP_HIT");
-        assert_eq!(db.decided_ts(id).unwrap().len(), 1);
     }
 
     #[test]

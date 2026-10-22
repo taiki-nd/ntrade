@@ -17,7 +17,7 @@ pub async fn cancel_order(State(state): State<AppState>, Path(id): Path<String>)
     if !state.working_orders.read().await.iter().any(|o| o.id == id) {
         return Json(ApiResponse::err(format!("order {id} not found")));
     }
-    // 判断サイクルの発注・操作と重ねない
+    // 戦略の発注・操作と重ねない
     let _guard = state.order_lock.lock().await;
     let sink = state.order_sink.read().await.clone();
     match sink.cancel_pending(&id).await {
@@ -38,7 +38,6 @@ pub async fn guard_config(State(state): State<AppState>) -> Json<ApiResponse<Gua
 /// GET /api/runtime
 /// エンジンの稼働設定（読み取り専用）
 pub async fn runtime_info(State(state): State<AppState>) -> Json<ApiResponse<RuntimeInfo>> {
-    let llm = state.llm.config();
     let settings = state.settings.read().await.clone();
     let ctrader = state.ctrader_config.read().await.clone();
     let info = RuntimeInfo {
@@ -49,9 +48,6 @@ pub async fn runtime_info(State(state): State<AppState>) -> Json<ApiResponse<Run
         paper_balance: 0.0,
         guard_config_path: format!("SQLite app_settings.{}", crate::settings::SETTINGS_KEY),
         db_path: state.db_path.to_string_lossy().to_string(),
-        llm_cli: llm.cli_binary.clone(),
-        llm_model: llm.model.clone(),
-        llm_timeout_secs: llm.timeout_secs,
         env_file_present: std::path::Path::new(".env").exists(),
         ctrader_token_present: ctrader.as_ref().is_some_and(|c| !c.access_token.is_empty()),
         ctrader_refresh_token_present: ctrader.as_ref().is_some_and(|c| c.refresh_token.is_some()),

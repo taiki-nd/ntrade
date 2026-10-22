@@ -14,9 +14,9 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { ArrowUpRight, ArrowDownRight, BrainCircuit, Wallet, XCircle } from "lucide-react";
+import { ArrowUpRight, ArrowDownRight, Radio, Wallet, XCircle } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { CoTDetailDialog } from "@/components/trading/CoTDetailDialog";
+import { SignalDetailDialog } from "@/components/trading/SignalViewer";
 import { useNow } from "@/hooks/use-now";
 import { formatDuration, parseEngineTime } from "@/lib/time";
 
@@ -39,6 +39,24 @@ export function SideBadge({ side, suffix }: { side: "BUY" | "SELL"; suffix?: str
   );
 }
 
+/** 管理している戦略（デプロイ ID）。無ければ手動・ブローカーから取り込んだもの */
+export function StrategyBadge({ strategy }: { strategy?: string | null }) {
+  return strategy ? (
+    <Badge variant="secondary" className="font-mono text-[11px]" title={`デプロイ ${strategy} が管理`}>
+      {strategy}
+    </Badge>
+  ) : (
+    <Badge variant="outline" className="text-[11px] text-muted-foreground" title="戦略の管理外（手動・ブローカーから取り込み）">
+      手動/取込
+    </Badge>
+  );
+}
+
+/** SL / TP の価格。0 は未設定 */
+export function formatLevel(v: number, digits: number): string {
+  return v > 0 ? v.toFixed(digits) : "なし";
+}
+
 interface PositionTableProps {
   positions: Position[];
   onClosePosition: (id: string) => void;
@@ -46,7 +64,7 @@ interface PositionTableProps {
 
 export function PositionTable({ positions, onClosePosition }: PositionTableProps) {
   const now = useNow();
-  const [cotId, setCotId] = React.useState<string | null>(null);
+  const [signalId, setSignalId] = React.useState<string | null>(null);
 
   return (
     <Card className="shadow-xs">
@@ -59,7 +77,7 @@ export function PositionTable({ positions, onClosePosition }: PositionTableProps
           </Badge>
         </CardTitle>
         <CardDescription className="text-xs">
-          SL/TP はブローカー側に置いてあり、判断のたびに LLM が保有継続・SL/TP の変更・決済を見直します
+          SL/TP はブローカー側に置いてあり、戦略は自分の時間足の確定ごとに SL の変更・決済を判断します。手動/取込の建玉は戦略が触りません
         </CardDescription>
       </CardHeader>
       <CardContent className="p-0">
@@ -68,6 +86,7 @@ export function PositionTable({ positions, onClosePosition }: PositionTableProps
             <TableHeader className="bg-muted/40">
               <TableRow>
                 <TableHead>銘柄</TableHead>
+                <TableHead>戦略 / メモ</TableHead>
                 <TableHead className="text-right">建値 → 現在値</TableHead>
                 <TableHead className="text-right">SL / TP</TableHead>
                 <TableHead className="text-right">損益</TableHead>
@@ -77,7 +96,7 @@ export function PositionTable({ positions, onClosePosition }: PositionTableProps
             <TableBody>
               {positions.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={5} className="h-20 text-center text-muted-foreground text-sm">
+                  <TableCell colSpan={6} className="h-20 text-center text-muted-foreground text-sm">
                     保有中のポジションはありません
                   </TableCell>
                 </TableRow>
@@ -97,6 +116,12 @@ export function PositionTable({ positions, onClosePosition }: PositionTableProps
                           {pos.volumeLots.toFixed(2)} lot · 保有 {opened != null ? formatDuration(now - opened) : "-"}
                         </span>
                       </TableCell>
+                      <TableCell className="max-w-[260px]">
+                        <StrategyBadge strategy={pos.strategy} />
+                        <p className="mt-0.5 text-[11px] text-muted-foreground truncate" title={pos.note}>
+                          {pos.note || "—"}
+                        </p>
+                      </TableCell>
                       <TableCell className="text-right font-mono tabular-nums text-sm">
                         <span className="text-muted-foreground">{pos.entryPrice.toFixed(d)}</span>
                         <span className="text-muted-foreground"> → </span>
@@ -104,11 +129,8 @@ export function PositionTable({ positions, onClosePosition }: PositionTableProps
                       </TableCell>
                       <TableCell className="text-right">
                         <div className="flex flex-col items-end gap-0.5 font-mono tabular-nums text-xs">
-                          <span className="text-loss" title={pos.closeStop != null ? `ハードSL ${pos.stopLoss.toFixed(d)}` : undefined}>
-                            SL {(pos.closeStop ?? pos.stopLoss).toFixed(d)}
-                            {pos.closeStop != null && <span className="text-muted-foreground"> (終値)</span>}
-                          </span>
-                          <span className="text-profit">TP {pos.takeProfit.toFixed(d)}</span>
+                          <span className="text-loss">SL {formatLevel(pos.stopLoss, d)}</span>
+                          <span className="text-profit">TP {formatLevel(pos.takeProfit, d)}</span>
                         </div>
                       </TableCell>
                       <TableCell className={cn("text-right font-mono tabular-nums", pnlClass)}>
@@ -120,15 +142,15 @@ export function PositionTable({ positions, onClosePosition }: PositionTableProps
                       </TableCell>
                       <TableCell className="text-right">
                         <div className="flex items-center justify-end gap-1">
-                          {pos.cotLogId && (
+                          {pos.signalId && (
                             <Button
                               variant="ghost"
                               size="icon-sm"
-                              onClick={() => setCotId(pos.cotLogId ?? null)}
-                              aria-label="この建玉を建てた判断"
-                              title="この建玉を建てた判断"
+                              onClick={() => setSignalId(pos.signalId ?? null)}
+                              aria-label="この建玉を建てたシグナル"
+                              title="この建玉を建てたシグナル"
                             >
-                              <BrainCircuit className="h-3.5 w-3.5" />
+                              <Radio className="h-3.5 w-3.5" />
                             </Button>
                           )}
                           <Button
@@ -151,7 +173,7 @@ export function PositionTable({ positions, onClosePosition }: PositionTableProps
           </Table>
         </div>
       </CardContent>
-      <CoTDetailDialog cotLogId={cotId} onClose={() => setCotId(null)} />
+      <SignalDetailDialog signalId={signalId} onClose={() => setSignalId(null)} />
     </Card>
   );
 }

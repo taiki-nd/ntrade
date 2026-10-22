@@ -6,12 +6,12 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Switch } from "@/components/ui/switch";
 import { Separator } from "@/components/ui/separator";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { ShieldCheck, Loader2, Plus, Save, Search, Undo2, X } from "lucide-react";
+import { ShieldCheck, Loader2, Plus, Save, Search, Undo2, X, Info } from "lucide-react";
 import { toast } from "sonner";
 import { tradingApi, type GuardConfig, type SymbolCatalogEntry, type TradingSettings } from "@/lib/trading-api";
+import { DeploymentEditor } from "@/components/trading/DeploymentEditor";
 
 type NumericGuardKey = {
   [K in keyof GuardConfig]: GuardConfig[K] extends number ? K : never;
@@ -129,7 +129,7 @@ export function TradingSettingsForm() {
       if (res.success && res.data) {
         setSaved(res.data);
         setDraft(res.data);
-        toast.success("設定を保存しました", { description: "次の判断サイクルから反映されます。" });
+        toast.success("設定を保存しました", { description: "次の足の確定から反映されます。" });
       } else {
         toast.error("保存できませんでした", { description: res.message });
       }
@@ -150,7 +150,8 @@ export function TradingSettingsForm() {
               取引設定
             </CardTitle>
             <CardDescription className="text-xs">
-              SQLite に保存され、再起動なしで次の判断サイクルから反映されます。ガードは判断ロジックではなくリスク管理です。
+              SQLite に保存され、再起動なしで次の足の確定から反映されます。ガードは売買ロジックではなくリスク管理で、本番の発注とバックテスト（
+              <code className="font-mono">config/backtest.toml</code> の guard = &quot;settings&quot;）の両方に当たります。
             </CardDescription>
           </div>
           <div className="flex items-center gap-2 shrink-0">
@@ -227,23 +228,41 @@ export function TradingSettingsForm() {
               value={draft.barDelaySecs}
               onChange={(v) => setDraft({ ...draft, barDelaySecs: v ?? 0 })}
             />
-            <NumberField
-              label="LLM の判断間隔（分）"
-              step="5"
-              value={draft.decisionIntervalMinutes}
-              onChange={(v) => setDraft({ ...draft, decisionIntervalMinutes: v ?? 5 })}
-              hint="5 の倍数（UTC 0:00 起点）。予約注文の約定はブローカーが判定し、終値判定の損切りは 5 分足ごとに見ます"
-            />
           </div>
+        </section>
+
+        <Separator />
+
+        {/* 戦略のデプロイ */}
+        <section className="space-y-3">
+          <div>
+            <h3 className="text-sm font-medium">戦略のデプロイ</h3>
+            <p className="text-xs text-muted-foreground">
+              戦略を銘柄に割り当てます。各デプロイは自分の時間足の足が確定するたびに動きます。銘柄は上の対象銘柄から選びます。
+            </p>
+          </div>
+          <div className="flex items-start gap-2 rounded-lg border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+            <Info className="h-3.5 w-3.5 mt-0.5 shrink-0 text-primary" />
+            <span>
+              実際に発注するのは「有効」かつドライランでないデプロイだけです。ドライランはシグナルを記録するだけで発注しません。新しい戦略はまずドライランで動かし、シグナル画面で確かめてから切り替えてください。
+            </span>
+          </div>
+          <DeploymentEditor
+            deployments={draft.deployments}
+            pairs={draft.pairs}
+            onChange={(deployments) => setDraft({ ...draft, deployments })}
+          />
         </section>
 
         <Separator />
 
         {/* エントリー検証 */}
         <section className="space-y-3">
-          <h3 className="text-sm font-medium">エントリー検証</h3>
+          <div>
+            <h3 className="text-sm font-medium">エントリー検証</h3>
+            <p className="text-xs text-muted-foreground">ここから下のリスク設定は、本番の発注とバックテストの両方に当たります。</p>
+          </div>
           <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-            <NumberField label="確信度の下限 (0〜1)" value={g.min_confidence} onChange={setNum("min_confidence")} />
             <NumberField label="リスクリワード下限" value={g.min_rr} onChange={setNum("min_rr")} />
             <NumberField label="SL 最小幅 (pips, FX のみ)" value={g.sl_min_pips} onChange={setNum("sl_min_pips")} />
             <NumberField label="SL 幅 下限 (5M ATR 比)" value={g.sl_atr_min} onChange={setNum("sl_atr_min")} />
@@ -251,6 +270,7 @@ export function TradingSettingsForm() {
               label={`SL 幅 上限 (${ATR_TF_LABELS[g.sl_atr_max_tf]} ATR 比)`}
               value={g.sl_atr_max}
               onChange={setNum("sl_atr_max")}
+              hint="0 = 上限なし"
             />
             <div className="space-y-1.5">
               <Label className="text-xs text-muted-foreground">SL 幅 上限を測る時間足</Label>
@@ -270,33 +290,9 @@ export function TradingSettingsForm() {
                   ))}
                 </SelectContent>
               </Select>
-              <p className="text-[11px] text-muted-foreground">LLM は上位足の構造で SL を置くため、5M だと値幅の大きい銘柄はほぼ弾かれます</p>
+              <p className="text-[11px] text-muted-foreground">上位足の構造で SL を置く戦略は、5M だと値幅の大きい銘柄でほぼ弾かれます</p>
             </div>
-            <NumberField label="予約注文の期限 上限 (時間)" value={g.plan_max_hours} onChange={setNum("plan_max_hours")} />
-          </div>
-        </section>
-
-        <Separator />
-
-        {/* 損切りの執行 */}
-        <section className="space-y-3">
-          <h3 className="text-sm font-medium">損切りの執行</h3>
-          <div className="flex items-center gap-2">
-            <Switch
-              checked={g.stop_mode === "close"}
-              onCheckedChange={(v) => setGuard({ stop_mode: v ? "close" : "touch" })}
-            />
-            <Label className="text-xs">
-              5M 確定足の終値で損切りを判定する（オフならブローカーの SL にヒゲが触れた時点で決済）
-            </Label>
-          </div>
-          <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-            <NumberField
-              label="ハードSLの位置 (5M ATR 比)"
-              value={g.hard_stop_atr}
-              onChange={setNum("hard_stop_atr")}
-              hint="終値判定のとき、LLM の SL からこの幅だけ外側にブローカーの SL を置く"
-            />
+            <NumberField label="予約注文の期限の上限（時間）" value={g.order_max_hours} onChange={setNum("order_max_hours")} />
           </div>
         </section>
 

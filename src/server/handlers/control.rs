@@ -92,7 +92,8 @@ pub async fn emergency_stop(
             close_reason: CloseReason::Manual,
             open_time: p.open_time,
             close_time: now_str.clone(),
-            cot_log_id: p.cot_log_id,
+            signal_id: p.signal_id,
+            strategy: p.strategy,
         });
     }
 

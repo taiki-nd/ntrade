@@ -856,14 +856,14 @@ impl CTraderService {
         volume: i64,
         price: f64,
         stop_loss: f64,
-        take_profit: f64,
+        take_profit: Option<f64>,
         expires_at: chrono::DateTime<Utc>,
         comment: &str,
     ) -> Result<i64> {
         let symbol_id = self.get_symbol_id(symbol_name).await?;
         let price = self.round_price(symbol_name, price).await;
         let (stop_loss, take_profit) =
-            (self.round_price(symbol_name, stop_loss).await, self.round_price(symbol_name, take_profit).await);
+            (self.round_price(symbol_name, stop_loss).await, self.round_opt(symbol_name, take_profit).await);
         let client_order_id = format!("nt-{}", Utc::now().timestamp_micros());
         let req = ProtoOaNewOrderReq {
             payload_type: Some(ProtoOaPayloadType::ProtoOaNewOrderReq as i32),
@@ -880,7 +880,7 @@ impl CTraderService {
             time_in_force: Some(ProtoOaTimeInForce::GoodTillDate as i32),
             expiration_timestamp: Some(expires_at.timestamp_millis()),
             stop_loss: Some(stop_loss),
-            take_profit: Some(take_profit),
+            take_profit,
             comment: Some(comment.to_string()),
             label: Some("ntrade".to_string()),
             client_order_id: Some(client_order_id.clone()),
@@ -899,6 +899,63 @@ impl CTraderService {
             })
             .await?;
         ev.order.map(|o| o.order_id).ok_or_else(|| anyhow!("order accepted without order id"))
+    }
+
+    /// 成行注文。約定した建玉 ID と約定価格を返す。
+    ///
+    /// 成行の SL/TP は約定価格からの相対距離でしか付けられないので、`reference_price`（発注直前の気配）からの
+    /// 距離で付けて約定直後から守り、約定後に絶対価格へ付け替える（`amend_position_sltp`）。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn place_market_order(
+        &self,
+        symbol_name: &str,
+        is_buy: bool,
+        volume: i64,
+        reference_price: f64,
+        stop_loss: f64,
+        take_profit: Option<f64>,
+        comment: &str,
+    ) -> Result<(i64, f64)> {
+        let symbol_id = self.get_symbol_id(symbol_name).await?;
+        // 相対値は価格差の 10^5 倍
+        let rel = |target: f64| ((target - reference_price).abs() * 100_000.0).round() as i64;
+        let client_order_id = format!("nt-{}", Utc::now().timestamp_micros());
+        let req = ProtoOaNewOrderReq {
+            payload_type: Some(ProtoOaPayloadType::ProtoOaNewOrderReq as i32),
+            ctid_trader_account_id: self.config.account_id,
+            symbol_id,
+            order_type: ProtoOaOrderType::Market as i32,
+            trade_side: if is_buy { ProtoOaTradeSide::Buy as i32 } else { ProtoOaTradeSide::Sell as i32 },
+            volume,
+            relative_stop_loss: Some(rel(stop_loss)).filter(|v| *v > 0),
+            relative_take_profit: take_profit.map(rel).filter(|v| *v > 0),
+            comment: Some(comment.to_string()),
+            label: Some("ntrade".to_string()),
+            client_order_id: Some(client_order_id.clone()),
+            ..Default::default()
+        };
+        info!(symbol_name, is_buy, volume, reference_price, stop_loss, ?take_profit, comment, "Placing market order");
+        let mut rx = self.order_events.subscribe();
+        let deadline = Instant::now() + ORDER_OUTCOME_TIMEOUT;
+        self.send_unsolicited(ProtoOaPayloadType::ProtoOaNewOrderReq as u32, req.encode_to_vec()).await?;
+        let ev = self
+            .await_execution(&mut rx, deadline, &[ProtoOaExecutionType::OrderFilled, ProtoOaExecutionType::OrderPartialFill], |ev| {
+                ev.order.as_ref().and_then(|o| o.client_order_id.as_deref()) == Some(client_order_id.as_str())
+            })
+            .await?;
+        let position_id = ev
+            .position
+            .as_ref()
+            .map(|p| p.position_id)
+            .or_else(|| ev.deal.as_ref().map(|d| d.position_id))
+            .ok_or_else(|| anyhow!("market order filled without position id"))?;
+        let price = ev
+            .deal
+            .as_ref()
+            .and_then(|d| d.execution_price)
+            .or_else(|| ev.position.as_ref().and_then(|p| p.price))
+            .unwrap_or(reference_price);
+        Ok((position_id, price))
     }
 
     /// 予約注文の価格・SL/TP・期限を変える（None の項目は変えない）

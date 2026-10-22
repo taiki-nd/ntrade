@@ -45,6 +45,8 @@ import {
   AlertTriangle,
   Hand,
   BrainCircuit,
+  Bot,
+  Radio,
   Search,
   X,
   SlidersHorizontal,
@@ -53,7 +55,8 @@ import {
   ArrowDown,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { CoTDetailDialog } from "@/components/trading/CoTDetailDialog";
+import { SignalDetailDialog } from "@/components/trading/SignalViewer";
+import { StrategyBadge } from "@/components/trading/PositionTable";
 import { PaginationBar, PaginationBarProps } from "@/components/trading/PaginationBar";
 import {
   EMPTY_TRADE_FILTER,
@@ -67,6 +70,8 @@ export interface TradeFilterProps {
   onChange: (value: TradeFilterState) => void;
   /** 銘柄プルダウンの選択肢（未指定なら銘柄の絞り込みは出さない） */
   symbols?: string[];
+  /** 戦略（デプロイ ID）プルダウンの選択肢（未指定なら戦略の絞り込みは出さない） */
+  strategies?: string[];
 }
 
 interface TradeHistoryTableProps {
@@ -85,14 +90,15 @@ const CLOSE_REASON_LABELS: Record<string, string> = {
   "": "すべて",
   TAKE_PROFIT: "利確 (TP)",
   STOP_LOSS: "損切り (SL)",
-  INVALIDATED: "損切り (終値)",
-  DISCRETIONARY: "LLM 判断で決済",
+  STRATEGY: "戦略決済",
   MANUAL: "手動決済",
   CIRCUIT_BREAKER: "強制停止",
+  INVALIDATED: "旧: 損切り (終値)",
+  DISCRETIONARY: "旧: LLM 判断で決済",
 };
 
 export function TradeHistoryTable({ trades, pagination, filter, onDelete }: TradeHistoryTableProps) {
-  const [selectedCotId, setSelectedCotId] = React.useState<string | null>(null);
+  const [selectedSignalId, setSelectedSignalId] = React.useState<string | null>(null);
   const [selectedIds, setSelectedIds] = React.useState<string[]>([]);
   // 削除確認ダイアログの対象。null なら閉じている
   const [pendingDelete, setPendingDelete] = React.useState<TradeHistory[] | null>(null);
@@ -155,18 +161,26 @@ export function TradeHistoryTable({ trades, pagination, filter, onDelete }: Trad
             損切り (SL)
           </Badge>
         );
+      case "STRATEGY":
+        return (
+          <Badge variant="outline" className="gap-1 text-[11px]">
+            <Bot className="h-3 w-3" />
+            戦略決済
+          </Badge>
+        );
+      // 以下は LLM 運用時代の旧データ
       case "INVALIDATED":
         return (
-          <Badge className="bg-loss/15 text-loss border-loss/30 gap-1 text-[11px]">
+          <Badge className="bg-loss/15 text-loss border-loss/30 gap-1 text-[11px]" title="旧データ: 終値判定の損切り">
             <AlertTriangle className="h-3 w-3" />
-            損切り (終値)
+            旧: 損切り (終値)
           </Badge>
         );
       case "DISCRETIONARY":
         return (
-          <Badge variant="outline" className="gap-1 text-[11px]">
+          <Badge variant="outline" className="gap-1 text-[11px] text-muted-foreground" title="旧データ: LLM の判断で決済">
             <BrainCircuit className="h-3 w-3" />
-            LLM 判断で決済
+            旧: LLM 判断
           </Badge>
         );
       case "MANUAL":
@@ -180,6 +194,12 @@ export function TradeHistoryTable({ trades, pagination, filter, onDelete }: Trad
         return (
           <Badge className="bg-warning/15 text-warning border-warning/30 gap-1 text-[11px]">
             強制停止
+          </Badge>
+        );
+      default:
+        return (
+          <Badge variant="outline" className="text-[11px] font-mono">
+            {reason}
           </Badge>
         );
     }
@@ -209,7 +229,7 @@ export function TradeHistoryTable({ trades, pagination, filter, onDelete }: Trad
   // 概要タブ（ページ送り・絞り込みなし）は狭いカラムに置くので、価格と数量の列を省く
   const compact = !pagination && !filter;
   const wideOnly = compact ? "hidden" : "";
-  const columnCount = (compact ? 6 : 10) + (onDelete ? 2 : 0);
+  const columnCount = (compact ? 7 : 11) + (onDelete ? 2 : 0);
 
   return (
     <Card className="shadow-xs">
@@ -217,10 +237,10 @@ export function TradeHistoryTable({ trades, pagination, filter, onDelete }: Trad
         <div className="space-y-1">
           <CardTitle className="text-base font-semibold flex items-center gap-2">
             <History className="h-5 w-5 text-primary" />
-            <span>{compact ? "直近の決済" : "約定履歴"}</span>
+            <span>{compact ? "直近の決済" : "取引履歴"}</span>
           </CardTitle>
           <CardDescription className="text-xs">
-            決済済みトレードの結果と、エントリーの根拠になった判断
+            決済済みトレードの結果と、管理していた戦略・エントリーしたシグナル
           </CardDescription>
         </div>
 
@@ -231,8 +251,8 @@ export function TradeHistoryTable({ trades, pagination, filter, onDelete }: Trad
               <Input
                 value={filter.value.q}
                 onChange={(e) => set("q", e.target.value)}
-                placeholder="銘柄・売買・決済理由・判断IDを検索"
-                aria-label="約定履歴を検索"
+                placeholder="銘柄・売買・決済理由・シグナルIDを検索"
+                aria-label="取引履歴を検索"
                 className="h-8 pl-8 pr-8 text-xs"
               />
               {filter.value.q && (
@@ -277,6 +297,29 @@ export function TradeHistoryTable({ trades, pagination, filter, onDelete }: Trad
                       <SelectContent>
                         <SelectItem value="">すべて</SelectItem>
                         {filter.symbols.map((s) => (
+                          <SelectItem key={s} value={s}>
+                            {s}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                )}
+
+                {filter.strategies && filter.strategies.length > 0 && (
+                  <div className="space-y-1.5">
+                    <Label className="text-xs text-muted-foreground">戦略（デプロイ）</Label>
+                    <Select
+                      value={filter.value.strategy}
+                      items={{ "": "すべて", ...Object.fromEntries(filter.strategies.map((s) => [s, s])) }}
+                      onValueChange={(v) => set("strategy", String(v ?? ""))}
+                    >
+                      <SelectTrigger size="sm" className="w-full text-xs">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="">すべて</SelectItem>
+                        {filter.strategies.map((s) => (
                           <SelectItem key={s} value={s}>
                             {s}
                           </SelectItem>
@@ -469,7 +512,8 @@ export function TradeHistoryTable({ trades, pagination, filter, onDelete }: Trad
                 {sortHead("pnlAmount", "確定損益", "text-right")}
                 <TableHead className="text-center">決済理由</TableHead>
                 {!compact && sortHead("closeTime", "決済時刻", "text-right")}
-                <TableHead className="text-center">判断</TableHead>
+                <TableHead>戦略</TableHead>
+                <TableHead className="text-center">シグナル</TableHead>
                 {onDelete && <TableHead className="w-[52px] text-center">削除</TableHead>}
               </TableRow>
             </TableHeader>
@@ -481,7 +525,7 @@ export function TradeHistoryTable({ trades, pagination, filter, onDelete }: Trad
                     className="h-24 text-center text-muted-foreground text-sm"
                   >
                     {hasAnyCondition
-                      ? "条件に一致する約定履歴はありません"
+                      ? "条件に一致する取引履歴はありません"
                       : "決済済みのトレード履歴はありません"}
                   </TableCell>
                 </TableRow>
@@ -558,16 +602,20 @@ export function TradeHistoryTable({ trades, pagination, filter, onDelete }: Trad
                         {trd.closeTime}
                       </TableCell>
 
+                      <TableCell>
+                        <StrategyBadge strategy={trd.strategy} />
+                      </TableCell>
+
                       <TableCell className="text-center">
-                        {trd.cotLogId ? (
+                        {trd.signalId ? (
                           <Button
                             variant="ghost"
                             size="sm"
                             className="h-7 gap-1 text-xs"
-                            onClick={() => setSelectedCotId(trd.cotLogId ?? null)}
+                            onClick={() => setSelectedSignalId(trd.signalId ?? null)}
                           >
-                            <BrainCircuit className="h-3.5 w-3.5" />
-                            根拠
+                            <Radio className="h-3.5 w-3.5" />
+                            開く
                           </Button>
                         ) : (
                           <span className="text-xs text-muted-foreground">—</span>
@@ -601,14 +649,14 @@ export function TradeHistoryTable({ trades, pagination, filter, onDelete }: Trad
         )}
       </CardContent>
 
-      <CoTDetailDialog cotLogId={selectedCotId} onClose={() => setSelectedCotId(null)} />
+      <SignalDetailDialog signalId={selectedSignalId} onClose={() => setSelectedSignalId(null)} />
 
       <Dialog open={!!pendingDelete} onOpenChange={(open) => !open && setPendingDelete(null)}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2 text-base">
               <Trash2 className="h-4 w-4 text-destructive" />
-              約定履歴を削除しますか？
+              取引履歴を削除しますか？
             </DialogTitle>
             <DialogDescription className="text-xs">
               {pendingDelete?.length === 1 && pendingDelete[0]

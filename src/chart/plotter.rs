@@ -9,7 +9,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::ctrader::CandleBar;
-use crate::snapshot::measures::{calculate_ema, get_pip_size, price_digits};
+use crate::indicators::{calculate_ema, get_pip_size, price_digits};
 
 /// チャート生成設定
 #[derive(Debug, Clone)]

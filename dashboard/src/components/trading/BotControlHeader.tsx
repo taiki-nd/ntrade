@@ -7,7 +7,6 @@ import {
   Play,
   Pause,
   AlertOctagon,
-  Cpu,
   ShieldAlert,
   Server,
   Link2,
@@ -204,14 +203,6 @@ export function BotControlHeader({
               <span className="text-loss font-medium">cTrader未接続</span>
             )}
           </Button>
-
-          <div
-            className="hidden items-center gap-1.5 px-2 py-1 rounded-md bg-muted/60 text-xs font-mono text-muted-foreground xl:flex"
-            title="LLM: claude -p"
-          >
-            <Cpu className="h-3.5 w-3.5 text-primary" />
-            <span>{metrics.connectionStatus.llm}</span>
-          </div>
 
           {botState === "running" ? (
             <Button

@@ -35,28 +35,23 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/trades", get(handlers::trades::get_trades))
         .route("/api/trades/delete", post(handlers::trades::delete_trades))
         .route("/api/trades/{id}", delete(handlers::trades::delete_trade))
-        // 5. LLM思考ログ (CoT)
-        .route("/api/cot", get(handlers::cot::get_cot_logs))
-        .route("/api/cot/{id}", get(handlers::cot::get_cot_detail))
-        // 6. 自己反省ルール (教訓CRUD)
-        .route("/api/lessons", get(handlers::lessons::get_lessons))
-        .route("/api/lessons", post(handlers::lessons::create_lesson))
-        .route("/api/lessons/{id}/toggle", post(handlers::lessons::toggle_lesson))
-        .route("/api/lessons/{id}", delete(handlers::lessons::delete_lesson))
-        // 7. Snapshot: 時間足別チャート画像配信 / 再生成 / 客観的事実JSON
+        // 5. シグナル（戦略が出した操作の記録）と戦略
+        .route("/api/signals", get(handlers::signals::list_signals))
+        .route("/api/signals/{id}", get(handlers::signals::get_signal))
+        .route("/api/strategies", get(handlers::strategies::list_strategies))
+        .route("/api/deployments", get(handlers::strategies::list_deployments))
+        // 6. チャート画像
         .route("/api/chart/latest", get(handlers::chart::get_latest_chart))
-        .route("/api/chart/generate", post(handlers::chart::generate_chart))
-        .route("/api/snapshot/latest", get(handlers::chart::get_latest_snapshot))
-        // 7b. リプレイ結果
-        .route("/api/replay/runs", get(handlers::replay::list_runs))
-        .route("/api/replay/runs/{id}", get(handlers::replay::run_detail))
-        .route("/api/replay/coverage", get(handlers::replay::coverage))
-        // 9. 判断サイクル（Snapshot → LLM → 注文・建玉の操作 → ガード → 予約注文）と予約注文
-        .route("/api/decide", post(handlers::decide::decide_now))
+        // 7. バックテスト
+        .route("/api/backtest/runs", get(handlers::backtest::list_runs))
+        .route("/api/backtest/runs/{id}", get(handlers::backtest::run_detail).delete(handlers::backtest::delete_run))
+        .route("/api/backtest/run", post(handlers::backtest::run))
+        .route("/api/backtest/coverage", get(handlers::backtest::coverage))
+        // 9. 予約注文とリスク設定
         .route("/api/orders", get(handlers::orders::list_orders))
         .route("/api/orders/{id}", delete(handlers::orders::cancel_order))
         .route("/api/guard/config", get(handlers::orders::guard_config))
-        // 10. 取引設定（対象ペア・待ち秒数・事後ガード）。SQLite に保存し再起動なしで反映
+        // 10. 取引設定（対象ペア・待ち秒数・リスク設定・戦略）。SQLite に保存し再起動なしで反映
         .route("/api/settings", get(handlers::settings::get_settings).put(handlers::settings::update_settings))
         .route("/api/runtime", get(handlers::orders::runtime_info))
         // 11. 銘柄一覧（ブローカーの全銘柄。資産クラス付き）と銘柄仕様

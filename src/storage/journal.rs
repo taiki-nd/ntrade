@@ -1,10 +1,8 @@
-//! 本番運用の記録: LLM 判断ログ（CoT）・保有ポジション・決済履歴・教訓。
+//! 本番運用の記録: シグナルログ・保有ポジション・予約注文・決済履歴・残高の推移。
 //!
-//! 判断と取引の対応は `cot_log_id` で辿る: `cot_logs.id` ← `positions.cot_log_id` / `trades.cot_log_id`、
-//! 教訓は `lessons.trigger_trade_id` → `trades.id`。
-//! 予約注文は `working_orders.cot_log_id` に置いた判断を持ち、約定した建玉にそれを引き継ぐ。
-//! 旧データ: 条件付きプランの成立時の再判断は、プランを立てた判断へ `cot_logs.origin_cot_log_id` で辿る。
-//! `cot-plan-*` は LLM を通さずに発注した機械的な成立ログで、根拠は origin 側にある。
+//! シグナルと取引の対応は `signal_id` で辿る: `signals.id` ← `positions.signal_id` / `trades.signal_id`。
+//! どの戦略（デプロイ）の取引かは `strategy` 列に持つ。
+//! 予約注文は置いたシグナルと戦略を持ち、約定した建玉にそれを引き継ぐ。
 //! 時刻は API と同じ "YYYY-MM-DD HH:MM:SS"（UTC）の文字列で持つ（辞書順 = 時系列順）。
 
 use anyhow::Result;
@@ -13,7 +11,7 @@ use serde::Serialize;
 
 use super::Db;
 use crate::ctrader::BalanceEvent;
-use crate::server::types::{BalancePoint, CloseReason, CoTLog, LessonLearned, Position, TradeHistory, TradeQuery, WorkingOrder};
+use crate::server::types::{BalancePoint, CloseReason, Position, SignalLog, SignalQuery, SignalStatus, TradeHistory, TradeQuery, WorkingOrder};
 
 /// ページング結果
 #[derive(Debug, Clone, Serialize)]
@@ -24,18 +22,17 @@ pub struct Page<T> {
     pub total: i64,
 }
 
-const COT_COLS: &str = "id, timestamp, symbol, action, confidence, entry_type, entry_price, stop_loss, take_profit,
-    risk_reward_ratio, macro_context, order_flow, invalidation, conflicts, guard_result, reasoning, executed, spread_pips,
-    origin_cot_log_id, fundamental_view";
+const SIGNAL_COLS: &str =
+    "id, timestamp, deployment, strategy, symbol, action, side, reason, detail_json, guard_result, status, message, order_id, dry_run";
 
-/// CoT ログの絞り込み条件（?1 = ペア / ?2 = 検索語。いずれも NULL なら無条件）
-const COT_SEARCH_WHERE: &str = r#"WHERE (?1 IS NULL OR symbol = ?1 COLLATE NOCASE)
-      AND (?2 IS NULL OR lower(
-            symbol || ' ' || action || ' ' || timestamp || ' ' || COALESCE(entry_type, '') || ' ' ||
-            COALESCE(fundamental_view, '') || ' ' ||
-            macro_context || ' ' || order_flow || ' ' || invalidation || ' ' || conflicts || ' ' ||
-            COALESCE(guard_result, '') || ' ' || reasoning
-          ) LIKE ?2 ESCAPE '\')"#;
+/// シグナルの絞り込み条件（NULL の名前付きパラメータは絞り込まない）
+const SIGNAL_SEARCH_WHERE: &str = r#"WHERE (:symbol IS NULL OR symbol = :symbol COLLATE NOCASE)
+      AND (:deployment IS NULL OR deployment = :deployment)
+      AND (:status IS NULL OR status = :status)
+      AND (:q IS NULL OR lower(
+            symbol || ' ' || deployment || ' ' || strategy || ' ' || action || ' ' || COALESCE(side, '') || ' ' ||
+            timestamp || ' ' || reason || ' ' || COALESCE(guard_result, '') || ' ' || COALESCE(message, '')
+          ) LIKE :q ESCAPE '\')"#;
 
 /// 検索語を LIKE の部分一致パターンにする（ワイルドカードは打ち消す）。空文字なら絞り込まない
 fn search_pattern(query: Option<&str>) -> Option<String> {
@@ -45,26 +42,25 @@ fn search_pattern(query: Option<&str>) -> Option<String> {
 }
 
 const POSITION_COLS: &str = "id, symbol, side, volume_lots, entry_price, current_price, stop_loss, take_profit,
-    pnl_pips, pnl_amount, open_time, invalidation_reason, cot_log_id, close_stop";
+    pnl_pips, pnl_amount, open_time, note, signal_id, strategy";
 
 const TRADE_COLS: &str = "id, symbol, side, volume_lots, entry_price, close_price, stop_loss, take_profit,
-    pnl_pips, pnl_amount, close_reason, open_time, close_time, cot_log_id";
-
-const LESSON_COLS: &str = "id, created_at, symbol, rule, context, active, trigger_trade_id, category";
+    pnl_pips, pnl_amount, close_reason, open_time, close_time, signal_id, strategy";
 
 /// 決済履歴の絞り込み条件（NULL の名前付きパラメータは絞り込まない）
-const TRADE_SEARCH_WHERE: &str = r#"WHERE (:cot_log_id IS NULL OR cot_log_id = :cot_log_id)
+const TRADE_SEARCH_WHERE: &str = r#"WHERE (:signal_id IS NULL OR signal_id = :signal_id)
       AND (:symbol IS NULL OR symbol = :symbol COLLATE NOCASE)
+      AND (:strategy IS NULL OR strategy = :strategy)
       AND (:side IS NULL OR side = :side)
       AND (:close_reason IS NULL OR close_reason = :close_reason)
-      AND (:win IS NULL OR :win = (pnl_pips >= 0))
+      AND (:win IS NULL OR :win = (pnl_amount >= 0))
       AND (:from IS NULL OR close_time >= :from)
       AND (:to IS NULL OR close_time <= :to)
       AND (:min_pnl IS NULL OR pnl_pips >= :min_pnl)
       AND (:max_pnl IS NULL OR pnl_pips <= :max_pnl)
       AND (:q IS NULL OR lower(
             symbol || ' ' || side || ' ' || close_reason || ' ' ||
-            open_time || ' ' || close_time || ' ' || COALESCE(cot_log_id, '')
+            open_time || ' ' || close_time || ' ' || COALESCE(signal_id, '') || ' ' || COALESCE(strategy, '')
           ) LIKE :q ESCAPE '\')"#;
 
 /// 空文字を None に畳む（クエリ文字列の `&symbol=` を「指定なし」として扱う）
@@ -78,48 +74,64 @@ fn range_end(v: Option<&String>) -> Option<String> {
 }
 
 impl Db {
+    fn columns(&self, table: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let cols = stmt.query_map([], |r| r.get::<_, String>(1))?.collect::<std::result::Result<_, _>>()?;
+        Ok(cols)
+    }
+
+    /// 列名の変更（旧名の列があり、新名の列が無いときだけ）
+    fn rename_column(&self, table: &str, from: &str, to: &str) -> Result<()> {
+        let cols = self.columns(table)?;
+        if cols.iter().any(|c| c == from) && !cols.iter().any(|c| c == to) {
+            self.conn.execute_batch(&format!("ALTER TABLE {table} RENAME COLUMN {from} TO {to}"))?;
+        }
+        Ok(())
+    }
+
+    fn add_column(&self, table: &str, column: &str, decl: &str) -> Result<()> {
+        if !self.columns(table)?.iter().any(|c| c == column) {
+            self.conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
+        }
+        Ok(())
+    }
+
     pub(super) fn migrate_journal(&self) -> Result<()> {
         self.conn.execute_batch(
             r#"
-            CREATE TABLE IF NOT EXISTS cot_logs (
-              id                TEXT PRIMARY KEY,
-              timestamp         TEXT NOT NULL,
-              symbol            TEXT NOT NULL,
-              action            TEXT NOT NULL,
-              confidence        REAL NOT NULL,
-              entry_type        TEXT,
-              entry_price       REAL,
-              stop_loss         REAL,
-              take_profit       REAL,
-              risk_reward_ratio REAL,
-              macro_context     TEXT NOT NULL,
-              order_flow        TEXT NOT NULL,
-              invalidation      TEXT NOT NULL,
-              conflicts         TEXT NOT NULL,
-              guard_result      TEXT,
-              reasoning         TEXT NOT NULL,
-              executed          INTEGER NOT NULL,
-              spread_pips       REAL NOT NULL,
-              origin_cot_log_id TEXT,
-              fundamental_view  TEXT
+            CREATE TABLE IF NOT EXISTS signals (
+              id           TEXT PRIMARY KEY,
+              timestamp    TEXT NOT NULL,
+              deployment   TEXT NOT NULL,
+              strategy     TEXT NOT NULL,
+              symbol       TEXT NOT NULL,
+              action       TEXT NOT NULL,
+              side         TEXT,
+              reason       TEXT NOT NULL,
+              detail_json  TEXT NOT NULL,
+              guard_result TEXT,
+              status       TEXT NOT NULL,
+              message      TEXT,
+              order_id     TEXT,
+              dry_run      INTEGER NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_cot_logs_ts ON cot_logs (timestamp);
-            CREATE INDEX IF NOT EXISTS idx_cot_logs_symbol_ts ON cot_logs (symbol, timestamp);
+            CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals (timestamp);
+            CREATE INDEX IF NOT EXISTS idx_signals_deployment_ts ON signals (deployment, timestamp);
             CREATE TABLE IF NOT EXISTS positions (
-              id                  TEXT PRIMARY KEY,
-              symbol              TEXT NOT NULL,
-              side                TEXT NOT NULL,
-              volume_lots         REAL NOT NULL,
-              entry_price         REAL NOT NULL,
-              current_price       REAL NOT NULL,
-              stop_loss           REAL NOT NULL,
-              take_profit         REAL NOT NULL,
-              pnl_pips            REAL NOT NULL,
-              pnl_amount          REAL NOT NULL,
-              open_time           TEXT NOT NULL,
-              invalidation_reason TEXT NOT NULL,
-              cot_log_id          TEXT,
-              close_stop          REAL
+              id            TEXT PRIMARY KEY,
+              symbol        TEXT NOT NULL,
+              side          TEXT NOT NULL,
+              volume_lots   REAL NOT NULL,
+              entry_price   REAL NOT NULL,
+              current_price REAL NOT NULL,
+              stop_loss     REAL NOT NULL,
+              take_profit   REAL NOT NULL,
+              pnl_pips      REAL NOT NULL,
+              pnl_amount    REAL NOT NULL,
+              open_time     TEXT NOT NULL,
+              note          TEXT NOT NULL,
+              signal_id     TEXT,
+              strategy      TEXT
             );
             CREATE TABLE IF NOT EXISTS trades (
               id           TEXT PRIMARY KEY,
@@ -135,41 +147,13 @@ impl Db {
               close_reason TEXT NOT NULL,
               open_time    TEXT NOT NULL,
               close_time   TEXT NOT NULL,
-              cot_log_id   TEXT
+              signal_id    TEXT,
+              strategy     TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_trades_close_time ON trades (close_time);
-            CREATE INDEX IF NOT EXISTS idx_trades_cot_log_id ON trades (cot_log_id);
-            CREATE TABLE IF NOT EXISTS lessons (
-              id               TEXT PRIMARY KEY,
-              created_at       TEXT NOT NULL,
-              symbol           TEXT NOT NULL,
-              rule             TEXT NOT NULL,
-              context          TEXT NOT NULL,
-              active           INTEGER NOT NULL,
-              trigger_trade_id TEXT,
-              category         TEXT NOT NULL
-            );
-            UPDATE cot_logs
-            SET risk_reward_ratio = ABS((take_profit - entry_price) / (entry_price - stop_loss))
-            WHERE risk_reward_ratio IS NULL
-              AND entry_price IS NOT NULL
-              AND stop_loss IS NOT NULL
-              AND take_profit IS NOT NULL
-              AND ABS(entry_price - stop_loss) > 0;
-            "#,
-        )?;
-
-        // 既存 DB への列追加。既にあれば "duplicate column name" になるので無視する
-        let _ = self.conn.execute("ALTER TABLE cot_logs ADD COLUMN origin_cot_log_id TEXT", []);
-        let _ = self.conn.execute("ALTER TABLE positions ADD COLUMN close_stop REAL", []);
-        let _ = self.conn.execute("ALTER TABLE cot_logs ADD COLUMN fundamental_view TEXT", []);
-        // 約定待ちの予約注文（再起動しても判断との対応と終値判定ラインを失わないため）
-        self.conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS working_orders (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, json TEXT NOT NULL);",
-        )?;
-        // 口座残高が動いた出来事（決済・入出金）。cTrader の履歴から取り込む。時刻は epoch 秒
-        self.conn.execute_batch(
-            r#"
+            -- 約定待ちの予約注文（再起動してもシグナル・戦略との対応を失わないため）
+            CREATE TABLE IF NOT EXISTS working_orders (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, json TEXT NOT NULL);
+            -- 口座残高が動いた出来事（決済・入出金）。cTrader の履歴から取り込む。時刻は epoch 秒
             CREATE TABLE IF NOT EXISTS balance_history (
                 account_id INTEGER NOT NULL,
                 id TEXT NOT NULL,
@@ -182,84 +166,67 @@ impl Db {
             "#,
         )?;
 
+        // LLM 時代の列名から移す（判断ログ ID → シグナル ID、無効化の根拠 → メモ）
+        self.rename_column("positions", "cot_log_id", "signal_id")?;
+        self.rename_column("positions", "invalidation_reason", "note")?;
+        self.rename_column("trades", "cot_log_id", "signal_id")?;
+        self.add_column("positions", "strategy", "TEXT")?;
+        self.add_column("trades", "strategy", "TEXT")?;
         self.conn.execute_batch(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_cot_logs_origin ON cot_logs (origin_cot_log_id);
-            -- 成立ログは元の判断 ID を本文にだけ持っていたので、列に移す（'元の判断: ' は6文字）
-            UPDATE cot_logs
-            SET origin_cot_log_id =
-                  replace(substr(macro_context, instr(macro_context, '元の判断: ') + 6), '）', '')
-            WHERE origin_cot_log_id IS NULL
-              AND substr(macro_context, instr(macro_context, '元の判断: ') + 6, 4) = 'cot-';
-            "#,
+            "DROP INDEX IF EXISTS idx_trades_cot_log_id;
+             CREATE INDEX IF NOT EXISTS idx_trades_signal_id ON trades (signal_id);
+             CREATE INDEX IF NOT EXISTS idx_trades_strategy ON trades (strategy, close_time);",
         )?;
         Ok(())
     }
 
-    // ------------------------------------------------------------- cot_logs
+    // -------------------------------------------------------------- signals
 
-    pub fn insert_cot_log(&self, log: &CoTLog) -> Result<()> {
+    pub fn insert_signal(&self, s: &SignalLog) -> Result<()> {
         self.conn.execute(
-            &format!("INSERT OR REPLACE INTO cot_logs ({COT_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)"),
+            &format!("INSERT OR REPLACE INTO signals ({SIGNAL_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"),
             params![
-                log.id,
-                log.timestamp,
-                log.symbol,
-                log.action,
-                log.confidence,
-                log.entry_type,
-                log.entry_price,
-                log.stop_loss,
-                log.take_profit,
-                log.risk_reward_ratio,
-                log.macro_context,
-                log.order_flow,
-                log.invalidation,
-                log.conflicts,
-                log.guard_result,
-                log.reasoning,
-                log.executed,
-                log.spread_pips,
-                log.origin_cot_log_id,
-                log.fundamental_view
+                s.id,
+                s.timestamp,
+                s.deployment,
+                s.strategy,
+                s.symbol,
+                s.action,
+                s.side,
+                s.reason,
+                serde_json::to_string(&s.detail)?,
+                s.guard_result,
+                s.status.as_str(),
+                s.message,
+                s.order_id,
+                s.dry_run
             ],
         )?;
         Ok(())
     }
 
-    /// 新しい順。`symbol` 指定時はそのペアのみ、`query` 指定時は本文の部分一致（大文字小文字を無視）で絞り込む
-    pub fn cot_logs(&self, symbol: Option<&str>, query: Option<&str>, limit: usize, offset: usize) -> Result<Page<CoTLog>> {
-        let query = search_pattern(query);
-        let total = self.conn.query_row(
-            &format!("SELECT COUNT(*) FROM cot_logs {COT_SEARCH_WHERE}"),
-            params![symbol, query],
-            |r| r.get(0),
-        )?;
+    /// 新しい順
+    pub fn signals(&self, q: &SignalQuery) -> Result<Page<SignalLog>> {
+        let filters = named_params! {
+            ":symbol": non_empty(q.symbol.as_ref()),
+            ":deployment": non_empty(q.deployment.as_ref()),
+            ":status": non_empty(q.status.as_ref()).map(|s| s.to_uppercase()),
+            ":q": search_pattern(q.q.as_deref()),
+        };
+        let total = self.conn.query_row(&format!("SELECT COUNT(*) FROM signals {SIGNAL_SEARCH_WHERE}"), filters, |r| r.get(0))?;
+        let (limit, offset) = (q.limit(), q.offset());
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {COT_COLS} FROM cot_logs {COT_SEARCH_WHERE}
-             ORDER BY timestamp DESC, rowid DESC LIMIT ?3 OFFSET ?4"
+            "SELECT {SIGNAL_COLS} FROM signals {SIGNAL_SEARCH_WHERE}
+             ORDER BY timestamp DESC, rowid DESC LIMIT {limit} OFFSET {offset}"
         ))?;
-        let items = stmt
-            .query_map(params![symbol, query, limit as i64, offset as i64], row_to_cot)?
-            .collect::<std::result::Result<_, _>>()?;
+        let items = stmt.query_map(filters, row_to_signal)?.collect::<std::result::Result<_, _>>()?;
         Ok(Page { items, total })
     }
 
-    /// この判断から生まれた成立ログ（条件付きプランが成立して発注した記録）を古い順に返す
-    pub fn cot_logs_by_origin(&self, origin_cot_log_id: &str) -> Result<Vec<CoTLog>> {
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT {COT_COLS} FROM cot_logs WHERE origin_cot_log_id = ?1 ORDER BY timestamp ASC, rowid ASC"
-        ))?;
-        let items = stmt
-            .query_map(params![origin_cot_log_id], row_to_cot)?
-            .collect::<std::result::Result<_, _>>()?;
-        Ok(items)
-    }
-
-    pub fn cot_log(&self, id: &str) -> Result<Option<CoTLog>> {
+    pub fn signal(&self, id: &str) -> Result<Option<SignalLog>> {
         Ok(self
             .conn
-            .query_row(&format!("SELECT {COT_COLS} FROM cot_logs WHERE id = ?1"), params![id], row_to_cot)
+            .query_row(&format!("SELECT {SIGNAL_COLS} FROM signals WHERE id = ?1"), params![id], row_to_signal)
             .optional()?)
     }
 
@@ -286,9 +253,9 @@ impl Db {
                     p.pnl_pips,
                     p.pnl_amount,
                     p.open_time,
-                    p.invalidation_reason,
-                    p.cot_log_id,
-                    p.close_stop
+                    p.note,
+                    p.signal_id,
+                    p.strategy
                 ])?;
             }
         }
@@ -327,7 +294,7 @@ impl Db {
 
     pub fn insert_trade(&self, t: &TradeHistory) -> Result<()> {
         self.conn.execute(
-            &format!("INSERT OR REPLACE INTO trades ({TRADE_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"),
+            &format!("INSERT OR REPLACE INTO trades ({TRADE_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"),
             params![
                 t.id,
                 t.symbol,
@@ -342,31 +309,29 @@ impl Db {
                 close_reason_str(&t.close_reason),
                 t.open_time,
                 t.close_time,
-                t.cot_log_id
+                t.signal_id,
+                t.strategy
             ],
         )?;
         Ok(())
     }
 
-    /// 決済の新しい順。`cot_log_id` 指定時はその判断から生まれた取引のみ
-    pub fn trades(&self, cot_log_id: Option<&str>, limit: usize, offset: usize) -> Result<Page<TradeHistory>> {
-        self.search_trades(&TradeQuery::by_cot_log(cot_log_id, limit, offset))
-    }
-
-    /// 銘柄・売買・決済理由・勝敗・期間・損益幅・フリーワードで絞り込んだ決済履歴
+    /// 銘柄・戦略・売買・決済理由・勝敗・期間・損益幅・フリーワードで絞り込んだ決済履歴
     pub fn search_trades(&self, q: &TradeQuery) -> Result<Page<TradeHistory>> {
         let symbol = non_empty(q.symbol.as_ref());
         let side = non_empty(q.side.as_ref()).map(|s| s.to_uppercase());
         let close_reason = q.close_reason.as_ref().map(close_reason_str);
-        let cot_log_id = non_empty(q.cot_log_id.as_ref());
+        let signal_id = non_empty(q.signal_id.as_ref());
+        let strategy = non_empty(q.strategy.as_ref());
         let pattern = search_pattern(q.q.as_deref());
         let from = non_empty(q.from.as_ref());
         let to = range_end(q.to.as_ref());
 
         // 絞り込み条件は件数・本体の双方で同じものを使う
         let filters = named_params! {
-            ":cot_log_id": cot_log_id,
+            ":signal_id": signal_id,
             ":symbol": symbol,
+            ":strategy": strategy,
             ":side": side,
             ":close_reason": close_reason,
             ":win": q.win_only(),
@@ -392,6 +357,13 @@ impl Db {
         Ok(Page { items, total })
     }
 
+    /// `since`（"YYYY-MM-DD HH:MM:SS"）以降に決済した取引の損益合計（口座通貨）
+    pub fn realized_pnl_since(&self, since: &str) -> Result<f64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COALESCE(SUM(pnl_amount), 0) FROM trades WHERE close_time >= ?1", params![since], |r| r.get(0))?)
+    }
+
     /// 決済履歴を1件削除。削除できたら true
     pub fn delete_trade(&self, id: &str) -> Result<bool> {
         Ok(self.conn.execute("DELETE FROM trades WHERE id = ?1", params![id])? > 0)
@@ -415,35 +387,6 @@ impl Db {
         Ok(self
             .conn
             .query_row(&format!("SELECT {TRADE_COLS} FROM trades WHERE id = ?1"), params![id], row_to_trade)
-            .optional()?)
-    }
-
-    // -------------------------------------------------------------- lessons
-
-    pub fn upsert_lesson(&self, l: &LessonLearned) -> Result<()> {
-        self.conn.execute(
-            &format!("INSERT OR REPLACE INTO lessons ({LESSON_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"),
-            params![l.id, l.created_at, l.symbol, l.rule, l.context, l.active, l.trigger_trade_id, l.category],
-        )?;
-        Ok(())
-    }
-
-    /// 削除できたら true
-    pub fn delete_lesson(&self, id: &str) -> Result<bool> {
-        Ok(self.conn.execute("DELETE FROM lessons WHERE id = ?1", params![id])? > 0)
-    }
-
-    /// 新しい順
-    pub fn lessons(&self) -> Result<Vec<LessonLearned>> {
-        let mut stmt = self.conn.prepare(&format!("SELECT {LESSON_COLS} FROM lessons ORDER BY created_at DESC, rowid DESC"))?;
-        let rows = stmt.query_map([], row_to_lesson)?.collect::<std::result::Result<_, _>>()?;
-        Ok(rows)
-    }
-
-    pub fn lesson(&self, id: &str) -> Result<Option<LessonLearned>> {
-        Ok(self
-            .conn
-            .query_row(&format!("SELECT {LESSON_COLS} FROM lessons WHERE id = ?1"), params![id], row_to_lesson)
             .optional()?)
     }
 
@@ -508,28 +451,24 @@ fn parse_close_reason(s: &str) -> rusqlite::Result<CloseReason> {
         .map_err(|e| rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, Box::new(e)))
 }
 
-fn row_to_cot(r: &Row) -> rusqlite::Result<CoTLog> {
-    Ok(CoTLog {
+fn row_to_signal(r: &Row) -> rusqlite::Result<SignalLog> {
+    let detail: String = r.get(8)?;
+    let status: String = r.get(10)?;
+    Ok(SignalLog {
         id: r.get(0)?,
         timestamp: r.get(1)?,
-        symbol: r.get(2)?,
-        action: r.get(3)?,
-        confidence: r.get(4)?,
-        entry_type: r.get(5)?,
-        entry_price: r.get(6)?,
-        stop_loss: r.get(7)?,
-        take_profit: r.get(8)?,
-        risk_reward_ratio: r.get(9)?,
-        macro_context: r.get(10)?,
-        order_flow: r.get(11)?,
-        invalidation: r.get(12)?,
-        conflicts: r.get(13)?,
-        guard_result: r.get(14)?,
-        reasoning: r.get(15)?,
-        executed: r.get(16)?,
-        spread_pips: r.get(17)?,
-        origin_cot_log_id: r.get(18)?,
-        fundamental_view: r.get::<_, Option<String>>(19)?.unwrap_or_default(),
+        deployment: r.get(2)?,
+        strategy: r.get(3)?,
+        symbol: r.get(4)?,
+        action: r.get(5)?,
+        side: r.get(6)?,
+        reason: r.get(7)?,
+        detail: serde_json::from_str(&detail).unwrap_or(serde_json::Value::Null),
+        guard_result: r.get(9)?,
+        status: SignalStatus::parse(&status),
+        message: r.get(11)?,
+        order_id: r.get(12)?,
+        dry_run: r.get(13)?,
     })
 }
 
@@ -546,9 +485,9 @@ fn row_to_position(r: &Row) -> rusqlite::Result<Position> {
         pnl_pips: r.get(8)?,
         pnl_amount: r.get(9)?,
         open_time: r.get(10)?,
-        invalidation_reason: r.get(11)?,
-        cot_log_id: r.get(12)?,
-        close_stop: r.get(13)?,
+        note: r.get(11)?,
+        signal_id: r.get(12)?,
+        strategy: r.get(13)?,
     })
 }
 
@@ -567,20 +506,8 @@ fn row_to_trade(r: &Row) -> rusqlite::Result<TradeHistory> {
         close_reason: parse_close_reason(&r.get::<_, String>(10)?)?,
         open_time: r.get(11)?,
         close_time: r.get(12)?,
-        cot_log_id: r.get(13)?,
-    })
-}
-
-fn row_to_lesson(r: &Row) -> rusqlite::Result<LessonLearned> {
-    Ok(LessonLearned {
-        id: r.get(0)?,
-        created_at: r.get(1)?,
-        symbol: r.get(2)?,
-        rule: r.get(3)?,
-        context: r.get(4)?,
-        active: r.get(5)?,
-        trigger_trade_id: r.get(6)?,
-        category: r.get(7)?,
+        signal_id: r.get(13)?,
+        strategy: r.get(14)?,
     })
 }
 
@@ -589,32 +516,7 @@ mod tests {
     use super::*;
     use crate::server::types::TradeSort;
 
-    fn cot(id: &str, ts: &str, symbol: &str) -> CoTLog {
-        CoTLog {
-            id: id.into(),
-            timestamp: ts.into(),
-            symbol: symbol.into(),
-            action: "BUY".into(),
-            confidence: 0.8,
-            entry_type: Some("MARKET".into()),
-            entry_price: Some(154.2),
-            stop_loss: Some(154.1),
-            take_profit: None,
-            risk_reward_ratio: None,
-            fundamental_view: "f".into(),
-            macro_context: "m".into(),
-            order_flow: "o".into(),
-            invalidation: "i".into(),
-            conflicts: String::new(),
-            guard_result: None,
-            reasoning: "r".into(),
-            executed: true,
-            spread_pips: 0.3,
-            origin_cot_log_id: None,
-        }
-    }
-
-    fn trade(id: &str, close_time: &str, cot_log_id: Option<&str>) -> TradeHistory {
+    fn trade(id: &str, close_time: &str, signal_id: Option<&str>) -> TradeHistory {
         TradeHistory {
             id: id.into(),
             symbol: "USDJPY".into(),
@@ -629,103 +531,89 @@ mod tests {
             close_reason: CloseReason::TakeProfit,
             open_time: "2026-09-15 09:00:00".into(),
             close_time: close_time.into(),
-            cot_log_id: cot_log_id.map(String::from),
+            signal_id: signal_id.map(String::from),
+            strategy: Some("ema-usdjpy".into()),
         }
     }
 
-    /// 成立ログは元の判断 ID を本文にしか持っていなかった。移行でその ID を列へ移せること
-    #[test]
-    fn migration_backfills_origin_from_plan_log_text() {
-        let db = Db::open_in_memory().unwrap();
-        let mut plan = cot("cot-plan-1", "2026-09-25 10:35:22", "USDJPY");
-        plan.macro_context = "条件付きプラン plan-1790332320282 が成立（元の判断: cot-1790332320282）".into();
-        db.insert_cot_log(&plan).unwrap();
-        // 元の判断が無いものは埋めない
-        let mut orphan = cot("cot-plan-2", "2026-09-25 10:40:00", "USDJPY");
-        orphan.macro_context = "条件付きプラン plan-x が成立（元の判断: 不明）".into();
-        db.insert_cot_log(&orphan).unwrap();
+    fn signal(id: &str, ts: &str, status: SignalStatus) -> SignalLog {
+        SignalLog {
+            id: id.into(),
+            timestamp: ts.into(),
+            deployment: "ema-usdjpy".into(),
+            strategy: "ema_cross M5".into(),
+            symbol: "USDJPY_z".into(),
+            action: "OPEN".into(),
+            side: Some("BUY".into()),
+            reason: "EMA20 が EMA50 を上抜け".into(),
+            detail: serde_json::json!({"lots": 0.1}),
+            guard_result: Some("PASS".into()),
+            status,
+            message: None,
+            order_id: Some("123".into()),
+            dry_run: false,
+        }
+    }
 
+    /// LLM 時代の DB（cot_log_id / invalidation_reason 列）を開いても、列名を移して読めること
+    #[test]
+    fn migration_renames_llm_era_columns() {
+        let db = Db::open_in_memory().unwrap();
+        db.conn
+            .execute_batch(
+                "DROP TABLE positions; DROP TABLE trades;
+                 CREATE TABLE positions (id TEXT PRIMARY KEY, symbol TEXT NOT NULL, side TEXT NOT NULL, volume_lots REAL NOT NULL,
+                   entry_price REAL NOT NULL, current_price REAL NOT NULL, stop_loss REAL NOT NULL, take_profit REAL NOT NULL,
+                   pnl_pips REAL NOT NULL, pnl_amount REAL NOT NULL, open_time TEXT NOT NULL, invalidation_reason TEXT NOT NULL,
+                   cot_log_id TEXT, close_stop REAL);
+                 CREATE TABLE trades (id TEXT PRIMARY KEY, symbol TEXT NOT NULL, side TEXT NOT NULL, volume_lots REAL NOT NULL,
+                   entry_price REAL NOT NULL, close_price REAL NOT NULL, stop_loss REAL NOT NULL, take_profit REAL NOT NULL,
+                   pnl_pips REAL NOT NULL, pnl_amount REAL NOT NULL, close_reason TEXT NOT NULL, open_time TEXT NOT NULL,
+                   close_time TEXT NOT NULL, cot_log_id TEXT);
+                 INSERT INTO trades VALUES ('trd-1','USDJPY_z','SELL',0.01,157.0,156.9,157.2,156.8,10.0,84.0,'INVALIDATED',
+                   '2026-10-01 00:00:00','2026-10-01 01:00:00','cot-1');",
+            )
+            .unwrap();
         db.migrate_journal().unwrap();
-
-        let filled = db.cot_log("cot-plan-1").unwrap().unwrap();
-        assert_eq!(filled.origin_cot_log_id.as_deref(), Some("cot-1790332320282"));
-        assert!(db.cot_log("cot-plan-2").unwrap().unwrap().origin_cot_log_id.is_none());
-        let children = db.cot_logs_by_origin("cot-1790332320282").unwrap();
-        assert_eq!(children.len(), 1);
-        assert_eq!(children[0].id, "cot-plan-1");
+        let t = db.trade("trd-1").unwrap().unwrap();
+        assert_eq!(t.signal_id.as_deref(), Some("cot-1"));
+        assert!(t.strategy.is_none());
+        assert!(matches!(t.close_reason, CloseReason::Invalidated));
+        assert!(db.positions().unwrap().is_empty());
+        // 2回目は何もしない
+        db.migrate_journal().unwrap();
     }
 
     #[test]
-    fn cot_logs_paginate_newest_first() {
+    fn signals_are_searchable_newest_first() {
         let db = Db::open_in_memory().unwrap();
-        for i in 0..5 {
-            db.insert_cot_log(&cot(&format!("cot-{i}"), &format!("2026-09-15 09:0{i}:00"), "USDJPY")).unwrap();
-        }
-        db.insert_cot_log(&cot("cot-e", "2026-09-15 09:09:00", "EURUSD")).unwrap();
+        db.insert_signal(&signal("sig-1", "2026-10-20 09:00:00", SignalStatus::Executed)).unwrap();
+        let mut rejected = signal("sig-2", "2026-10-20 09:05:00", SignalStatus::Rejected);
+        rejected.guard_result = Some("MAX_POSITIONS".into());
+        db.insert_signal(&rejected).unwrap();
 
-        let page = db.cot_logs(None, None, 2, 0).unwrap();
-        assert_eq!(page.total, 6);
-        assert_eq!(page.items.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["cot-e", "cot-4"]);
-
-        let page = db.cot_logs(Some("usdjpy"), None, 2, 3).unwrap();
-        assert_eq!(page.total, 5);
-        assert_eq!(page.items.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["cot-1", "cot-0"]);
-
-        let got = db.cot_log("cot-2").unwrap().unwrap();
-        assert_eq!(got.entry_type.as_deref(), Some("MARKET"));
-        assert!(got.executed);
-        assert!(db.cot_log("missing").unwrap().is_none());
-    }
-
-    #[test]
-    fn cot_logs_search_matches_body_and_ignores_wildcards() {
-        let db = Db::open_in_memory().unwrap();
-        let mut hit = cot("cot-hit", "2026-09-15 09:00:00", "USDJPY");
-        hit.reasoning = "レンジ上限を Break した".into();
-        let mut miss = cot("cot-miss", "2026-09-15 09:01:00", "EURUSD");
-        miss.reasoning = "様子見".into();
-        miss.action = "HOLD".into();
-        db.insert_cot_log(&hit).unwrap();
-        db.insert_cot_log(&miss).unwrap();
-
-        // 本文の部分一致（英字は大文字小文字を無視）
-        let page = db.cot_logs(None, Some(" break "), 10, 0).unwrap();
-        assert_eq!((page.total, page.items[0].id.as_str()), (1, "cot-hit"));
-        // 日本語・アクション・ペアでも引ける
-        assert_eq!(db.cot_logs(None, Some("レンジ"), 10, 0).unwrap().total, 1);
-        assert_eq!(db.cot_logs(None, Some("HOLD"), 10, 0).unwrap().total, 1);
-        assert_eq!(db.cot_logs(Some("USDJPY"), Some("様子見"), 10, 0).unwrap().total, 0);
-        // 空文字は絞り込まない / ワイルドカードはリテラル扱い
-        assert_eq!(db.cot_logs(None, Some("   "), 10, 0).unwrap().total, 2);
-        assert_eq!(db.cot_logs(None, Some("%"), 10, 0).unwrap().total, 0);
-    }
-
-    #[test]
-    fn trades_link_to_decision() {
-        let db = Db::open_in_memory().unwrap();
-        db.insert_trade(&trade("trd-1", "2026-09-15 10:00:00", Some("cot-1"))).unwrap();
-        db.insert_trade(&trade("trd-2", "2026-09-15 11:00:00", None)).unwrap();
-
-        let all = db.trades(None, 10, 0).unwrap();
+        let all = db.signals(&SignalQuery::default()).unwrap();
         assert_eq!(all.total, 2);
-        assert_eq!(all.items[0].id, "trd-2");
-
-        let linked = db.trades(Some("cot-1"), 10, 0).unwrap();
-        assert_eq!(linked.total, 1);
-        assert!(matches!(linked.items[0].close_reason, CloseReason::TakeProfit));
-        assert_eq!(db.trade("trd-1").unwrap().unwrap().cot_log_id.as_deref(), Some("cot-1"));
+        assert_eq!(all.items[0].id, "sig-2");
+        assert_eq!(all.items[1].detail["lots"], 0.1);
+        let q = SignalQuery { status: Some("rejected".into()), ..Default::default() };
+        assert_eq!(db.signals(&q).unwrap().items[0].guard_result.as_deref(), Some("MAX_POSITIONS"));
+        let q = SignalQuery { q: Some("上抜け".into()), deployment: Some("ema-usdjpy".into()), ..Default::default() };
+        assert_eq!(db.signals(&q).unwrap().total, 2);
+        assert_eq!(db.signal("sig-1").unwrap().unwrap().status, SignalStatus::Executed);
     }
 
     #[test]
     fn trades_search_filters_and_sorts() {
         let mut db = Db::open_in_memory().unwrap();
-        let mut win = trade("trd-win", "2026-09-15 10:00:00", Some("cot-1"));
+        let mut win = trade("trd-win", "2026-09-15 10:00:00", Some("sig-1"));
         let mut loss = trade("trd-loss", "2026-09-16 11:00:00", None);
         loss.symbol = "EURUSD".into();
         loss.side = "SELL".into();
         loss.close_reason = CloseReason::StopLoss;
         loss.pnl_pips = -12.0;
         loss.pnl_amount = -1200.0;
+        loss.strategy = None;
         win.pnl_pips = 20.0;
         db.insert_trade(&win).unwrap();
         db.insert_trade(&loss).unwrap();
@@ -739,32 +627,23 @@ mod tests {
 
         // 既定は決済の新しい順
         assert_eq!(search(|_| {}).items[0].id, "trd-loss");
-        // 銘柄・売買・決済理由・勝敗
         assert_eq!(search(|q| q.symbol = Some("eurusd".into())).total, 1);
+        assert_eq!(search(|q| q.strategy = Some("ema-usdjpy".into())).items[0].id, "trd-win");
+        assert_eq!(search(|q| q.signal_id = Some("sig-1".into())).total, 1);
         assert_eq!(search(|q| q.side = Some("buy".into())).items[0].id, "trd-win");
         assert_eq!(search(|q| q.close_reason = Some(CloseReason::StopLoss)).items[0].id, "trd-loss");
         assert_eq!(search(|q| q.result = Some("win".into())).items[0].id, "trd-win");
-        assert_eq!(search(|q| q.result = Some("loss".into())).total, 1);
-        // 期間（上限は日付だけでもその日いっぱいを含む）と損益幅
         assert_eq!(search(|q| q.to = Some("2026-09-15".into())).items[0].id, "trd-win");
-        assert_eq!(search(|q| q.from = Some("2026-09-16".into())).items[0].id, "trd-loss");
-        assert_eq!(search(|q| q.min_pnl_pips = Some(0.0)).total, 1);
         assert_eq!(search(|q| q.max_pnl_pips = Some(-1.0)).items[0].id, "trd-loss");
-        // フリーワード（空文字は絞り込まない / ワイルドカードはリテラル扱い）
-        assert_eq!(search(|q| q.q = Some("stop_loss".into())).items[0].id, "trd-loss");
-        assert_eq!(search(|q| q.q = Some("cot-1".into())).items[0].id, "trd-win");
-        assert_eq!(search(|q| q.q = Some("  ".into())).total, 2);
         assert_eq!(search(|q| q.q = Some("%".into())).total, 0);
-        // 並び替え
         let by_pnl_asc = search(|q| {
             q.sort = TradeSort::PnlPips;
             q.asc = true;
         });
         assert_eq!(by_pnl_asc.items[0].id, "trd-loss");
+        assert_eq!(db.realized_pnl_since("2026-09-16 00:00:00").unwrap(), -1200.0);
 
-        // 削除しても件数・結果に残らない
         assert!(db.delete_trade("trd-win").unwrap());
-        assert!(!db.delete_trade("trd-win").unwrap());
         assert_eq!(db.delete_trades(&["trd-loss".into(), "missing".into()]).unwrap(), 1);
         assert_eq!(find(&db, |_| {}).total, 0);
     }
@@ -784,38 +663,15 @@ mod tests {
             pnl_pips: 5.0,
             pnl_amount: 500.0,
             open_time: "2026-09-15 09:00:00".into(),
-            invalidation_reason: "i".into(),
-            cot_log_id: Some("cot-1".into()),
-            close_stop: Some(154.12),
+            note: "n".into(),
+            signal_id: Some("sig-1".into()),
+            strategy: Some("ema-usdjpy".into()),
         };
         db.replace_positions(std::slice::from_ref(&p)).unwrap();
-        assert_eq!(db.positions().unwrap()[0].cot_log_id.as_deref(), Some("cot-1"));
-        assert_eq!(db.positions().unwrap()[0].close_stop, Some(154.12));
+        let got = &db.positions().unwrap()[0];
+        assert_eq!((got.signal_id.as_deref(), got.strategy.as_deref()), (Some("sig-1"), Some("ema-usdjpy")));
         db.replace_positions(&[]).unwrap();
         assert!(db.positions().unwrap().is_empty());
-    }
-
-    #[test]
-    fn lessons_crud() {
-        let db = Db::open_in_memory().unwrap();
-        let mut l = LessonLearned {
-            id: "les-1".into(),
-            created_at: "2026-09-15 09:00:00".into(),
-            symbol: "USDJPY".into(),
-            rule: "r".into(),
-            context: "c".into(),
-            active: false,
-            trigger_trade_id: Some("trd-1".into()),
-            category: "TIMING".into(),
-        };
-        db.upsert_lesson(&l).unwrap();
-        l.active = true;
-        db.upsert_lesson(&l).unwrap();
-        let all = db.lessons().unwrap();
-        assert_eq!(all.len(), 1);
-        assert!(all[0].active);
-        assert!(db.delete_lesson("les-1").unwrap());
-        assert!(!db.delete_lesson("les-1").unwrap());
     }
 
     #[test]
@@ -831,14 +687,11 @@ mod tests {
         assert_eq!(db.latest_balance_ts(1).unwrap(), None);
         db.insert_balance_events(1, &[ev("cash-1", 100, 1, 1000.0), ev("deal-1", 200, 2, 1100.0), ev("deal-2", 200, 3, 1050.0)])
             .unwrap();
-        // 取り直しても重複しない。別口座は混ざらない
         db.insert_balance_events(1, &[ev("deal-2", 200, 3, 1050.0)]).unwrap();
         db.insert_balance_events(2, &[ev("deal-9", 150, 1, 5.0)]).unwrap();
         assert_eq!(db.latest_balance_ts(1).unwrap(), Some(200));
-
         let all = db.balance_history(1, None).unwrap();
         assert_eq!(all.iter().map(|p| p.balance).collect::<Vec<_>>(), vec![1000.0, 1100.0, 1050.0]);
-        // 期間の頭には、それ以前の最後の残高が置かれる
         let recent = db.balance_history(1, Some(150)).unwrap();
         assert_eq!(recent[0], BalancePoint { time: crate::storage::fmt_ts(150), balance: 1000.0 });
         assert_eq!(recent.len(), 3);

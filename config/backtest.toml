@@ -1,0 +1,37 @@
+# バックテストの設定（bin/backtest とダッシュボードのバックテストが読む）
+
+# 口座通貨と初期資金
+account_currency = "JPY"
+initial_balance = 1_000_000
+
+# リスク設定（建玉数の上限・ロット計算・SL 幅のチェックなど）をどこから取るか
+#   settings: 本番と同じ（ダッシュボードで保存した取引設定。未保存なら config/guard.toml）
+#   file:     config/guard.toml
+guard = "settings"
+
+# 約定を判定する足。auto なら期間をカバーする 1 分足があればそれ、無ければ戦略の時間足
+exec_timeframe = "auto"
+
+# 換算用の足（EURUSD を JPY 口座で見るなら USDJPY）が DB に無いときの固定レート
+# fx_rate = 150.0
+
+# 取引コスト（共通）
+[costs]
+# ゼロスプレッド口座でも指標時などは開くので、0 より少し大きめにしておく
+spread_pips = 0.2
+# 成行・逆指値・SL の約定の滑り（不利な方向）
+slippage_pips = 0.1
+# 手数料（1 lot・片道、口座通貨）。実績の取引（0.01 lot の往復で約 14〜16 円）から推定した値
+commission_per_lot = 800
+# スワップ（1 lot・1 日、口座通貨。受け取りは正・支払いは負）。水曜は 3 日分
+swap_long_per_lot = 0
+swap_short_per_lot = 0
+# ロールオーバーの時刻（UTC）
+rollover_hour_utc = 21
+
+# 銘柄ごとの上書き（書いた項目だけ）
+[pairs.USDJPY_z]
+commission_per_lot = 800
+
+[pairs.EURUSD_z]
+commission_per_lot = 700

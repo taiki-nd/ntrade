@@ -5,13 +5,13 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { BrainCircuit, Hourglass, Trash2 } from "lucide-react";
+import { Hourglass, Radio, Trash2 } from "lucide-react";
 import { tradingApi, type WorkingOrder } from "@/lib/trading-api";
 import { priceDigits } from "@/lib/price";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
-import { SideBadge } from "@/components/trading/PositionTable";
-import { CoTDetailDialog } from "@/components/trading/CoTDetailDialog";
+import { SideBadge, StrategyBadge, formatLevel } from "@/components/trading/PositionTable";
+import { SignalDetailDialog } from "@/components/trading/SignalViewer";
 import { useNow } from "@/hooks/use-now";
 import { formatDuration, parseEngineTime } from "@/lib/time";
 
@@ -24,16 +24,16 @@ interface OrderMonitorProps {
 
 const KIND_LABELS: Record<WorkingOrder["kind"], string> = { LIMIT: "指値", STOP: "逆指値" };
 
-/** 置いた価格からの RR（SL は LLM が決めた損切りライン） */
+/** 置いた価格からの RR（SL か TP が未設定なら出さない） */
 function riskReward(o: WorkingOrder): number | null {
-  const sl = o.closeStop ?? o.stopLoss;
-  const risk = Math.abs(o.entryPrice - sl);
+  if (o.stopLoss <= 0 || o.takeProfit <= 0) return null;
+  const risk = Math.abs(o.entryPrice - o.stopLoss);
   return risk > 0 ? Math.abs(o.takeProfit - o.entryPrice) / risk : null;
 }
 
 export function OrderMonitor({ onChanged, refreshKey }: OrderMonitorProps) {
   const [orders, setOrders] = React.useState<WorkingOrder[]>([]);
-  const [cotId, setCotId] = React.useState<string | null>(null);
+  const [signalId, setSignalId] = React.useState<string | null>(null);
   const now = useNow();
 
   const load = React.useCallback(async () => {
@@ -80,7 +80,7 @@ export function OrderMonitor({ onChanged, refreshKey }: OrderMonitorProps) {
           </Badge>
         </CardTitle>
         <CardDescription className="text-xs">
-          LLM がブローカーに置いた指値・逆指値。約定はブローカーが判定し、判断のたびに LLM が変更・取消を見直します
+          戦略がブローカーに置いた指値・逆指値。約定はブローカーが判定し、戦略は自分の時間足の確定ごとに変更・取消を判断します
         </CardDescription>
       </CardHeader>
       <CardContent className="p-0">
@@ -89,6 +89,7 @@ export function OrderMonitor({ onChanged, refreshKey }: OrderMonitorProps) {
             <TableHeader className="bg-muted/40">
               <TableRow>
                 <TableHead>銘柄</TableHead>
+                <TableHead>戦略 / メモ</TableHead>
                 <TableHead className="text-right">注文価格</TableHead>
                 <TableHead className="text-right">SL / TP</TableHead>
                 <TableHead className="text-right">RR</TableHead>
@@ -99,7 +100,7 @@ export function OrderMonitor({ onChanged, refreshKey }: OrderMonitorProps) {
             <TableBody>
               {orders.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={6} className="h-20 text-center text-muted-foreground text-sm">
+                  <TableCell colSpan={7} className="h-20 text-center text-muted-foreground text-sm">
                     約定待ちの予約注文はありません
                   </TableCell>
                 </TableRow>
@@ -118,14 +119,17 @@ export function OrderMonitor({ onChanged, refreshKey }: OrderMonitorProps) {
                         </div>
                         <span className="text-[11px] font-mono text-muted-foreground">{o.volumeLots.toFixed(2)} lot</span>
                       </TableCell>
+                      <TableCell className="max-w-[260px]">
+                        <StrategyBadge strategy={o.strategy} />
+                        <p className="mt-0.5 text-[11px] text-muted-foreground truncate" title={o.note}>
+                          {o.note || "—"}
+                        </p>
+                      </TableCell>
                       <TableCell className="text-right font-mono tabular-nums text-sm font-semibold">{o.entryPrice.toFixed(d)}</TableCell>
                       <TableCell className="text-right">
                         <div className="flex flex-col items-end gap-0.5 font-mono tabular-nums text-xs">
-                          <span className="text-loss" title={o.closeStop != null ? `ハードSL ${o.stopLoss.toFixed(d)}` : undefined}>
-                            SL {(o.closeStop ?? o.stopLoss).toFixed(d)}
-                            {o.closeStop != null && <span className="text-muted-foreground"> (終値)</span>}
-                          </span>
-                          <span className="text-profit">TP {o.takeProfit.toFixed(d)}</span>
+                          <span className="text-loss">SL {formatLevel(o.stopLoss, d)}</span>
+                          <span className="text-profit">TP {formatLevel(o.takeProfit, d)}</span>
                         </div>
                       </TableCell>
                       <TableCell className="text-right font-mono tabular-nums text-xs">{rr != null ? `1 : ${rr.toFixed(2)}` : "-"}</TableCell>
@@ -140,15 +144,15 @@ export function OrderMonitor({ onChanged, refreshKey }: OrderMonitorProps) {
                       </TableCell>
                       <TableCell className="text-right">
                         <div className="flex items-center justify-end gap-1">
-                          {o.cotLogId && (
+                          {o.signalId && (
                             <Button
                               variant="ghost"
                               size="icon-sm"
-                              onClick={() => setCotId(o.cotLogId ?? null)}
-                              aria-label="この注文を置いた判断"
-                              title="この注文を置いた判断"
+                              onClick={() => setSignalId(o.signalId ?? null)}
+                              aria-label="この注文を置いたシグナル"
+                              title="この注文を置いたシグナル"
                             >
-                              <BrainCircuit className="h-3.5 w-3.5" />
+                              <Radio className="h-3.5 w-3.5" />
                             </Button>
                           )}
                           <Button
@@ -171,7 +175,7 @@ export function OrderMonitor({ onChanged, refreshKey }: OrderMonitorProps) {
           </Table>
         </div>
       </CardContent>
-      <CoTDetailDialog cotLogId={cotId} onClose={() => setCotId(null)} />
+      <SignalDetailDialog signalId={signalId} onClose={() => setSignalId(null)} />
     </Card>
   );
 }

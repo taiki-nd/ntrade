@@ -63,15 +63,19 @@ pub async fn get_status(State(state): State<AppState>) -> Json<AccountMetrics> {
     metrics.free_margin = metrics.equity - metrics.margin;
     metrics.bot_state = *state.bot_state.read().await;
 
-    // ペアごとの直近 Snapshot のスプレッドを反映
-    for (pair, bundle) in state.latest_snapshots.read().await.iter() {
-        match bundle.snapshot.spread_pips {
-            Some(spread) => metrics.spreads.insert(pair.clone(), spread),
-            None => metrics.spreads.remove(pair),
-        };
-    }
+    // 当日（UTC）の確定損益は決済履歴から数える（再起動しても日付が変わっても正しく出すため）
+    let (daily, daily_pct) = state.daily_realized().await;
+    metrics.daily_pnl = daily;
+    metrics.daily_pnl_percent = daily_pct;
 
     if let Some(ctrader) = ctrader_opt {
+        // ペアごとの直近スプレッド（気配値の購読から）
+        metrics.spreads.clear();
+        for pair in state.pairs().await {
+            if let Some(q) = ctrader.quote(&pair, chrono::Duration::minutes(5)).await {
+                metrics.spreads.insert(pair.clone(), q.spread() / crate::instrument::pip_size(&pair));
+            }
+        }
         metrics.connection_status.ctrader = "connected".to_string();
         metrics.connection_status.environment = if ctrader.config().is_live {
             "LIVE".to_string()

@@ -22,14 +22,15 @@ pub struct Position {
     pub pnl_pips: f64,
     pub pnl_amount: f64,
     pub open_time: String,
-    pub invalidation_reason: String,
-    /// このポジションを建てた判断（CoT ログ）
+    /// 建てた理由など（戦略のシグナル理由・ブローカーから取り込んだ旨）
+    #[serde(alias = "invalidationReason")]
+    pub note: String,
+    /// この建玉を建てたシグナル
+    #[serde(default, alias = "cotLogId", skip_serializing_if = "Option::is_none")]
+    pub signal_id: Option<String>,
+    /// この建玉を管理する戦略（デプロイ ID）。None なら戦略の管理外（手動・取り込み）
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cot_log_id: Option<String>,
-    /// `stop_mode = close` の建玉だけが持つ、5M 確定足の終値で判定する損切りライン（LLM の SL）。
-    /// このとき `stop_loss` はブローカーに置いたハードSL
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub close_stop: Option<f64>,
+    pub strategy: Option<String>,
 }
 
 /// ブローカーに置いてある、まだ約定していない予約注文（ntrade の記録）
@@ -43,19 +44,20 @@ pub struct WorkingOrder {
     pub kind: crate::ctrader::PendingKind,
     pub volume_lots: f64,
     pub entry_price: f64,
-    /// ブローカーに置いた SL（`stop_mode = close` ならハードSL）
     pub stop_loss: f64,
+    /// 0.0 なら TP なし
     pub take_profit: f64,
-    /// `stop_mode = close` のとき、約定後の建玉に引き継ぐ終値判定の損切りライン（LLM の SL）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub close_stop: Option<f64>,
     /// "YYYY-MM-DD HH:MM:SS"（UTC）
     pub created_at: String,
     pub expires_at: String,
-    pub invalidation_reason: String,
-    /// この注文を置いた判断（CoT ログ）。約定した建玉に引き継ぐ
+    #[serde(alias = "invalidationReason")]
+    pub note: String,
+    /// この注文を置いたシグナル。約定した建玉に引き継ぐ
+    #[serde(default, alias = "cotLogId", skip_serializing_if = "Option::is_none")]
+    pub signal_id: Option<String>,
+    /// この注文を置いた戦略（デプロイ ID）。約定した建玉に引き継ぐ
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cot_log_id: Option<String>,
+    pub strategy: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,12 +65,14 @@ pub struct WorkingOrder {
 pub enum CloseReason {
     TakeProfit,
     StopLoss,
-    /// `stop_mode = close`: 5M 確定足の終値が LLM の SL（無効化ライン）を越えたため ntrade が成行決済した
-    Invalidated,
-    /// LLM が判断サイクルで決済を選んだ（`manage` の CLOSE）
-    Discretionary,
+    /// 戦略の決済シグナルで ntrade が成行決済した
+    Strategy,
     Manual,
     CircuitBreaker,
+    /// 旧: LLM 時代の終値判定の損切り（保存済みの決済履歴を読むためだけに残す）
+    Invalidated,
+    /// 旧: LLM が判断サイクルで決済を選んだ（同上）
+    Discretionary,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,60 +91,17 @@ pub struct TradeHistory {
     pub close_reason: CloseReason,
     pub open_time: String,
     pub close_time: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cot_log_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CoTLog {
-    pub id: String,
-    pub timestamp: String,
-    pub symbol: String,
-    pub action: String, // "BUY" | "SELL" | "HOLD"
-    pub confidence: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub entry_type: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub entry_price: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stop_loss: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub take_profit: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub risk_reward_ratio: Option<f64>,
-    /// ファンダメンタルズの読み（事実から読んだ方向感・根拠・指標発表のリスク）
-    #[serde(default)]
-    pub fundamental_view: String,
-    /// 環境認識（4H/1H）
-    pub macro_context: String,
-    /// 注文の攻防（15M/5M）
-    pub order_flow: String,
-    /// 無効化ライン（SLの根拠）
-    pub invalidation: String,
-    /// 反対材料
-    #[serde(default)]
-    pub conflicts: String,
-    /// ガードで弾かれた場合のガード名（PASS 以外）
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub guard_result: Option<String>,
-    pub reasoning: String,
-    pub executed: bool,
-    pub spread_pips: f64,
-    /// 条件付きプランの成立ログの場合、そのプランを立てた LLM 判断の ID。
-    ///
-    /// プランは HOLD 判断と一緒に出る（「今は入らないが、条件成立時に売る」）ため、
-    /// 「発注した記録」と「根拠になった判断」は別のログになる。取引はこの成立ログに紐づき、
-    /// 根拠はここから辿る。
+    pub signal_id: Option<String>,
+    /// 建てた戦略（デプロイ ID）
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub origin_cot_log_id: Option<String>,
+    pub strategy: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionStatus {
     pub ctrader: String, // "connected" | "connecting" | "disconnected"
-    pub llm: String,     // "ready" | "busy" | "error"
     pub ping_ms: i64,
     pub environment: String, // "DEMO" | "LIVE"
     pub account_number: String,
@@ -175,7 +136,7 @@ pub struct AccountMetrics {
     pub win_rate_today: f64,
     pub total_trades_today: u32,
     pub winning_trades_today: u32,
-    /// ペアごとの直近スプレッド（pips）。直近 Snapshot の値
+    /// ペアごとの直近スプレッド（pips）。気配値の購読から
     pub spreads: std::collections::BTreeMap<String, f64>,
     pub circuit_breaker_threshold_percent: f64,
     /// "paper" | "live"。live のとき balance はブローカー残高を反映する
@@ -197,10 +158,6 @@ pub struct RuntimeInfo {
     pub paper_balance: f64,
     pub guard_config_path: String,
     pub db_path: String,
-    pub llm_cli: String,
-    /// `claude --model` に渡すモデル（None なら CLI の既定）
-    pub llm_model: Option<String>,
-    pub llm_timeout_secs: u64,
     pub env_file_present: bool,
     /// cTrader の認証情報（トークン）が設定されているか
     pub ctrader_token_present: bool,
@@ -210,40 +167,26 @@ pub struct RuntimeInfo {
     pub ctrader_token_expires_at: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LessonLearned {
-    pub id: String,
-    pub created_at: String,
-    pub symbol: String,
-    pub rule: String,
-    pub context: String,
-    pub active: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub trigger_trade_id: Option<String>,
-    pub category: String, // "RISK" | "TIMING" | "PATTERN" | "NEWS"
-}
-
 // リクエスト & レスポンス用構造体
 
 pub const DEFAULT_PAGE_LIMIT: usize = 20;
 pub const MAX_PAGE_LIMIT: usize = 200;
 
-/// 一覧 API のページング指定（`?limit=20&offset=0`）
+/// シグナルの検索条件（`?limit=20&offset=0&symbol=&deployment=&status=&q=`）
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PageQuery {
+pub struct SignalQuery {
     pub limit: Option<usize>,
     pub offset: Option<usize>,
-    /// ペアで絞り込む（CoT ログのみ）
     pub symbol: Option<String>,
-    /// 判断 ID で絞り込む（決済履歴のみ）
-    pub cot_log_id: Option<String>,
-    /// 本文のフリーワード検索（CoT ログのみ）
+    pub deployment: Option<String>,
+    /// EXECUTED / REJECTED / FAILED / DRY_RUN
+    pub status: Option<String>,
+    /// 本文のフリーワード検索
     pub q: Option<String>,
 }
 
-impl PageQuery {
+impl SignalQuery {
     pub fn limit(&self) -> usize {
         self.limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT)
     }
@@ -251,6 +194,66 @@ impl PageQuery {
     pub fn offset(&self) -> usize {
         self.offset.unwrap_or(0)
     }
+}
+
+/// シグナル（戦略が出した操作）の処理結果
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SignalStatus {
+    /// ブローカーで執行した
+    Executed,
+    /// リスクチェックで弾いた
+    Rejected,
+    /// 発注・操作がブローカーで失敗した
+    Failed,
+    /// ドライラン（発注せず記録だけ）
+    DryRun,
+}
+
+impl SignalStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Executed => "EXECUTED",
+            Self::Rejected => "REJECTED",
+            Self::Failed => "FAILED",
+            Self::DryRun => "DRY_RUN",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "EXECUTED" => Self::Executed,
+            "REJECTED" => Self::Rejected,
+            "DRY_RUN" => Self::DryRun,
+            _ => Self::Failed,
+        }
+    }
+}
+
+/// 戦略が出した操作 1 件の記録
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignalLog {
+    pub id: String,
+    pub timestamp: String,
+    /// デプロイ ID
+    pub deployment: String,
+    /// 戦略と時間足・パラメータ（`StrategySpec::label`）
+    pub strategy: String,
+    pub symbol: String,
+    /// OPEN / CLOSE / CANCEL / MODIFY
+    pub action: String,
+    pub side: Option<String>,
+    pub reason: String,
+    /// 操作の中身（注文の意図・発注量・判断時の相場など）
+    pub detail: serde_json::Value,
+    /// リスクチェックの結果（OPEN のみ。PASS か失敗したチェック名）
+    pub guard_result: Option<String>,
+    pub status: SignalStatus,
+    pub message: Option<String>,
+    /// 置いた注文 ID / 建てた建玉 ID / 操作した対象
+    pub order_id: Option<String>,
+    pub dry_run: bool,
 }
 
 /// 決済履歴の並び順（列名は固定値としてSQLへ埋め込む）
@@ -285,11 +288,13 @@ impl TradeSort {
 pub struct TradeQuery {
     pub limit: Option<usize>,
     pub offset: Option<usize>,
-    /// 本文（銘柄・売買・決済理由・時刻・判断ID）のフリーワード部分一致
+    /// 本文（銘柄・売買・決済理由・時刻・シグナルID・戦略）のフリーワード部分一致
     pub q: Option<String>,
-    /// 判断 ID で絞り込む
-    pub cot_log_id: Option<String>,
+    /// シグナル ID で絞り込む
+    pub signal_id: Option<String>,
     pub symbol: Option<String>,
+    /// 戦略（デプロイ ID）で絞り込む
+    pub strategy: Option<String>,
     /// "BUY" | "SELL"
     pub side: Option<String>,
     pub close_reason: Option<CloseReason>,
@@ -317,16 +322,6 @@ impl TradeQuery {
         self.offset.unwrap_or(0)
     }
 
-    /// 判断 ID 指定だけの既定クエリ（CoT 詳細などの内部用）
-    pub fn by_cot_log(cot_log_id: Option<&str>, limit: usize, offset: usize) -> Self {
-        Self {
-            limit: Some(limit),
-            offset: Some(offset),
-            cot_log_id: cot_log_id.map(str::to_string),
-            ..Default::default()
-        }
-    }
-
     /// Some(true) = 勝ちのみ / Some(false) = 負けのみ
     pub fn win_only(&self) -> Option<bool> {
         match self.result.as_deref().map(str::trim) {
@@ -344,38 +339,9 @@ pub struct DeleteTradesRequest {
     pub ids: Vec<String>,
 }
 
-/// 1件の判断と、そこから生まれた取引
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CoTDetail {
-    pub log: CoTLog,
-    /// 決済済みの取引
-    pub trades: Vec<TradeHistory>,
-    /// 保有中のポジション
-    pub open_positions: Vec<Position>,
-    /// 成立ログの場合、そのプランを立てた元の LLM 判断
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub origin: Option<CoTLog>,
-}
-
 #[derive(Debug, Deserialize)]
 pub struct UpdateBotStateRequest {
     pub state: BotState,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateLessonRequest {
-    pub symbol: String,
-    pub rule: String,
-    pub context: String,
-    pub category: String,
-    #[serde(default = "default_active")]
-    pub active: bool,
-}
-
-fn default_active() -> bool {
-    true
 }
 
 #[derive(Debug, Serialize)]

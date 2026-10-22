@@ -1,13 +1,20 @@
 import {
   AccountMetrics,
+  BacktestRunDetail,
+  BacktestRunRequest,
+  BacktestRunRow,
   BalancePoint,
+  BarCoverage,
   BotState,
   CloseReason,
-  CoTDetail,
-  CoTLog,
-  LessonLearned,
+  Deployment,
+  DeploymentView,
+  Metrics,
   Page,
   Position,
+  SignalLog,
+  SignalStatus,
+  StrategyInfo,
   TradeHistory,
 } from "@/types/trading";
 
@@ -64,22 +71,6 @@ async function request<T>(
   }
 }
 
-export interface PageParams {
-  limit?: number;
-  offset?: number;
-  /** フリーワード検索（CoT ログのみ・本文の部分一致） */
-  q?: string;
-}
-
-function toQuery(params: PageParams): string {
-  const q = new URLSearchParams();
-  if (params.limit !== undefined) q.set("limit", String(params.limit));
-  if (params.offset !== undefined) q.set("offset", String(params.offset));
-  if (params.q) q.set("q", params.q);
-  const s = q.toString();
-  return s ? `?${s}` : "";
-}
-
 /** 決済履歴の並び替えキー（Rust 側 TradeSort と対応） */
 export type TradeSortKey =
   | "closeTime"
@@ -93,9 +84,11 @@ export type TradeSortKey =
 export interface TradeQueryParams {
   limit?: number;
   offset?: number;
-  /** 銘柄・売買・決済理由・時刻・判断IDのフリーワード部分一致 */
+  /** 銘柄・売買・決済理由・時刻・シグナルIDのフリーワード部分一致 */
   q?: string;
-  cotLogId?: string;
+  signalId?: string;
+  /** 管理していた戦略（デプロイ ID） */
+  strategy?: string;
   symbol?: string;
   side?: "BUY" | "SELL";
   closeReason?: CloseReason;
@@ -116,6 +109,8 @@ export interface TradeQueryParams {
 export interface TradeFilterState {
   q: string;
   symbol: string;
+  /** デプロイ ID */
+  strategy: string;
   side: "" | "BUY" | "SELL";
   closeReason: "" | CloseReason;
   result: "" | "win" | "loss";
@@ -130,6 +125,7 @@ export interface TradeFilterState {
 export const EMPTY_TRADE_FILTER: TradeFilterState = {
   q: "",
   symbol: "",
+  strategy: "",
   side: "",
   closeReason: "",
   result: "",
@@ -143,7 +139,7 @@ export const EMPTY_TRADE_FILTER: TradeFilterState = {
 
 /** フリーワード・並び順を除く、実際に絞り込んでいる条件の数（バッジ表示用） */
 export function countActiveTradeFilters(f: TradeFilterState): number {
-  return [f.symbol, f.side, f.closeReason, f.result, f.from, f.to, f.minPnlPips, f.maxPnlPips].filter(
+  return [f.symbol, f.strategy, f.side, f.closeReason, f.result, f.from, f.to, f.minPnlPips, f.maxPnlPips].filter(
     (v) => v !== ""
   ).length;
 }
@@ -157,6 +153,7 @@ export function toTradeQueryParams(f: TradeFilterState): TradeQueryParams {
   return {
     q: f.q.trim() || undefined,
     symbol: f.symbol || undefined,
+    strategy: f.strategy || undefined,
     side: f.side || undefined,
     closeReason: f.closeReason || undefined,
     result: f.result || undefined,
@@ -169,7 +166,8 @@ export function toTradeQueryParams(f: TradeFilterState): TradeQueryParams {
   };
 }
 
-function toTradeQuery(params: TradeQueryParams): string {
+/** 未指定・空・false の項目を落としてクエリ文字列にする */
+function toQuery(params: object): string {
   const q = new URLSearchParams();
   for (const [key, value] of Object.entries(params)) {
     if (value === undefined || value === null || value === "" || value === false) continue;
@@ -233,7 +231,7 @@ export const tradingApi = {
    * 決済履歴の取得（既定は新しい順・ページング / 各種条件で絞り込み可）
    */
   async getTrades(params: TradeQueryParams = {}): Promise<ApiResponse<Page<TradeHistory>>> {
-    return await request<ApiResponse<Page<TradeHistory>>>(`/api/trades${toTradeQuery(params)}`);
+    return await request<ApiResponse<Page<TradeHistory>>>(`/api/trades${toQuery(params)}`);
   },
 
   /**
@@ -252,57 +250,6 @@ export const tradingApi = {
     return await request<ApiResponse<number>>("/api/trades/delete", {
       method: "POST",
       body: JSON.stringify({ ids }),
-    });
-  },
-
-  /**
-   * LLM思考プロセス（CoT）ログの取得（新しい順・ページング）
-   */
-  async getCoTLogs(params: PageParams = {}): Promise<ApiResponse<Page<CoTLog>>> {
-    return await request<ApiResponse<Page<CoTLog>>>(`/api/cot${toQuery(params)}`);
-  },
-
-  /**
-   * 判断1件と、そこから建てたポジション・決済履歴の取得
-   */
-  async getCoTDetail(id: string): Promise<ApiResponse<CoTDetail>> {
-    return await request<ApiResponse<CoTDetail>>(`/api/cot/${encodeURIComponent(id)}`);
-  },
-
-  /**
-   * 教訓ルール一覧の取得
-   */
-  async getLessons(): Promise<ApiResponse<LessonLearned[]>> {
-    return await request<ApiResponse<LessonLearned[]>>("/api/lessons");
-  },
-
-  /**
-   * 新規教訓ルールの登録
-   */
-  async createLesson(
-    lesson: Omit<LessonLearned, "id" | "createdAt">
-  ): Promise<ApiResponse<LessonLearned>> {
-    return await request<ApiResponse<LessonLearned>>("/api/lessons", {
-      method: "POST",
-      body: JSON.stringify(lesson),
-    });
-  },
-
-  /**
-   * 教訓ルールの有効/無効切り替え
-   */
-  async toggleLesson(id: string): Promise<ApiResponse<LessonLearned>> {
-    return await request<ApiResponse<LessonLearned>>(`/api/lessons/${id}/toggle`, {
-      method: "POST",
-    });
-  },
-
-  /**
-   * 教訓ルールの削除
-   */
-  async deleteLesson(id: string): Promise<ApiResponse<void>> {
-    return await request<ApiResponse<void>>(`/api/lessons/${id}`, {
-      method: "DELETE",
     });
   },
 
@@ -349,50 +296,6 @@ export const tradingApi = {
     );
   },
 
-  /**
-   * Snapshot（時間足別チャート4枚 + 客観的事実JSON）の再生成トリガー
-   */
-  async generateChart(pair?: string): Promise<ApiResponse<string>> {
-    return await request<ApiResponse<string>>(`/api/chart/generate${pairQuery(pair)}`, {
-      method: "POST",
-    });
-  },
-
-  /**
-   * 時間足別の最新チャート画像URL
-   */
-  getLatestChartUrl(tf: ChartTimeframe, cacheKey: number = Date.now(), pair?: string): string {
-    const p = pair ? `&pair=${encodeURIComponent(pair)}` : "";
-    return `${API_BASE_URL}/api/chart/latest?tf=${tf}${p}&t=${cacheKey}`;
-  },
-
-  /**
-   * 直近 Snapshot の客観的事実JSON
-   */
-  async getLatestSnapshot(pair?: string): Promise<ApiResponse<MarketSnapshot>> {
-    return await request<ApiResponse<MarketSnapshot>>(`/api/snapshot/latest${pairQuery(pair)}`);
-  },
-
-  /** リプレイ run 一覧 */
-  async getReplayRuns(): Promise<ApiResponse<ReplayRun[]>> {
-    return await request<ApiResponse<ReplayRun[]>>("/api/replay/runs");
-  },
-
-  /** リプレイ run の詳細（集計 + 判断一覧） */
-  async getReplayRun(id: number): Promise<ApiResponse<ReplayRunDetail>> {
-    return await request<ApiResponse<ReplayRunDetail>>(`/api/replay/runs/${id}`);
-  },
-
-  /** ヒストリカルデータの収録範囲 */
-  async getReplayCoverage(): Promise<ApiResponse<ReplayCoverage[]>> {
-    return await request<ApiResponse<ReplayCoverage[]>>("/api/replay/coverage");
-  },
-
-  /** 判断サイクルを1回実行（Snapshot → LLM → 注文・建玉の操作 → ガード → 予約注文） */
-  async decideNow(pair?: string): Promise<ApiResponse<DecideResponse>> {
-    return await request<ApiResponse<DecideResponse>>(`/api/decide${pairQuery(pair)}`, { method: "POST" });
-  },
-
   /** ブローカーに置いてある、まだ約定していない予約注文 */
   async getOrders(): Promise<ApiResponse<WorkingOrder[]>> {
     return await request<ApiResponse<WorkingOrder[]>>("/api/orders");
@@ -413,7 +316,7 @@ export const tradingApi = {
     return await request<ApiResponse<GuardConfig>>("/api/guard/config");
   },
 
-  /** 取引設定（対象ペア・待ち秒数・事後ガード） */
+  /** 取引設定（対象ペア・待ち秒数・事後ガード・戦略のデプロイ） */
   async getSettings(): Promise<ApiResponse<TradingSettings>> {
     return await request<ApiResponse<TradingSettings>>("/api/settings");
   },
@@ -423,27 +326,90 @@ export const tradingApi = {
     return await request<ApiResponse<SymbolCatalogEntry[]>>(`/api/symbols${q ? `?q=${encodeURIComponent(q)}` : ""}`);
   },
 
-  /** 取引設定を保存（SQLite）。次の判断サイクルから反映 */
+  /** 取引設定を保存（SQLite）。次の足の確定から反映。検証エラーは success:false と message */
   async saveSettings(settings: TradingSettings): Promise<ApiResponse<TradingSettings>> {
     return await request<ApiResponse<TradingSettings>>("/api/settings", {
       method: "PUT",
       body: JSON.stringify(settings),
     });
   },
+
+  /**
+   * 時間足別のチャート画像URL（cTrader の足から要求のたびに描く。建玉・予約注文の水準入り）
+   */
+  getLatestChartUrl(tf: ChartTimeframe, cacheKey: number = Date.now(), pair?: string): string {
+    const p = pair ? `&pair=${encodeURIComponent(pair)}` : "";
+    return `${API_BASE_URL}/api/chart/latest?tf=${tf}${p}&t=${cacheKey}`;
+  },
+
+  /** 使える戦略とパラメータの定義 */
+  async getStrategies(): Promise<ApiResponse<StrategyInfo[]>> {
+    return await request<ApiResponse<StrategyInfo[]>>("/api/strategies");
+  },
+
+  /** 設定したデプロイと、建玉・予約注文の数、直近の実行状況 */
+  async getDeployments(): Promise<ApiResponse<DeploymentView[]>> {
+    return await request<ApiResponse<DeploymentView[]>>("/api/deployments");
+  },
+
+  /** 戦略が出したシグナルの記録（新しい順・ページング / 条件で絞り込み可） */
+  async getSignals(params: SignalQueryParams = {}): Promise<ApiResponse<Page<SignalLog>>> {
+    return await request<ApiResponse<Page<SignalLog>>>(`/api/signals${toQuery(params)}`);
+  },
+
+  /** シグナル1件 */
+  async getSignal(id: string): Promise<ApiResponse<SignalLog>> {
+    return await request<ApiResponse<SignalLog>>(`/api/signals/${encodeURIComponent(id)}`);
+  },
+
+  /** バックテストの実行一覧（新しい順） */
+  async getBacktestRuns(limit?: number): Promise<ApiResponse<BacktestRunRow[]>> {
+    return await request<ApiResponse<BacktestRunRow[]>>(`/api/backtest/runs${limit !== undefined ? `?limit=${limit}` : ""}`);
+  },
+
+  /** バックテスト1件の結果（取引一覧と資産曲線付き） */
+  async getBacktestRun(id: number): Promise<ApiResponse<BacktestRunDetail>> {
+    return await request<ApiResponse<BacktestRunDetail>>(`/api/backtest/runs/${id}`);
+  },
+
+  /** バックテストの結果を削除 */
+  async deleteBacktestRun(id: number): Promise<ApiResponse<null>> {
+    return await request<ApiResponse<null>>(`/api/backtest/runs/${id}`, { method: "DELETE" });
+  },
+
+  /** 単発のバックテストを実行して保存する（終わるまで返らない。数年分の 1 分足だと 1 分ほどかかる） */
+  async runBacktest(req: BacktestRunRequest): Promise<ApiResponse<{ id: number; metrics: Metrics }>> {
+    return await request<ApiResponse<{ id: number; metrics: Metrics }>>("/api/backtest/run", {
+      method: "POST",
+      body: JSON.stringify(req),
+    });
+  },
+
+  /** DB にあるヒストリカルの足の範囲 */
+  async getBacktestCoverage(): Promise<ApiResponse<BarCoverage[]>> {
+    return await request<ApiResponse<BarCoverage[]>>("/api/backtest/coverage");
+  },
 };
 
-/** `?pair=XXX`（省略時はエンジン側で設定の先頭ペア） */
-function pairQuery(pair?: string): string {
-  return pair ? `?pair=${encodeURIComponent(pair)}` : "";
+/** シグナル一覧の検索条件。未指定の項目は絞り込まない */
+export interface SignalQueryParams {
+  limit?: number;
+  offset?: number;
+  symbol?: string;
+  /** デプロイ ID */
+  deployment?: string;
+  status?: SignalStatus;
+  /** 理由・ガード結果・メッセージなどの部分一致 */
+  q?: string;
 }
 
 /** 画面から変更できる取引設定。guard のキーは Rust 側のまま snake_case */
 export interface TradingSettings {
   pairs: string[];
   barDelaySecs: number;
-  /** LLM に判断させる間隔（分。5 の倍数、UTC 0:00 起点）。終値判定の損切りは 5M 足ごと */
-  decisionIntervalMinutes: number;
   guard: GuardConfig;
+  /** 戦略のデプロイ（戦略は各自の時間足の確定ごとに動く） */
+  deployments: Deployment[];
 }
 
 /** ブローカーの銘柄一覧の1行 */
@@ -466,10 +432,6 @@ export interface RuntimeInfo {
   paperBalance: number;
   guardConfigPath: string;
   dbPath: string;
-  llmCli: string;
-  /** claude --model に渡すモデル（null なら CLI の既定） */
-  llmModel: string | null;
-  llmTimeoutSecs: number;
   ctraderTokenPresent: boolean;
   ctraderRefreshTokenPresent: boolean;
   /** Access Token の失効時刻（UTC, "YYYY-MM-DD HH:MM:SS"）。不明なら null */
@@ -477,12 +439,11 @@ export interface RuntimeInfo {
   envFilePresent: boolean;
 }
 
-/** Rust 側 GuardConfig（snake_case のまま） */
+/** Rust 側 GuardConfig（snake_case のまま）。バックテスト（guard = "settings"）と本番の両方に当たる */
 export interface GuardConfig {
-  observed_check: boolean;
-  min_confidence: number;
   min_rr: number;
   sl_atr_min: number;
+  /** 0 なら上限なし */
   sl_atr_max: number;
   /** SL 幅の上限を測る ATR の時間足（下限は常に 5M ATR） */
   sl_atr_max_tf: "5m" | "15m" | "1h" | "4h";
@@ -491,7 +452,7 @@ export interface GuardConfig {
   max_positions_total: number;
   daily_loss_limit_pct: number;
   /** 予約注文の有効期限の上限（時間） */
-  plan_max_hours: number;
+  order_max_hours: number;
   fixed_volume_lots: number;
   risk_pct: number | null;
   pip_value_per_lot: number | null;
@@ -504,10 +465,6 @@ export interface GuardConfig {
   /** 発注後の実効レバレッジの上限（倍）。null なら見ない */
   max_effective_leverage: number | null;
   news_blackout: { time: string; before_min: number; after_min: number; label: string }[];
-  /** 損切りの執行方法。touch = ブローカーの SL（ヒゲ判定） / close = 5M 確定足の終値で判定 */
-  stop_mode: "touch" | "close";
-  /** close のとき、ブローカーに置くハードSLを LLM の SL から 5M ATR の何倍外側に置くか */
-  hard_stop_atr: number;
 }
 
 /** ブローカーに置いてある予約注文（Rust 側 WorkingOrder） */
@@ -518,154 +475,20 @@ export interface WorkingOrder {
   kind: "LIMIT" | "STOP";
   volumeLots: number;
   entryPrice: number;
-  /** ブローカーに置いた SL（終値判定モードならハードSL） */
+  /** 0 なら未設定 */
   stopLoss: number;
+  /** 0 なら未設定 */
   takeProfit: number;
-  /** 終値判定モードの損切りライン（LLM の SL） */
-  closeStop?: number;
   createdAt: string;
   expiresAt: string;
-  invalidationReason: string;
-  cotLogId?: string;
+  /** 置いた理由など */
+  note: string;
+  /** この注文を置いたシグナル */
+  signalId?: string;
+  /** この注文を管理する戦略（デプロイ ID）。無ければ手動・取り込み */
+  strategy?: string;
 }
 
-export interface GuardCheck {
-  name: string;
-  passed: boolean;
-  detail: string;
-}
-
-export interface DecideResponse {
-  cot_log_id: string;
-  decision: {
-    action: "BUY" | "SELL" | "HOLD";
-    confidence: number;
-    reasoning: string;
-  };
-  guard: { passed: boolean; failed: string[]; checks: GuardCheck[] };
-  /** 新しい予約注文を置いたか */
-  executed: boolean;
-  order_id: string | null;
-  /** 既存の注文・建玉への操作の結果（1 操作 1 行） */
-  manage_results: string[];
-  chart_dir: string;
-}
-
-export interface ReplayRun {
-  id: number;
-  created_at: string;
-  label: string;
-  pair: string;
-  from_ts: string;
-  to_ts: string;
-  sampling: string;
-  prompt_hash: string;
-  snapshot_ver: string;
-  decisions: number;
-}
-
-export interface ReplayBucket {
-  n: number;
-  trades: number;
-  tp_hit: number;
-  sl_hit: number;
-  same_bar: number;
-  timeout: number;
-  win_rate: number | null;
-  avg_pnl_pips: number | null;
-  total_pnl_pips: number;
-}
-
-export interface ReplayReport {
-  run_id: number;
-  total: number;
-  guard_pass: number;
-  by_action: Record<string, number>;
-  by_outcome: Record<string, number>;
-  by_guard: Record<string, number>;
-  by_confidence: Record<string, ReplayBucket>;
-  by_session: Record<string, ReplayBucket>;
-  overall: ReplayBucket;
-  rejected: ReplayBucket;
-  unobserved_rate: number;
-  hold_rate: number;
-  /** 予約注文を出した判断の割合 */
-  order_rate: number;
-  orders_filled: number;
-  orders_expired: number;
-  conflicts_empty_rate: number;
-}
-
-export interface ReplayDecision {
-  run_id: number;
-  t: string;
-  decision_json: string;
-  guard_result: string;
-  outcome: string;
-  pnl_pips: number | null;
-  bars_to_exit: number | null;
-  chart_dir: string;
-  session: string;
-  confidence: number;
-  action: string;
-}
-
-export interface ReplayRunDetail {
-  run: ReplayRun;
-  report: ReplayReport;
-  decisions: ReplayDecision[];
-}
-
-export interface ReplayCoverage {
-  pair: string;
-  period: string;
-  count: number;
-  first: string | null;
-  last: string | null;
-}
-
-export type ChartTimeframe = "4H" | "1H" | "15M" | "5M";
-export const CHART_TIMEFRAMES: ChartTimeframe[] = ["4H", "1H", "15M", "5M"];
-
-/** Rust 側 MarketSnapshot の表示に必要な部分だけを型付け */
-export interface MarketSnapshot {
-  pair: string;
-  timestamp: string;
-  session: string;
-  instrument: {
-    asset_class: string | null;
-    description: string | null;
-    lot_units: number | null;
-    measurement_units: string | null;
-    digits: number;
-    next_market_change: string | null;
-  };
-  current_price: number;
-  /** 気配値が取れていなければ null */
-  spread_pips: number | null;
-  volatility: {
-    atr14_5m_pips: number | null;
-    atr14_15m_pips: number | null;
-    atr14_1h_pips: number | null;
-    atr14_4h_pips: number | null;
-    today_range_pips: number | null;
-    avg_daily_range_pips: number | null;
-    avg_daily_range_days_sampled: number;
-    today_range_vs_avg: number | null;
-  };
-  reference_levels: {
-    prev_day_high: number | null;
-    prev_day_low: number | null;
-    today_high: number | null;
-    today_low: number | null;
-    asia_session_high: number | null;
-    asia_session_low: number | null;
-    round_numbers: number[];
-  };
-  latest_bars: {
-    "4h": string | null;
-    "1h": string | null;
-    "15m": string | null;
-    "5m": string | null;
-  };
-}
+/** /api/chart/latest の tf */
+export type ChartTimeframe = "1M" | "5M" | "15M" | "1H" | "4H" | "1D";
+export const CHART_TIMEFRAMES: ChartTimeframe[] = ["1D", "4H", "1H", "15M", "5M", "1M"];

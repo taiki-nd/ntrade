@@ -70,7 +70,7 @@ export default function SettingsPage() {
       <div className="space-y-6 max-w-4xl">
         <div className="flex items-center justify-between">
           <p className="text-sm text-muted-foreground">
-            対象銘柄とガードはこの画面の「取引設定」で変更できます（SQLite に保存・再起動不要）。それ以外は環境変数（<code className="font-mono text-xs">.env</code>）で設定し、変更後はエンジンの再起動が必要です。
+            対象銘柄・戦略のデプロイ・ガードはこの画面の「取引設定」で変更できます（SQLite に保存・再起動不要）。それ以外は環境変数（<code className="font-mono text-xs">.env</code>）で設定し、変更後はエンジンの再起動が必要です。
           </p>
           <Button variant="outline" size="sm" onClick={load} disabled={loading} className="h-8 gap-1.5 text-xs">
             {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
@@ -93,7 +93,7 @@ export default function SettingsPage() {
               <Cpu className="h-5 w-5 text-primary" />
               稼働設定
             </CardTitle>
-            <CardDescription className="text-xs">スケジューラ、発注モード、LLM CLI の設定（環境変数）</CardDescription>
+            <CardDescription className="text-xs">スケジューラ、発注モードなどの設定（環境変数）</CardDescription>
           </CardHeader>
           <CardContent>
             {runtime ? (
@@ -107,13 +107,9 @@ export default function SettingsPage() {
                       </Badge>
                     }
                   />
-                  <Row label="スケジューラ (NTRADE_SCHEDULER)" value={runtime.schedulerEnabled ? "有効（5分足確定ごと）" : "無効"} />
-                  <Row label="対象銘柄（並行に判断）" value={runtime.pairs.join(", ")} />
+                  <Row label="スケジューラ (NTRADE_SCHEDULER)" value={runtime.schedulerEnabled ? "有効（各デプロイの時間足の確定ごと）" : "無効"} />
+                  <Row label="対象銘柄" value={runtime.pairs.join(", ")} />
                   <Row label="足確定後の待ち秒数" value={`${runtime.barDelaySecs} 秒`} />
-                  <Row
-                    label="LLM（NTRADE_LLM_MODEL）"
-                    value={`${runtime.llmCli} -p --model ${runtime.llmModel ?? "（CLI の既定）"}（タイムアウト ${runtime.llmTimeoutSecs} 秒）`}
-                  />
                   <Row label="取引設定の保存先" value={runtime.guardConfigPath} />
                   <Row label="SQLite" value={runtime.dbPath} />
                   <Row label=".env" value={runtime.envFilePresent ? "あり" : "なし（.env.example をコピーしてください）"} />
@@ -182,7 +178,7 @@ export default function SettingsPage() {
           </CardContent>
         </Card>
 
-        {/* 取引設定（対象ペア・ガード）: SQLite に保存し再起動なしで反映 */}
+        {/* 取引設定（対象ペア・戦略のデプロイ・ガード）: SQLite に保存し再起動なしで反映 */}
         <TradingSettingsForm />
       </div>
     </DashboardLayout>

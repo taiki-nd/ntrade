@@ -2,102 +2,51 @@
 
 import * as React from "react";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { LineChart, RefreshCw, Image as ImageIcon, LayoutGrid, Loader2 } from "lucide-react";
-import {
-  tradingApi,
-  CHART_TIMEFRAMES,
-  type ChartTimeframe,
-  type MarketSnapshot,
-} from "@/lib/trading-api";
-import { toast } from "sonner";
+import { tradingApi, CHART_TIMEFRAMES, type ChartTimeframe } from "@/lib/trading-api";
 
-const TF_LABEL: Record<ChartTimeframe, string> = {
-  "4H": "4H",
-  "1H": "1H",
-  "15M": "15M",
-  "5M": "5M",
-};
+const NO_ERRORS = Object.fromEntries(CHART_TIMEFRAMES.map((tf) => [tf, false])) as Record<ChartTimeframe, boolean>;
 
-function fmt(v: number | null | undefined, digits = 1): string {
-  return v === null || v === undefined ? "-" : v.toFixed(digits);
-}
-
-const NO_ERRORS: Record<ChartTimeframe, boolean> = { "4H": false, "1H": false, "15M": false, "5M": false };
-
+/** 時間足別のチャート。画像はエンジンが cTrader の足から要求のたびに描く */
 export function ChartPreview() {
   const [mode, setMode] = React.useState<"tabs" | "grid">("tabs");
+  // 0 の間は対象ペアの取得待ち。変えると画像を描き直させる
   const [cacheKey, setCacheKey] = React.useState<number>(0);
-  const [snapshot, setSnapshot] = React.useState<MarketSnapshot | null>(null);
-  const [isRegenerating, setIsRegenerating] = React.useState<boolean>(false);
   const [errored, setErrored] = React.useState<Record<ChartTimeframe, boolean>>(NO_ERRORS);
   /** 設定の対象ペア。先頭が既定 */
   const [pairs, setPairs] = React.useState<string[]>([]);
   const [pair, setPair] = React.useState<string>("");
 
-  const loadSnapshot = React.useCallback(async (target: string) => {
-    try {
-      const res = await tradingApi.getLatestSnapshot(target || undefined);
-      if (res.success && res.data) setSnapshot(res.data);
-    } catch {
-      // エンジン未起動時は静かに無視（画像側の onError で表示される）
-    }
-  }, []);
-
   React.useEffect(() => {
     let cancelled = false;
     tradingApi
       .getSettings()
-      .then(async (res) => {
+      .then((res) => {
         if (cancelled || !res.success || !res.data) return;
-        const first = res.data.pairs[0] ?? "";
         setPairs(res.data.pairs);
-        setPair(first);
+        setPair(res.data.pairs[0] ?? "");
         setCacheKey(Date.now());
-        const snap = await tradingApi.getLatestSnapshot(first || undefined);
-        if (!cancelled && snap.success && snap.data) setSnapshot(snap.data);
       })
       .catch(() => {
-        // エンジン未起動時は静かに無視（画像側の onError で表示される）
+        // エンジン未起動時も既定ペアで画像を試す（失敗は画像側の onError で表示される）
+        if (!cancelled) setCacheKey(Date.now());
       });
     return () => {
       cancelled = true;
     };
   }, []);
 
-  /** ペアを切り替えて、そのペアの Snapshot と画像を読み直す */
-  const selectPair = (next: string) => {
-    setPair(next);
-    setSnapshot(null);
+  const reload = () => {
     setErrored(NO_ERRORS);
     setCacheKey(Date.now());
-    void loadSnapshot(next);
   };
 
-  const handleRegenerate = async () => {
-    try {
-      setIsRegenerating(true);
-      const res = await tradingApi.generateChart(pair || undefined);
-      if (res.success) {
-        setCacheKey(Date.now());
-        setErrored(NO_ERRORS);
-        await loadSnapshot(pair);
-        toast.success(`${pair} の Snapshot を再生成しました`, {
-          description: "4H / 1H / 15M / 5M の画像と客観的事実JSONが更新されました。",
-        });
-      } else {
-        toast.error("Snapshot の再生成に失敗しました", { description: res.message });
-      }
-    } catch (err: unknown) {
-      toast.error("Rustエンジンへの接続に失敗しました", {
-        description: err instanceof Error ? err.message : "エンジンが起動しているか確認してください。",
-      });
-    } finally {
-      setIsRegenerating(false);
-    }
+  const selectPair = (next: string) => {
+    setPair(next);
+    reload();
   };
 
   const renderImage = (tf: ChartTimeframe) => (
@@ -105,7 +54,7 @@ export function ChartPreview() {
       {errored[tf] ? (
         <div className="text-center p-6 space-y-2">
           <ImageIcon className="h-8 w-8 text-muted-foreground mx-auto" />
-          <p className="text-sm text-muted-foreground">{tf} の画像がまだありません。</p>
+          <p className="text-sm text-muted-foreground">{tf} のチャートを描けませんでした。cTrader に接続しているか確認してください。</p>
         </div>
       ) : cacheKey === 0 ? (
         <div className="text-center p-6 space-y-2">
@@ -114,7 +63,7 @@ export function ChartPreview() {
       ) : (
         // eslint-disable-next-line @next/next/no-img-element
         <img
-          src={tradingApi.getLatestChartUrl(tf, cacheKey, pair)}
+          src={tradingApi.getLatestChartUrl(tf, cacheKey, pair || undefined)}
           alt={`${pair} ${tf} chart`}
           className="w-full h-auto object-contain"
           onError={() => setErrored((e) => ({ ...e, [tf]: true }))}
@@ -122,7 +71,6 @@ export function ChartPreview() {
       )}
     </div>
   );
-
 
   return (
     <Card className="shadow-xs">
@@ -133,7 +81,7 @@ export function ChartPreview() {
             <span>チャート</span>
           </CardTitle>
           <CardDescription className="text-xs">
-            直近の判断時点の足と、LLM に数値で渡している水準（前日・当日高安、スイング、キリ番）。LLM 自身は画像を見ていません
+            cTrader の直近の足と、保有中の建玉・予約注文の水準（建値・SL・TP）。開くたび・再読込のたびに描き直します
           </CardDescription>
         </div>
 
@@ -171,49 +119,20 @@ export function ChartPreview() {
               onClick={() => setMode("grid")}
             >
               <LayoutGrid className="h-3.5 w-3.5" />
-              4枚
+              一覧
             </Button>
           </div>
 
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={handleRegenerate}
-            disabled={isRegenerating}
-            className="h-8 gap-1.5 text-xs"
-          >
-            {isRegenerating ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            ) : (
-              <RefreshCw className="h-3.5 w-3.5" />
-            )}
-            再生成
+          <Button variant="outline" size="sm" onClick={reload} disabled={cacheKey === 0} className="h-8 gap-1.5 text-xs">
+            <RefreshCw className="h-3.5 w-3.5" />
+            再読込
           </Button>
         </div>
       </CardHeader>
 
       <CardContent className="space-y-3">
-        {snapshot && (
-          <div className="flex flex-wrap items-center gap-1.5 text-xs">
-            <Badge variant="outline">{snapshot.pair}</Badge>
-            <Badge variant="outline">{snapshot.session}</Badge>
-            <Badge variant="outline">{snapshot.timestamp}</Badge>
-            <span className="text-muted-foreground">
-              ATR14 5M {fmt(snapshot.volatility.atr14_5m_pips)} / 1H {fmt(snapshot.volatility.atr14_1h_pips)} pips
-            </span>
-            <span className="text-muted-foreground">
-              当日レンジ {fmt(snapshot.volatility.today_range_pips)} pips
-              {snapshot.volatility.today_range_vs_avg !== null &&
-                ` (平均比 ${fmt(snapshot.volatility.today_range_vs_avg, 2)})`}
-            </span>
-            <span className="text-muted-foreground">
-              PDH/PDL {fmt(snapshot.reference_levels.prev_day_high, 3)} / {fmt(snapshot.reference_levels.prev_day_low, 3)}
-            </span>
-          </div>
-        )}
-
         {mode === "tabs" ? (
-          <Tabs defaultValue="5M">
+          <Tabs defaultValue="1H">
             <TabsList>
               {CHART_TIMEFRAMES.map((tf) => (
                 <TabsTrigger key={tf} value={tf} className="text-xs">
@@ -222,8 +141,7 @@ export function ChartPreview() {
               ))}
             </TabsList>
             {CHART_TIMEFRAMES.map((tf) => (
-              <TabsContent key={tf} value={tf} className="space-y-1.5">
-                <p className="text-xs text-muted-foreground">{TF_LABEL[tf]}</p>
+              <TabsContent key={tf} value={tf}>
                 {renderImage(tf)}
               </TabsContent>
             ))}
@@ -232,7 +150,7 @@ export function ChartPreview() {
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
             {CHART_TIMEFRAMES.map((tf) => (
               <div key={tf} className="space-y-1.5">
-                <p className="text-xs font-medium">{TF_LABEL[tf]}</p>
+                <p className="text-xs font-medium">{tf}</p>
                 {renderImage(tf)}
               </div>
             ))}

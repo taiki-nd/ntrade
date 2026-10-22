@@ -1,10 +1,10 @@
 SHELL := /bin/zsh
 export PATH := $(HOME)/.local/bin:$(HOME)/.nodenv/shims:$(PATH)
 
-.PHONY: help install dev ui engine test poc ctrader build clean step4 replay-fetch replay-check replay-run replay-rescore replay-report replay-list
+.PHONY: help install dev ui engine test ctrader build clean bt-fetch bt-coverage bt-strategies bt-run bt-sweep bt-wf bt-list
 
 help: ## コマンド一覧を表示
-	@echo "ntrade - LLM駆動型 FX自動売買システム"
+	@echo "ntrade - ロジック戦略による FX 自動売買システム"
 	@echo ""
 	@echo "使用可能なコマンド:"
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'
@@ -28,33 +28,32 @@ dev: ## フロントエンドとRustエンジンを並行起動 (UI: 3000 / API:
 	cargo run --bin ntrade & \
 	wait
 
-poc: ## Snapshot生成 (画像4枚+事実JSON) & claude -p 画像パス渡し推論のPoCを実行
-	@echo "--> Running Snapshot & LLM inference PoC..."
-	cargo run --bin poc_price_action
-
 ctrader: ## cTrader Open API 接続とバーデータ取得のPoCを実行
 	@echo "--> Running cTrader Open API PoC..."
 	cargo run --bin poc_ctrader
 
-step4: poc ## (旧名) poc のエイリアス
+BT := cargo run --release --bin backtest --
 
-replay-fetch: ## ヒストリカルバーを cTrader から取得 (FROM=YYYY-MM-DD PAIR=USDJPY)
-	cargo run --bin replay -- fetch --pair $(or $(PAIR),USDJPY) --from $(or $(FROM),2026-06-15)
+bt-fetch: ## ヒストリカルバーを cTrader から取得 (PAIRS="USDJPY_z EURUSD_z" FROM=YYYY-MM-DD)
+	$(BT) fetch $(foreach p,$(or $(PAIRS),USDJPY_z),--pair $(p)) --from $(or $(FROM),2023-01-01)
 
-replay-check: ## 未来漏れ検証 (Snapshot に t より後のデータが無いこと)
-	cargo run --bin replay -- check-leak --pair $(or $(PAIR),USDJPY) --samples $(or $(SAMPLES),50)
+bt-coverage: ## DB にある足の範囲
+	$(BT) coverage
 
-replay-run: ## リプレイ実行 (FROM= TO= LIMIT= LABEL= STEP= EXIT=)
-	cargo run --bin replay -- run --pair $(or $(PAIR),USDJPY) --from $(FROM) --to $(TO) --step $(or $(STEP),15) $(if $(LIMIT),--limit $(LIMIT),) --label "$(LABEL)" $(if $(EXIT),--exit $(EXIT),)
+bt-strategies: ## 使える戦略とパラメータ
+	$(BT) strategies
 
-replay-rescore: ## 保存済み run を別の決済ルールで再採点 (RUN=<id> EXITS="touch:0.5 close:0:2")
-	cargo run --bin replay -- rescore --run $(RUN) $(foreach e,$(or $(EXITS),touch touch:0.5 touch:1 close:0:2),--exit $(e))
+bt-run: ## バックテスト (PAIR= FROM= TO= STRATEGY= TF= PARAMS="fast=20 slow=50" LABEL=)
+	$(BT) run --pair $(or $(PAIR),USDJPY_z) --from $(FROM) $(if $(TO),--to $(TO),) --strategy $(or $(STRATEGY),ema_cross) --tf $(or $(TF),M15) $(foreach p,$(PARAMS),--param $(p)) --label "$(LABEL)" --trades 10
 
-replay-report: ## リプレイ集計 (RUN=<id>)
-	cargo run --bin replay -- report --run $(RUN)
+bt-sweep: ## グリッドサーチ (... GRID="fast=10..30:5 slow=50,100" OBJ=pf)
+	$(BT) sweep --pair $(or $(PAIR),USDJPY_z) --from $(FROM) $(if $(TO),--to $(TO),) --strategy $(or $(STRATEGY),ema_cross) --tf $(or $(TF),M15) $(foreach g,$(GRID),--grid $(g)) --objective $(or $(OBJ),pf) --label "$(LABEL)"
 
-replay-list: ## リプレイ run 一覧
-	cargo run --bin replay -- list
+bt-wf: ## ウォークフォワード (... GRID= TRAIN=180 TEST=60)
+	$(BT) walk-forward --pair $(or $(PAIR),USDJPY_z) --from $(FROM) $(if $(TO),--to $(TO),) --strategy $(or $(STRATEGY),ema_cross) --tf $(or $(TF),M15) $(foreach g,$(GRID),--grid $(g)) --objective $(or $(OBJ),pf) --train-days $(or $(TRAIN),180) --test-days $(or $(TEST),60) --label "$(LABEL)"
+
+bt-list: ## 保存したバックテスト結果の一覧
+	$(BT) list
 
 test: ## テストを実行 (Rust単体テスト)
 	@echo "--> Running Rust tests..."

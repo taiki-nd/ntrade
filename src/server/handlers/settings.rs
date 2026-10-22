@@ -1,5 +1,5 @@
-//! 取引設定（対象ペア・足確定後の待ち秒数・事後ガード）の参照と更新。
-//! 保存先は SQLite の app_settings。保存すると次の判断サイクルから反映される（再起動不要）。
+//! 取引設定（対象ペア・足確定後の待ち秒数・リスク設定・戦略）の参照と更新。
+//! 保存先は SQLite の app_settings。保存すると次の足から反映される（再起動不要）。
 
 use axum::{extract::State, response::Json};
 use tracing::warn;
@@ -19,7 +19,7 @@ pub async fn update_settings(
     Json(next): Json<TradingSettings>,
 ) -> Json<ApiResponse<TradingSettings>> {
     match state.save_settings(next).await {
-        Ok(saved) => Json(ApiResponse::ok_msg(saved, "設定を保存しました。次の判断サイクルから反映されます")),
+        Ok(saved) => Json(ApiResponse::ok_msg(saved, "設定を保存しました。次の足から反映されます")),
         Err(e) => {
             warn!("settings update rejected: {e:#}");
             Json(ApiResponse::err(format!("{e:#}")))

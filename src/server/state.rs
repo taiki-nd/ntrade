@@ -9,14 +9,15 @@ use tracing::{debug, error, info, warn};
 
 use crate::ctrader::{token, BarPeriod, CTraderConfig, CTraderService, TokenSet};
 use crate::executor::{CTraderOrderSink, DisconnectedOrderSink, OrderSink};
+use crate::executor::parse_signal_comment;
 use crate::guard::GuardConfig;
-use crate::llm::{LlmClient, LlmClientConfig};
-use crate::snapshot::measures;
+use crate::indicators;
+use crate::live::DeploymentStatus;
 use crate::settings::TradingSettings;
-use crate::snapshot::SnapshotBundle;
 use crate::storage::Db;
+use crate::strategy::Side;
 use super::types::{
-    AccountInfo, AccountMetrics, BotState, CloseReason, ConnectionStatus, CoTLog, Position, TradeHistory, WorkingOrder,
+    AccountInfo, AccountMetrics, BotState, CloseReason, ConnectionStatus, Position, SignalLog, TradeHistory, WorkingOrder,
 };
 
 #[derive(Clone)]
@@ -29,24 +30,20 @@ pub struct AppState {
     pub ctrader_service: Arc<RwLock<Option<Arc<CTraderService>>>>,
     pub ctrader_config: Arc<RwLock<Option<CTraderConfig>>>,
     pub available_accounts: Arc<RwLock<Vec<AccountInfo>>>,
-    /// ペアごとの直近の Snapshot（客観的事実 + 画像4枚）
-    pub latest_snapshots: Arc<RwLock<HashMap<String, SnapshotBundle>>>,
-    /// SQLite（ヒストリカルバー・リプレイ結果・判断ログ・ポジション・決済履歴・教訓）
+    /// デプロイごとの直近の実行状況
+    pub deployment_status: Arc<RwLock<HashMap<String, DeploymentStatus>>>,
+    /// SQLite（ヒストリカルバー・バックテスト結果・シグナルログ・ポジション・決済履歴）
     pub db_path: PathBuf,
     /// `positions` の SQLite 書き出しを直列化する（古いスナップショットで上書きしないため）
     positions_persist_lock: Arc<tokio::sync::Mutex<()>>,
-    /// 画面から変更できる取引設定（対象ペア・待ち秒数・事後ガード）。SQLite の app_settings が正
+    /// 画面から変更できる取引設定（対象ペア・待ち秒数・リスク設定・戦略）。SQLite の app_settings が正
     pub settings: Arc<RwLock<TradingSettings>>,
-    /// LLM 推論クライアント
-    pub llm: Arc<LlmClient>,
     /// 発注先（cTrader 接続時は CTraderOrderSink、未接続時は DisconnectedOrderSink）
     pub order_sink: Arc<RwLock<Arc<dyn OrderSink>>>,
-    /// 判断サイクル（読み取り側・ペア間で並行可）と cTrader 接続の差し替え（書き込み側）の排他
+    /// 戦略の実行（読み取り側・デプロイ間で並行可）と cTrader 接続の差し替え（書き込み側）の排他
     pub cycle_gate: Arc<RwLock<()>>,
-    /// 同じペアの判断サイクルを重ねない（スケジューラと手動実行の衝突防止）
-    pair_locks: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
-    /// ガード評価（建玉数・日次損失）から発注・注文記録までを直列化する。
-    /// ペアを並行に回すと、両方が「建玉 0」を見て全体上限を超えて発注しうるため
+    /// リスクチェック（建玉数・日次損失）から発注・注文記録までを直列化する。
+    /// デプロイを並行に回すと、両方が「建玉 0」を見て全体上限を超えて発注しうるため
     pub order_lock: Arc<tokio::sync::Mutex<()>>,
     /// ブローカー残高の最終同期時刻
     pub last_broker_sync: Arc<RwLock<Option<std::time::Instant>>>,
@@ -82,7 +79,7 @@ async fn closed_trade(ctrader: &CTraderService, p: Position) -> TradeHistory {
         Err(_) => None,
     };
 
-    let pip = measures::get_pip_size(&p.symbol);
+    let pip = indicators::get_pip_size(&p.symbol);
     let sign = if p.side == "BUY" { 1.0 } else { -1.0 };
     let pip_value = match &deal {
         Some(_) => 0.0,
@@ -131,7 +128,8 @@ async fn closed_trade(ctrader: &CTraderService, p: Position) -> TradeHistory {
         close_reason,
         open_time: p.open_time,
         close_time,
-        cot_log_id: p.cot_log_id,
+        signal_id: p.signal_id,
+        strategy: p.strategy,
     }
 }
 
@@ -175,7 +173,7 @@ async fn pip_value_or_estimate(ctrader: &CTraderService, symbol: &str) -> f64 {
         Ok(v) => v,
         Err(e) => {
             warn!(%symbol, "failed to resolve pip value from broker; using a fixed estimate: {e:#}");
-            measures::pip_value_per_lot(symbol)
+            indicators::pip_value_per_lot(symbol)
         }
     }
 }
@@ -225,7 +223,7 @@ async fn refresh_unrealized(ctrader: &CTraderService, positions: &mut [Position]
             p.current_price = *price;
         }
         let sign = if p.side == "BUY" { 1.0 } else { -1.0 };
-        let pip = measures::get_pip_size(&p.symbol);
+        let pip = indicators::get_pip_size(&p.symbol);
         p.pnl_pips = ((p.current_price - p.entry_price) * sign / pip * 10.0).round() / 10.0;
         p.pnl_amount = match p.id.parse::<i64>().ok().and_then(|id| broker_pnl.get(&id)) {
             Some(v) => *v,
@@ -234,7 +232,7 @@ async fn refresh_unrealized(ctrader: &CTraderService, positions: &mut [Position]
     }
 }
 
-/// 前回終了時の保有ポジション（ペーパー決済の継続と判断ログとの対応付けのため）
+/// 前回終了時の保有ポジション（シグナル・戦略との対応を引き継ぐため）
 fn load_saved_positions(db_path: &std::path::Path) -> Vec<Position> {
     match Db::open(db_path).and_then(|db| db.positions()) {
         Ok(positions) => {
@@ -250,7 +248,7 @@ fn load_saved_positions(db_path: &std::path::Path) -> Vec<Position> {
     }
 }
 
-/// 前回終了時の約定待ちの予約注文（判断との対応と終値判定ラインを引き継ぐため）
+/// 前回終了時の約定待ちの予約注文（シグナル・戦略との対応を引き継ぐため）
 fn load_saved_working_orders(db_path: &std::path::Path) -> Vec<WorkingOrder> {
     match Db::open(db_path).and_then(|db| db.working_orders()) {
         Ok(orders) => {
@@ -266,9 +264,12 @@ fn load_saved_working_orders(db_path: &std::path::Path) -> Vec<WorkingOrder> {
     }
 }
 
-/// 判断 ID を comment に入れて発注しているので、ブローカー側の注文・建玉から判断へ辿れる
-fn cot_id_from_comment(comment: Option<&str>) -> Option<String> {
-    comment.filter(|c| c.starts_with("cot-")).map(str::to_string)
+/// シグナル ID とデプロイ ID を comment に入れて発注しているので、ブローカー側の注文・建玉から辿れる
+fn tags_from_comment(comment: Option<&str>) -> (Option<String>, Option<String>) {
+    match parse_signal_comment(comment) {
+        Some((signal, deployment)) => (Some(signal), deployment),
+        None => (None, None),
+    }
 }
 
 fn ts_string(t: chrono::DateTime<Utc>) -> String {
@@ -321,14 +322,12 @@ impl AppState {
             ctrader_service: Arc::new(RwLock::new(None)),
             ctrader_config: Arc::new(RwLock::new(initial_config)),
             available_accounts: Arc::new(RwLock::new(Vec::new())),
-            latest_snapshots: Arc::new(RwLock::new(HashMap::new())),
+            deployment_status: Arc::new(RwLock::new(HashMap::new())),
             db_path,
             positions_persist_lock: Arc::new(tokio::sync::Mutex::new(())),
             settings: Arc::new(RwLock::new(settings)),
-            llm: Arc::new(LlmClient::new(LlmClientConfig::default())),
             order_sink: Arc::new(RwLock::new(Arc::new(DisconnectedOrderSink))),
             cycle_gate: Arc::new(RwLock::new(())),
-            pair_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             order_lock: Arc::new(tokio::sync::Mutex::new(())),
             last_broker_sync: Arc::new(RwLock::new(None)),
             reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -401,14 +400,19 @@ impl AppState {
         }
     }
 
-    /// 対象銘柄の仕様（lot サイズ・取引時間など）を取得し、気配値を購読する
+    /// 対象銘柄の仕様（lot サイズ・取引時間など）を取得して保存し（バックテストが使う）、気配値を購読する
     pub async fn prepare_symbols(&self, ctrader: &CTraderService, pairs: &[String]) {
         for p in pairs {
             match ctrader.symbol_spec(p).await {
-                Ok(spec) => info!(
-                    pair = %p, asset_class = ?spec.asset_class, lot_units = spec.lot_units, pip = spec.pip_size(),
-                    min_lots = ?spec.min_lots(), schedule_tz = ?spec.schedule_time_zone, "symbol spec loaded"
-                ),
+                Ok(spec) => {
+                    info!(
+                        pair = %p, asset_class = ?spec.asset_class, lot_units = spec.lot_units, pip = spec.pip_size(),
+                        min_lots = ?spec.min_lots(), schedule_tz = ?spec.schedule_time_zone, "symbol spec loaded"
+                    );
+                    if let Err(e) = self.with_db(move |db| db.save_instrument(&spec)).await {
+                        warn!(pair = %p, "failed to save symbol spec: {e:#}");
+                    }
+                }
                 Err(e) => warn!(pair = %p, "failed to load symbol spec: {e:#}"),
             }
         }
@@ -496,7 +500,7 @@ impl AppState {
         if !cfg.tokens().needs_refresh(chrono::Utc::now().timestamp()) {
             return;
         }
-        // 判断サイクルの途中で接続を差し替えないよう、実行中のサイクルが終わるのを待つ
+        // 戦略の実行の途中で接続を差し替えないよう、実行中のサイクルが終わるのを待つ
         let _gate = self.cycle_gate.write().await;
         let result = async {
             let cfg = self.refresh_ctrader_tokens(cfg).await?;
@@ -568,7 +572,7 @@ impl AppState {
     /// 検知できない。判断サイクルの後にしか照合しないと、停止中・サイクル間・再起動直後の決済を
     /// 取りこぼし、決済済みの建玉が残って純資産がずれる。
     ///
-    /// 戻り値は今回はじめて確定した決済（自己反省の対象）。
+    /// 戻り値は今回はじめて確定した決済。
     pub async fn reconcile_positions(&self) -> Result<Vec<TradeHistory>> {
         let _serial = self.reconcile_lock.lock().await;
         let Some(ctrader) = self.ctrader_service.read().await.clone() else {
@@ -616,7 +620,7 @@ impl AppState {
             }
         }
 
-        // 2. ブローカーにあってローカルに無い建玉を取り込む。予約注文の約定ならその注文の判断を引き継ぐ
+        // 2. ブローカーにあってローカルに無い建玉を取り込む。予約注文の約定ならその注文のシグナル・戦略を引き継ぐ
         let orphans: Vec<_> = broker
             .iter()
             .filter(|b| !remaining.iter().any(|p| p.id == b.position_id.to_string()))
@@ -625,6 +629,7 @@ impl AppState {
         for b in orphans {
             let symbol = b.symbol_name.clone().unwrap_or_else(|| format!("symbol-{}", b.symbol_id));
             let entry = b.entry_price.unwrap_or_default();
+            let (signal_id, strategy) = tags_from_comment(b.comment.as_deref());
             let mut p = Position {
                 id: b.position_id.to_string(),
                 symbol,
@@ -637,18 +642,18 @@ impl AppState {
                 pnl_pips: 0.0,
                 pnl_amount: 0.0,
                 open_time: ts_string(b.open_time.unwrap_or_else(Utc::now)),
-                invalidation_reason: "ブローカー側から取り込んだ建玉（ntrade の記録に無し）".into(),
-                cot_log_id: cot_id_from_comment(b.comment.as_deref()),
-                close_stop: None,
+                note: "ブローカー側から取り込んだ建玉（ntrade の記録に無し）".into(),
+                signal_id,
+                strategy,
             };
             match filled.get(&b.position_id) {
                 Some(o) => {
-                    info!(position = %p.id, order = %o.id, cot = ?o.cot_log_id, "pending order filled; position adopted");
-                    p.invalidation_reason = o.invalidation_reason.clone();
-                    p.cot_log_id = o.cot_log_id.clone().or(p.cot_log_id);
-                    p.close_stop = o.close_stop;
+                    info!(position = %p.id, order = %o.id, signal = ?o.signal_id, strategy = ?o.strategy, "pending order filled; position adopted");
+                    p.note = o.note.clone();
+                    p.signal_id = o.signal_id.clone().or(p.signal_id);
+                    p.strategy = o.strategy.clone().or(p.strategy);
                 }
-                None => warn!(position = %p.id, symbol = %p.symbol, cot = ?p.cot_log_id, "orphan broker position adopted (not tracked locally)"),
+                None => warn!(position = %p.id, symbol = %p.symbol, signal = ?p.signal_id, strategy = ?p.strategy, "orphan broker position adopted (not tracked locally)"),
             }
             remaining.push(p);
         }
@@ -671,9 +676,9 @@ impl AppState {
                 pnl_pips: 0.0,
                 pnl_amount: 0.0,
                 open_time: o.created_at.clone(),
-                invalidation_reason: o.invalidation_reason.clone(),
-                cot_log_id: o.cot_log_id.clone(),
-                close_stop: o.close_stop,
+                note: o.note.clone(),
+                signal_id: o.signal_id.clone(),
+                strategy: o.strategy.clone(),
             };
             closed.push(closed_trade(&ctrader, p).await);
         }
@@ -725,7 +730,7 @@ impl AppState {
                 }
                 // reconcile とのすれ違い。次の照合で見直す
                 OrderFate::Working => keep.push(o),
-                other => info!(order = %o.id, symbol = %o.symbol, ?other, cot = ?o.cot_log_id, "pending order left the book"),
+                other => info!(order = %o.id, symbol = %o.symbol, ?other, signal = ?o.signal_id, "pending order left the book"),
             }
         }
         // ブローカーにだけある注文（cTrader 側で置いた・記録に失敗した）を取り込む
@@ -733,6 +738,7 @@ impl AppState {
         for b in broker_orders.iter().filter(|b| !known.contains(&b.order_id.to_string())) {
             let Some(kind) = b.kind else { continue };
             warn!(order = b.order_id, symbol = ?b.symbol_name, "orphan broker order adopted (not tracked locally)");
+            let (signal_id, strategy) = tags_from_comment(b.comment.as_deref());
             keep.push(WorkingOrder {
                 id: b.order_id.to_string(),
                 symbol: b.symbol_name.clone().unwrap_or_else(|| format!("symbol-{}", b.symbol_id)),
@@ -742,11 +748,11 @@ impl AppState {
                 entry_price: b.price.unwrap_or_default(),
                 stop_loss: b.stop_loss.unwrap_or_default(),
                 take_profit: b.take_profit.unwrap_or_default(),
-                close_stop: None,
                 created_at: ts_string(Utc::now()),
                 expires_at: b.expires_at.map(ts_string).unwrap_or_default(),
-                invalidation_reason: "ブローカー側から取り込んだ予約注文（ntrade の記録に無し）".into(),
-                cot_log_id: cot_id_from_comment(b.comment.as_deref()),
+                note: "ブローカー側から取り込んだ予約注文（ntrade の記録に無し）".into(),
+                signal_id,
+                strategy,
             });
         }
         (seen, keep, filled)
@@ -841,9 +847,8 @@ impl AppState {
         const INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
         loop {
             tokio::time::sleep(INTERVAL).await;
-            match self.reconcile_positions().await {
-                Ok(closed) => crate::scheduler::reflect_on_closed(&self, closed).await,
-                Err(e) => warn!("reconcile failed: {e:#}"),
+            if let Err(e) = self.reconcile_positions().await {
+                warn!("reconcile failed: {e:#}");
             }
         }
     }
@@ -932,7 +937,7 @@ impl AppState {
         self.settings.read().await.guard.clone()
     }
 
-    /// 判断サイクルの対象ペア
+    /// 監視する銘柄
     pub async fn pairs(&self) -> Vec<String> {
         self.settings.read().await.pairs.clone()
     }
@@ -946,7 +951,7 @@ impl AppState {
         }
     }
 
-    /// 設定を検証して SQLite に保存し、次の判断サイクルから反映する
+    /// 設定を検証して SQLite に保存し、次の足から反映する
     pub async fn save_settings(&self, mut next: TradingSettings) -> Result<TradingSettings> {
         next.normalize();
         next.validate()?;
@@ -972,12 +977,6 @@ impl AppState {
             self.prepare_symbols(&ctrader, &next.pairs).await;
         }
         Ok(next)
-    }
-
-    /// ペア単位のロック（同じペアの判断サイクルを重ねないため）
-    pub fn pair_lock(&self, pair: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut locks = self.pair_locks.lock().unwrap_or_else(|e| e.into_inner());
-        locks.entry(pair.to_uppercase()).or_default().clone()
     }
 
     /// 1 lot・1 pip の価値（口座通貨）をブローカーのレートから求める。未接続・取得失敗なら None
@@ -1011,7 +1010,7 @@ impl AppState {
         &self,
         cfg: &GuardConfig,
         pair: &str,
-        action: crate::strategy::types::Action,
+        side: Side,
         lots: f64,
         price: f64,
     ) -> std::result::Result<String, String> {
@@ -1024,7 +1023,7 @@ impl AppState {
             let msg = format!("{e:#}");
             if msg.contains("VOLUME_BELOW_MIN") { msg } else { format!("MARGIN_UNKNOWN: {msg}") }
         })?;
-        let new_margin = if action == crate::strategy::types::Action::Buy { buy } else { sell };
+        let new_margin = if side == Side::Buy { buy } else { sell };
         let positions = self.positions.read().await.clone();
         let (balance, used) = {
             let m = self.metrics.read().await;
@@ -1105,10 +1104,10 @@ impl AppState {
         }
     }
 
-    /// 判断ログを SQLite に記録する
-    pub async fn record_cot_log(&self, log: CoTLog) {
-        if let Err(e) = self.with_db(move |db| db.insert_cot_log(&log)).await {
-            error!("Failed to record CoT log to SQLite: {e:#}");
+    /// シグナルを SQLite に記録する
+    pub async fn record_signal(&self, log: SignalLog) {
+        if let Err(e) = self.with_db(move |db| db.insert_signal(&log)).await {
+            error!("Failed to record signal to SQLite: {e:#}");
         }
     }
 
@@ -1132,7 +1131,6 @@ impl AppState {
             broker_balance: None,
             connection_status: ConnectionStatus {
                 ctrader: "connecting".to_string(),
-                llm: "ready".to_string(),
                 ping_ms: 0,
                 environment: "DEMO".to_string(),
                 account_number: "未連携".to_string(),
@@ -1159,9 +1157,9 @@ mod tests {
             pnl_pips: 0.0,
             pnl_amount: 0.0,
             open_time: "2026-09-25 16:51:30".into(),
-            invalidation_reason: String::new(),
-            cot_log_id: None,
-            close_stop: None,
+            note: String::new(),
+            signal_id: None,
+            strategy: None,
         }
     }
 

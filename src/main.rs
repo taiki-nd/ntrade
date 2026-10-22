@@ -16,8 +16,8 @@ async fn main() -> Result<()> {
         .init();
 
     info!("============================================================");
-    info!("  Starting ntrade core engine v0.1.0 (Step 5 Integrated)");
-    info!("  Runtime: Tokio + Axum + cTrader Open API + LLM Engine");
+    info!("  Starting ntrade core engine v0.2.0");
+    info!("  Runtime: Tokio + Axum + cTrader Open API + rule-based strategies");
     info!("============================================================");
 
     // アプリケーション状態の初期化
@@ -38,7 +38,7 @@ async fn main() -> Result<()> {
     // 残高の推移を cTrader の決済・入出金履歴から取り込む（ダッシュボードのグラフ用）
     tokio::spawn(state.clone().run_balance_history_loop());
 
-    // 5分足確定ごとの常駐スケジューラ（NTRADE_SCHEDULER=off で無効化）
+    // 足の確定ごとに戦略を回す常駐スケジューラ（NTRADE_SCHEDULER=off で無効化）
     if std::env::var("NTRADE_SCHEDULER").map(|v| v == "off").unwrap_or(false) {
         info!("Scheduler disabled (NTRADE_SCHEDULER=off)");
     } else {
@@ -52,27 +52,6 @@ async fn main() -> Result<()> {
     let app = create_router(state);
     let addr = SocketAddr::from(([127, 0, 0, 1], 4000));
     info!("ntrade local API server listening on http://{}", addr);
-    info!("Endpoints available:");
-    info!("  - GET  /health");
-    info!("  - GET  /api/status");
-    info!("  - POST /api/control/state");
-    info!("  - POST /api/control/emergency-stop");
-    info!("  - GET  /api/positions");
-    info!("  - POST /api/positions/:id/close");
-    info!("  - GET  /api/trades");
-    info!("  - GET  /api/cot");
-    info!("  - GET  /api/lessons");
-    info!("  - GET  /api/chart/latest?tf=4H|1H|15M|5M&pair=USDJPY");
-    info!("  - GET  /api/snapshot/latest?pair=USDJPY");
-    info!("  - POST /api/decide?pair=USDJPY");
-    info!("  - GET  /api/orders, DELETE /api/orders/:id");
-    info!("  - GET  /api/guard/config");
-    info!("  - GET  /api/settings, PUT /api/settings");
-    info!("  - GET  /api/symbols?q=, /api/symbols/spec?pair=");
-    info!("  - GET  /api/replay/runs, /api/replay/runs/:id, /api/replay/coverage");
-    info!("  - GET  /api/auth/ctrader/url");
-    info!("  - POST /api/auth/ctrader/exchange");
-
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

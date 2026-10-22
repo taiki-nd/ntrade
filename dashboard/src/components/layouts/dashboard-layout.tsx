@@ -5,10 +5,9 @@ import Link from "next/link"
 import { usePathname } from "next/navigation"
 import {
   LayoutDashboard,
-  BrainCircuit,
+  Radio,
   LineChart,
   History,
-  Lightbulb,
   FlaskConical,
   Settings,
   Menu,
@@ -32,12 +31,11 @@ export interface NavItem {
 
 /** ダッシュボードのタブは `/#<tab>` で表現する。page.tsx がハッシュを読んでタブを切り替える。 */
 const defaultNavItems: NavItem[] = [
-  { title: "全体概要", href: "/#overview", icon: LayoutDashboard },
-  { title: "判断ログ", href: "/#cot", icon: BrainCircuit },
+  { title: "概要", href: "/#overview", icon: LayoutDashboard },
+  { title: "シグナル", href: "/#signals", icon: Radio },
   { title: "チャート", href: "/#chart", icon: LineChart },
-  { title: "約定履歴", href: "/#trades", icon: History },
-  { title: "教訓", href: "/#lessons", icon: Lightbulb },
-  { title: "リプレイ", href: "/#replay", icon: FlaskConical },
+  { title: "取引履歴", href: "/#trades", icon: History },
+  { title: "バックテスト", href: "/#backtest", icon: FlaskConical },
   { title: "システム設定", href: "/settings", icon: Settings },
 ]
 
