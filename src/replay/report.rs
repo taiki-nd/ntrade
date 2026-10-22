@@ -69,8 +69,12 @@ pub struct Report {
     pub rejected: Bucket,
     pub unobserved_rate: f64,
     pub hold_rate: f64,
-    pub plan_rate: f64,
-    pub plan_triggered: usize,
+    /// 予約注文を出した（BUY/SELL）判断の割合
+    pub order_rate: f64,
+    /// 出した予約注文のうち、期限内に約定したもの（ガード通過・不通過を問わず）
+    pub orders_filled: usize,
+    /// 出した予約注文のうち、期限内に約定しなかったもの
+    pub orders_expired: usize,
     pub conflicts_empty_rate: f64,
 }
 
@@ -84,8 +88,9 @@ pub fn build_report(run_id: i64, rows: &[ReplayDecisionRow]) -> Report {
     let mut rejected = Bucket::default();
     let mut unobserved = 0;
     let mut holds = 0;
-    let mut plans = 0;
-    let mut plan_triggered = 0;
+    let mut orders = 0;
+    let mut orders_filled = 0;
+    let mut orders_expired = 0;
     let mut conflicts_empty = 0;
     let mut guard_pass = 0;
 
@@ -101,12 +106,12 @@ pub fn build_report(run_id: i64, rows: &[ReplayDecisionRow]) -> Report {
             holds += 1;
         }
         let v: serde_json::Value = serde_json::from_str(&d.decision_json).unwrap_or_default();
-        if v.get("conditional_plan").map(|p| !p.is_null()).unwrap_or(false) {
-            plans += 1;
-            if matches!(d.outcome.as_str(), "TP_HIT" | "SL_HIT" | "SAME_BAR" | "TIMEOUT" | "PLAN_DECLINED" | "PLAN_REJECTED")
-                && d.action == "HOLD"
-            {
-                plan_triggered += 1;
+        if d.action == "BUY" || d.action == "SELL" {
+            orders += 1;
+            match d.outcome.as_str() {
+                "TP_HIT" | "SL_HIT" | "SAME_BAR" | "TIMEOUT" => orders_filled += 1,
+                "ORDER_EXPIRED" => orders_expired += 1,
+                _ => {}
             }
         }
         if v.pointer("/analysis/conflicts").and_then(|c| c.as_str()).map(|s| s.trim().is_empty()).unwrap_or(true) {
@@ -116,7 +121,7 @@ pub fn build_report(run_id: i64, rows: &[ReplayDecisionRow]) -> Report {
         if d.guard_result == "PASS" {
             guard_pass += 1;
             overall.add(d);
-            // プラン成立の再判断で入った取引は、入ると決めた再判断の確信度で分ける
+            // 旧方式の run: プラン成立の再判断で入った取引は、入ると決めた再判断の確信度で分ける
             let confidence = d
                 .followup_json
                 .as_deref()
@@ -151,8 +156,9 @@ pub fn build_report(run_id: i64, rows: &[ReplayDecisionRow]) -> Report {
         rejected,
         unobserved_rate: unobserved as f64 / total,
         hold_rate: holds as f64 / total,
-        plan_rate: plans as f64 / total,
-        plan_triggered,
+        order_rate: orders as f64 / total,
+        orders_filled,
+        orders_expired,
         conflicts_empty_rate: conflicts_empty as f64 / total,
     }
 }
@@ -162,8 +168,8 @@ pub fn format_report(r: &Report) -> String {
     let mut s = String::new();
     s.push_str(&format!("Run #{}  decisions={}  guard_pass={}\n", r.run_id, r.total, r.guard_pass));
     s.push_str(&format!(
-        "hold_rate={:.2}  plan_rate={:.2}  plan_triggered={}  unobserved_rate={:.2}  conflicts_empty_rate={:.2}\n",
-        r.hold_rate, r.plan_rate, r.plan_triggered, r.unobserved_rate, r.conflicts_empty_rate
+        "hold_rate={:.2}  order_rate={:.2}  orders_filled={}  orders_expired={}  conflicts_empty_rate={:.2}\n",
+        r.hold_rate, r.order_rate, r.orders_filled, r.orders_expired, r.conflicts_empty_rate
     ));
     s.push_str("\n[by action]     ");
     for (k, v) in &r.by_action { s.push_str(&format!("{k}={v} ")); }
@@ -220,7 +226,8 @@ pub fn format_compare(reports: &[Report]) -> String {
     line("total_pnl_pips", &|r| format!("{:.1}", r.overall.total_pnl_pips));
     line("rejected_total_pips", &|r| format!("{:.1}", r.rejected.total_pnl_pips));
     line("hold_rate", &|r| format!("{:.2}", r.hold_rate));
-    line("plan_rate", &|r| format!("{:.2}", r.plan_rate));
+    line("order_rate", &|r| format!("{:.2}", r.order_rate));
+    line("orders_filled", &|r| r.orders_filled.to_string());
     line("unobserved_rate", &|r| format!("{:.2}", r.unobserved_rate));
     line("conflicts_empty_rate", &|r| format!("{:.2}", r.conflicts_empty_rate));
     s

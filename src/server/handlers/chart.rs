@@ -14,6 +14,7 @@ use crate::server::state::AppState;
 use crate::server::types::ApiResponse;
 use crate::snapshot::{
     AccountState, MarketSnapshot, OpenPositionSummary, RecentDecision, SnapshotBundle, SnapshotInput, SnapshotPipeline,
+    WorkingOrderSummary,
 };
 
 #[derive(Debug, Deserialize)]
@@ -138,12 +139,16 @@ pub async fn generate_snapshot_internal(state: &AppState, pair: &str) -> anyhow:
     let b5m = ctrader.get_trendbars(pair, BarPeriod::M5, 200).await.context("failed to fetch 5M bars")?;
 
     let pip = crate::snapshot::measures::get_pip_size(pair);
-    let spread_pips = ctrader
-        .quote(pair, chrono::Duration::minutes(10))
+    let quote = ctrader.quote(pair, chrono::Duration::minutes(10)).await;
+    let spread_pips = quote.map(|q| crate::snapshot::measures::to_pips(q.spread(), pip));
+    // 予約注文は現在値の上下どちらに置くかで種類が決まるので、確定足の終値より新しい気配値の仲値を使う
+    let live_mid = ctrader
+        .quote(pair, chrono::Duration::seconds(30))
         .await
-        .map(|q| crate::snapshot::measures::to_pips(q.spread(), pip));
+        .map(|q| (q.bid + q.ask) / 2.0)
+        .filter(|p| *p > 0.0);
 
-    // 口座状態: 保有ポジションと直近の判断（フリップフロップ防止のため LLM に渡す）
+    // 口座状態: 保有ポジション・予約注文と直近の判断（フリップフロップ防止のため LLM に渡す）
     let recent_cot = {
         let pair = pair.to_string();
         match state.with_db(move |db| db.cot_logs(Some(&pair), None, 3, 0)).await {
@@ -161,12 +166,31 @@ pub async fn generate_snapshot_internal(state: &AppState, pair: &str) -> anyhow:
                 .iter()
                 .filter(|p| p.symbol.eq_ignore_ascii_case(pair))
                 .map(|p| OpenPositionSummary {
+                    id: p.id.clone(),
                     side: p.side.clone(),
                     entry_price: p.entry_price,
                     // LLM に見せるのは自分が決めた損切りライン。終値判定の建玉ではハードSLではなくそちら
                     stop_loss: Some(p.close_stop.unwrap_or(p.stop_loss)),
                     take_profit: Some(p.take_profit),
                     open_time: p.open_time.clone(),
+                    pnl_pips: p.pnl_pips,
+                })
+                .collect(),
+            working_orders: state
+                .working_orders
+                .read()
+                .await
+                .iter()
+                .filter(|o| o.symbol.eq_ignore_ascii_case(pair))
+                .map(|o| WorkingOrderSummary {
+                    id: o.id.clone(),
+                    side: o.side.clone(),
+                    kind: serde_json::to_value(o.kind).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default(),
+                    entry_price: o.entry_price,
+                    stop_loss: o.close_stop.unwrap_or(o.stop_loss),
+                    take_profit: o.take_profit,
+                    created_at: o.created_at.clone(),
+                    expires_at: o.expires_at.clone(),
                 })
                 .collect(),
             recent_decisions: recent_cot
@@ -174,15 +198,13 @@ pub async fn generate_snapshot_internal(state: &AppState, pair: &str) -> anyhow:
                 .map(|c| RecentDecision {
                     time: c.timestamp.clone(),
                     action: c.action.clone(),
-                    // 旧データは注文の攻防、新しいデータはファンダメンタルズの読みを要約にする
-                    summary: if c.fundamental_view.is_empty() { &c.order_flow } else { &c.fundamental_view }
+                    // 相場の読み（ファンダメンタルズ時代のログはその読み）を要約にする
+                    summary: if c.fundamental_view.is_empty() { &c.macro_context } else { &c.fundamental_view }
                         .chars()
                         .take(160)
                         .collect(),
                 })
                 .collect(),
-            // 成立したプランは判断サイクルがプラン評価の後で差し込む
-            triggered_plan: None,
         }
     };
 
@@ -194,7 +216,7 @@ pub async fn generate_snapshot_internal(state: &AppState, pair: &str) -> anyhow:
         bars_15m: &b15m,
         bars_5m: &b5m,
         spread_pips,
-        current_price: None,
+        current_price: live_mid,
         now: None,
         account_state,
     })?;

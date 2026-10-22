@@ -45,14 +45,14 @@ fn prompt_carries_price_facts_without_chart_images_or_judgment_labels() {
         .with_lessons(vec!["テスト教訓".to_string()])
         .build(&bundle.snapshot);
 
-    // チャート画像は LLM に渡さない（方向はファンダメンタルズの事実から決める）
+    // チャート画像は LLM に渡さない（価格の数値だけを渡す）
     for (_, p) in bundle.charts.ordered() {
         let abs = std::fs::canonicalize(p).unwrap();
         assert!(!prompt.contains(abs.to_str().unwrap()), "prompt must not reference {:?}", abs);
     }
     assert!(prompt.contains("USDJPY"));
     assert!(prompt.contains("テスト教訓"));
-    assert!(prompt.contains("\"bars_5m\""));
+    assert!(prompt.contains("\"bars_5m\"") && prompt.contains("\"bars_1h\""));
     for forbidden in ["PINBAR", "pattern_detected", "at_key_level", "必ず「HOLD"] {
         assert!(!prompt.contains(forbidden), "prompt leaks old judgment: {forbidden}");
     }
@@ -64,19 +64,21 @@ fn prompt_carries_price_facts_without_chart_images_or_judgment_labels() {
 fn parses_structured_output_envelope() {
     let client = LlmClient::new(LlmClientConfig::default());
     let raw = r#"{"type":"result","subtype":"success","is_error":false,"result":"{...}","structured_output":{
-        "action":"HOLD","confidence":0.4,"entry_type":"CONDITIONAL","entry_price":null,"stop_loss":null,"take_profit":null,
-        "analysis":{"macro_context":"4H上昇の押し目","order_flow":"5Mで下げ止まり","invalidation":"154.07割れ","conflicts":"低ボラ"},
-        "conditional_plan":{"wait_for":"154.24実体抜け","then_action":"BUY","invalidate_if":"154.07割れ","expires_at":"2026-09-15 10:30:00 UTC","stop_loss":154.07,"take_profit":154.5},
-        "observed":{"latest_bar_4h":"2026-09-15 08:00","latest_bar_1h":"2026-09-15 09:00","latest_bar_15m":"2026-09-15 09:30","latest_bar_5m":"2026-09-15 09:35"},
-        "reasoning":"待ち"}}"#;
+        "action":"SELL","confidence":0.7,"entry_type":"LIMIT","entry_price":154.45,"stop_loss":154.62,"take_profit":154.05,
+        "expiry_minutes":90,
+        "analysis":{"market_structure":"1H下落中の戻り","price_levels":"前日安値154.45の戻り売り","invalidation":"154.62超え","conflicts":"アジア安値が近い"},
+        "manage":[{"target":"ORDER","id":"555","op":"CANCEL","reason":"買いシナリオ崩れ"},
+                  {"target":"POSITION","id":"777","op":"MODIFY","stop_loss":154.30,"take_profit":null,"reason":"建値へ"}],
+        "reasoning":"戻り売り"}}"#;
 
     let d = client.parse_decision(raw);
-    assert_eq!(d.action, Action::Hold);
-    assert_eq!(d.entry_type, Some(EntryType::Conditional));
-    let plan = d.conditional_plan.expect("plan");
-    assert_eq!(plan.then_action, Action::Buy);
-    assert_eq!(plan.stop_loss, Some(154.07));
-    assert_eq!(d.observed.latest_bar_5m.as_deref(), Some("2026-09-15 09:35"));
+    assert_eq!(d.action, Action::Sell);
+    assert_eq!(d.entry_type, Some(EntryType::Limit));
+    assert_eq!(d.expiry_minutes, Some(90));
+    assert_eq!(d.manage.len(), 2);
+    assert_eq!((d.manage[0].target, d.manage[0].op), (ManageTarget::Order, ManageOp::Cancel));
+    assert_eq!(d.manage[1].stop_loss, Some(154.30));
+    assert_eq!(d.manage[1].take_profit, None);
 }
 
 #[test]
@@ -84,14 +86,15 @@ fn parses_markdown_block_fallback() {
     let client = LlmClient::new(LlmClientConfig::default());
     let raw = r#"analysis:
 ```json
-{"action":"BUY","confidence":0.8,"entry_price":154.2,"stop_loss":154.07,"take_profit":154.5,
- "analysis":{"macro_context":"a","order_flow":"b","invalidation":"c","conflicts":"d"},
- "observed":{"latest_bar_5m":"2026-09-15 09:35"},"reasoning":"r"}
+{"action":"BUY","confidence":0.8,"entry_type":"STOP","entry_price":154.2,"stop_loss":154.07,"take_profit":154.5,"expiry_minutes":30,
+ "analysis":{"market_structure":"a","price_levels":"b","invalidation":"c","conflicts":"d"},
+ "manage":[],"reasoning":"r"}
 ```"#;
     let d = client.parse_decision(raw);
     assert_eq!(d.action, Action::Buy);
+    assert_eq!(d.entry_type, Some(EntryType::Stop));
     assert_eq!(d.stop_loss, Some(154.07));
-    assert!(d.observed.latest_bar_4h.is_none());
+    assert!(d.manage.is_empty());
 }
 
 #[test]
@@ -109,7 +112,7 @@ fn error_envelope_and_garbage_fall_back_to_hold() {
 fn json_schema_matches_serialized_decision_shape() {
     let schema = TradeDecision::json_schema();
     let props = schema["properties"].as_object().unwrap();
-    for key in ["action", "confidence", "analysis", "conditional_plan", "reasoning"] {
+    for key in ["action", "confidence", "analysis", "manage", "expiry_minutes", "reasoning"] {
         assert!(props.contains_key(key), "schema missing {key}");
     }
     let d = TradeDecision::fallback_hold("x");
@@ -117,7 +120,8 @@ fn json_schema_matches_serialized_decision_shape() {
     for key in props.keys() {
         assert!(v.get(key).is_some(), "serialized decision missing {key}");
     }
-    assert!(!props.contains_key("observed"), "chart observation is no longer requested");
+    assert!(!props.contains_key("observed") && !props.contains_key("conditional_plan"));
     let analysis = schema["properties"]["analysis"]["required"].as_array().unwrap();
-    assert!(analysis.iter().any(|k| k == "fundamental_view") && analysis.iter().any(|k| k == "price_levels"));
+    assert!(analysis.iter().any(|k| k == "market_structure") && analysis.iter().any(|k| k == "price_levels"));
+    assert!(!analysis.iter().any(|k| k == "fundamental_view"));
 }

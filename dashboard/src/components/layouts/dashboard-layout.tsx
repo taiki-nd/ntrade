@@ -10,7 +10,6 @@ import {
   History,
   Lightbulb,
   FlaskConical,
-  Landmark,
   Settings,
   Menu,
   PanelLeftClose,
@@ -34,11 +33,10 @@ export interface NavItem {
 /** ダッシュボードのタブは `/#<tab>` で表現する。page.tsx がハッシュを読んでタブを切り替える。 */
 const defaultNavItems: NavItem[] = [
   { title: "全体概要", href: "/#overview", icon: LayoutDashboard },
-  { title: "LLM 思考ログ", href: "/#cot", icon: BrainCircuit, badge: "AI" },
+  { title: "判断ログ", href: "/#cot", icon: BrainCircuit },
   { title: "チャート", href: "/#chart", icon: LineChart },
-  { title: "ファンダメンタルズ", href: "/#fundamentals", icon: Landmark },
   { title: "約定履歴", href: "/#trades", icon: History },
-  { title: "教訓ルール", href: "/#lessons", icon: Lightbulb },
+  { title: "教訓", href: "/#lessons", icon: Lightbulb },
   { title: "リプレイ", href: "/#replay", icon: FlaskConical },
   { title: "システム設定", href: "/settings", icon: Settings },
 ]

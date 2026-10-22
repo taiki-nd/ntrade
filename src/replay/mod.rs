@@ -17,13 +17,13 @@ use crate::ctrader::{BarPeriod, CandleBar};
 use crate::guard::{self, GuardConfig, GuardContext};
 use crate::llm::LlmBackend;
 use crate::snapshot::measures::get_pip_size;
-use crate::snapshot::{AccountState, MarketSnapshot, SnapshotBundle, SnapshotInput, SnapshotPipeline, TriggeredPlan};
+use crate::snapshot::{AccountState, MarketSnapshot, SnapshotBundle, SnapshotInput, SnapshotPipeline};
 use crate::storage::{Db, ReplayDecisionRow};
-use crate::strategy::types::Action;
 use crate::strategy::PromptBuilder;
-use score::{plan_trigger_index, score_decision, score_followup, ExitRule, ScoreConfig};
+use score::{score_decision, ExitRule, ScoreConfig};
 
-pub const SNAPSHOT_VERSION: &str = "snapshot-v2";
+/// v3: 日中の短期取引・予約注文（1H 生足と予約注文の一覧を追加、ファンダメンタルズを廃止）
+pub const SNAPSHOT_VERSION: &str = "snapshot-v3";
 
 /// バー供給元の抽象。本番は cTrader、リプレイは SQLite。
 pub trait BarSource: Send + Sync {
@@ -104,6 +104,9 @@ pub fn verify_no_future_leak(snapshot: &MarketSnapshot, t: DateTime<Utc>) -> Res
     for b in &snapshot.bars_15m {
         times.push(("bars_15m", &b.t));
     }
+    for b in &snapshot.bars_1h {
+        times.push(("bars_1h", &b.t));
+    }
     for p in snapshot.swing_points.h4.iter().chain(&snapshot.swing_points.h1).chain(&snapshot.swing_points.m15) {
         times.push(("swing_points", &p.time));
     }
@@ -179,20 +182,6 @@ pub struct ReplayConfig {
     pub chart_root: PathBuf,
     pub lessons: Vec<String>,
     pub exit: ExitRule,
-    /// 条件付きプランが成立したら、本番と同じくその時点で LLM に判断し直させる。
-    /// false なら成立足の終値で機械的に執行したとみなす（旧方式との比較用）
-    pub plan_rejudge: bool,
-}
-
-/// 条件付きプランが成立した時点の再判断（`replay_decisions.followup_json`）
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct PlanFollowup {
-    /// 再判断の時刻（成立足の確定時刻）
-    pub t: String,
-    /// 元の判断時刻から成立足までの5M本数（成立足を含む）
-    pub offset: usize,
-    pub decision: crate::strategy::types::TradeDecision,
-    pub guard_result: String,
 }
 
 pub struct ReplayRunner {
@@ -215,8 +204,7 @@ impl ReplayRunner {
             "guard": self.guard,
             "max_bars_to_exit": cfg.max_bars_to_exit,
             "spread_pips": cfg.spread_pips,
-            "exit": cfg.exit,
-            "plan_rejudge": cfg.plan_rejudge
+            "exit": cfg.exit
         })
         .to_string();
         let sampling = format!("step:{}m{}", cfg.step_minutes, cfg.limit.map(|l| format!(":limit={l}")).unwrap_or_default());
@@ -313,24 +301,8 @@ async fn evaluate_one(
         atr,
     };
 
-    let plan = decision.conditional_plan.as_ref().filter(|p| decision.action == Action::Hold && p.then_action != Action::Hold);
-    let trigger = match plan {
-        Some(p) if cfg.plan_rejudge => plan_trigger_index(&after, p).ok().map(|i| (p, i)),
-        _ => None,
-    };
-    let (score, followup) = match trigger {
-        Some((plan, i)) => {
-            let f = rejudge_plan(llm, source, pipeline, cfg, guard_cfg, t, plan, &after[i], i + 1).await?;
-            let t2 = Utc.timestamp_opt(crate::storage::parse_ts(&f.t)?, 0).single().ok_or_else(|| anyhow!("bad ts {}", f.t))?;
-            let (after2, atr2) = {
-                let db = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
-                (db.bars_from(&cfg.pair, BarPeriod::M5, t2, cfg.max_bars_to_exit + 400)?, atr_5m_at(&db, &cfg.pair, t2)?)
-            };
-            let score = score_followup(&after2, &f.decision, f.guard_result == "PASS", f.offset, &score_cfg(atr2));
-            (score, Some(serde_json::to_string(&f)?))
-        }
-        None => (score_decision(&after, &decision, &score_cfg(atr)), None),
-    };
+    // 口座状態を持たないので、既存の注文・建玉への操作（manage）は採点しない。新しい予約注文だけを見る
+    let score = score_decision(&after, &decision, &score_cfg(atr));
 
     let row = ReplayDecisionRow {
         run_id,
@@ -344,44 +316,12 @@ async fn evaluate_one(
         session: serde_json::to_value(bundle.snapshot.session)?.as_str().unwrap_or("").to_string(),
         confidence: decision.confidence,
         action: serde_json::to_value(decision.action)?.as_str().unwrap_or("").to_string(),
-        followup_json: followup,
+        followup_json: None,
     };
     let db = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
     db.insert_decision(&row)?;
     info!(%t, action = %row.action, outcome = %row.outcome, guard = %row.guard_result, "replay sample done");
     Ok(())
-}
-
-/// プランが成立した足の確定時刻で Snapshot を作り直し、成立を添えて LLM に判断し直させる（本番の判断サイクルと同じ）。
-/// 再判断が新たに立てたプランは追わない。
-#[allow(clippy::too_many_arguments)]
-async fn rejudge_plan(
-    llm: &dyn LlmBackend,
-    source: &dyn BarSource,
-    pipeline: &SnapshotPipeline,
-    cfg: &ReplayConfig,
-    guard_cfg: &GuardConfig,
-    planned_at: DateTime<Utc>,
-    plan: &crate::strategy::types::ConditionalPlan,
-    bar: &CandleBar,
-    offset: usize,
-) -> Result<PlanFollowup> {
-    let t2 = bar.timestamp + BarPeriod::M5.duration();
-    let account_state = AccountState {
-        triggered_plan: Some(TriggeredPlan {
-            planned_at: planned_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-            triggered_bar: bar.timestamp.format("%Y-%m-%d %H:%M").to_string(),
-            triggered_close: bar.close,
-            plan: plan.clone(),
-        }),
-        ..Default::default()
-    };
-    let bundle = build_snapshot_at(source, pipeline, &cfg.pair, t2, cfg.spread_pips, cfg.bars_per_tf, account_state).await?;
-    let prompt = PromptBuilder::new().with_lessons(cfg.lessons.clone()).build(&bundle.snapshot);
-    let decision = llm.infer(&prompt).await?;
-    let guard = guard::evaluate(&decision, &bundle.snapshot, &GuardContext { now: Some(t2), ..Default::default() }, guard_cfg).summary();
-    info!(%planned_at, %t2, action = ?decision.action, %guard, "replay plan triggered; re-judged");
-    Ok(PlanFollowup { t: t2.format("%Y-%m-%d %H:%M:%S").to_string(), offset, decision, guard_result: guard })
 }
 
 /// 時刻 `t` の直前に 5M 足が確定しているか。週末・休場中は同じ Snapshot で LLM を呼ぶだけになるので飛ばす。
@@ -431,17 +371,8 @@ pub fn rescore_run(db: &Arc<Mutex<Db>>, source_run: i64, exit: ExitRule, label: 
             serde_json::from_str(&row.decision_json).with_context(|| format!("decision_json at {}", row.t))?;
         let after = db.bars_from(&run.pair, BarPeriod::M5, t, max_bars + 400)?;
         let atr = atr_5m_at(&db, &run.pair, t)?;
-        let score = match row.followup_json.as_deref() {
-            // 再判断がある run は、再判断の時刻以降の足で採点し直す
-            Some(raw) => {
-                let f: PlanFollowup = serde_json::from_str(raw).with_context(|| format!("followup_json at {}", row.t))?;
-                let t2 = ts(&f.t)?;
-                let after2 = db.bars_from(&run.pair, BarPeriod::M5, t2, max_bars + 400)?;
-                let atr2 = atr_5m_at(&db, &run.pair, t2)?;
-                score_followup(&after2, &f.decision, f.guard_result == "PASS", f.offset, &ScoreConfig { pip_size, spread_pips, max_bars, exit, atr: atr2 })
-            }
-            None => score_decision(&after, &decision, &ScoreConfig { pip_size, spread_pips, max_bars, exit, atr }),
-        };
+        // 旧方式の run にある条件付きプランの再判断（followup_json）は、プランを廃止したので採点し直さない
+        let score = score_decision(&after, &decision, &ScoreConfig { pip_size, spread_pips, max_bars, exit, atr });
         db.insert_decision(&ReplayDecisionRow {
             run_id,
             outcome: score.outcome.as_str().to_string(),

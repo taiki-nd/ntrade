@@ -92,16 +92,12 @@ enum Cmd {
         /// 教訓（複数指定可）
         #[arg(long)]
         lesson: Vec<String>,
-        /// LLM モデル名（省略時は CLI デフォルト）
+        /// LLM モデル名（省略時は本番と同じ。`NTRADE_LLM_MODEL` か opus）
         #[arg(long)]
         model: Option<String>,
         /// 決済ルール（touch / touch:<SLバッファATR倍> / close:<SLバッファ>:<ハードSL>）
         #[arg(long, default_value = "touch", value_parser = parse_exit)]
         exit: ExitRule,
-        /// 条件付きプランを成立時の終値で機械的に執行したとみなして採点する（再判断を入れる前の旧方式）。
-        /// 省略時は本番と同じく、成立した足で LLM に判断し直させる
-        #[arg(long)]
-        mechanical_plans: bool,
     },
     /// 保存済み run の判断を、LLM を呼ばずに別の決済ルールで採点し直す（ルールごとに新しい run を作る）
     Rescore {
@@ -141,7 +137,12 @@ async fn main() -> Result<()> {
         Cmd::Fetch { pair, from, to, periods } => {
             let from = parse_date(&from)?;
             let to = to.map(|s| parse_date(&s)).transpose()?.unwrap_or_else(Utc::now);
-            let service = CTraderService::connect(CTraderConfig::from_env()?).await?;
+            // bot が Refresh Token で更新したトークンは SQLite にあり、.env の方は古くなっている
+            let mut cfg = CTraderConfig::from_env()?;
+            if let Some(tokens) = db.lock().unwrap().load_ctrader_tokens()? {
+                cfg = cfg.with_tokens(&tokens);
+            }
+            let service = CTraderService::connect(cfg).await?;
             for p in periods.split(',') {
                 let period = BarPeriod::parse(p.trim()).ok_or_else(|| anyhow!("unknown period {p}"))?;
                 let start = {
@@ -160,8 +161,9 @@ async fn main() -> Result<()> {
             let n = check_leak(db.clone(), &pair, samples, &PathBuf::from("charts")).await?;
             println!("check-leak OK: {n} snapshots generated with no future data");
         }
-        Cmd::Run { pair, from, to, step, limit, label, parallel, max_bars, spread, resume, lesson, model, exit, mechanical_plans } => {
-            let llm = Arc::new(LlmClient::new(LlmClientConfig { model, ..Default::default() }));
+        Cmd::Run { pair, from, to, step, limit, label, parallel, max_bars, spread, resume, lesson, model, exit } => {
+            let defaults = LlmClientConfig::default();
+            let llm = Arc::new(LlmClient::new(LlmClientConfig { model: model.or(defaults.model.clone()), ..defaults }));
             let cfg = ReplayConfig {
                 pair,
                 from: parse_date(&from)?,
@@ -176,7 +178,6 @@ async fn main() -> Result<()> {
                 chart_root: PathBuf::from("charts"),
                 lessons: lesson,
                 exit,
-                plan_rejudge: !mechanical_plans,
             };
             let guard = GuardConfig::load_or_default(DEFAULT_GUARD_CONFIG_PATH);
             let run_id = ReplayRunner::new(db.clone(), llm, cfg, guard).run(resume).await?;

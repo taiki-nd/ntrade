@@ -1,5 +1,6 @@
 import {
   AccountMetrics,
+  BalancePoint,
   BotState,
   CloseReason,
   CoTDetail,
@@ -184,6 +185,13 @@ export const tradingApi = {
    */
   async getStatus(): Promise<AccountMetrics> {
     return await request<AccountMetrics>("/api/status");
+  },
+
+  /**
+   * 残高の推移（古い順）。days を省略すると全期間
+   */
+  async getBalanceHistory(days?: number): Promise<ApiResponse<BalancePoint[]>> {
+    return await request<ApiResponse<BalancePoint[]>>(`/api/balance-history${days !== undefined ? `?days=${days}` : ""}`);
   },
 
   /**
@@ -380,19 +388,19 @@ export const tradingApi = {
     return await request<ApiResponse<ReplayCoverage[]>>("/api/replay/coverage");
   },
 
-  /** 判断サイクルを1回実行（Snapshot → LLM → ガード → 執行/プラン登録） */
+  /** 判断サイクルを1回実行（Snapshot → LLM → 注文・建玉の操作 → ガード → 予約注文） */
   async decideNow(pair?: string): Promise<ApiResponse<DecideResponse>> {
     return await request<ApiResponse<DecideResponse>>(`/api/decide${pairQuery(pair)}`, { method: "POST" });
   },
 
-  /** 保持中の条件付きプラン */
-  async getPlans(): Promise<ApiResponse<PendingPlan[]>> {
-    return await request<ApiResponse<PendingPlan[]>>("/api/plans");
+  /** ブローカーに置いてある、まだ約定していない予約注文 */
+  async getOrders(): Promise<ApiResponse<WorkingOrder[]>> {
+    return await request<ApiResponse<WorkingOrder[]>>("/api/orders");
   },
 
-  /** 条件付きプランを手動破棄 */
-  async discardPlan(id: string): Promise<ApiResponse<string>> {
-    return await request<ApiResponse<string>>(`/api/plans/${id}`, { method: "DELETE" });
+  /** 予約注文をブローカーで取り消す */
+  async cancelOrder(id: string): Promise<ApiResponse<string>> {
+    return await request<ApiResponse<string>>(`/api/orders/${id}`, { method: "DELETE" });
   },
 
   /** エンジンの稼働設定（読み取り専用） */
@@ -415,16 +423,6 @@ export const tradingApi = {
     return await request<ApiResponse<SymbolCatalogEntry[]>>(`/api/symbols${q ? `?q=${encodeURIComponent(q)}` : ""}`);
   },
 
-  /** 判断に渡すファンダメンタルズの事実（銘柄ごと） */
-  async getFundamentals(pair?: string): Promise<ApiResponse<FundamentalFacts>> {
-    return await request<ApiResponse<FundamentalFacts>>(`/api/fundamentals${pairQuery(pair)}`);
-  },
-
-  /** 情報源ごとの取得状況 */
-  async getFundamentalsStatus(): Promise<ApiResponse<SourceStatus[]>> {
-    return await request<ApiResponse<SourceStatus[]>>("/api/fundamentals/status");
-  },
-
   /** 取引設定を保存（SQLite）。次の判断サイクルから反映 */
   async saveSettings(settings: TradingSettings): Promise<ApiResponse<TradingSettings>> {
     return await request<ApiResponse<TradingSettings>>("/api/settings", {
@@ -443,10 +441,8 @@ function pairQuery(pair?: string): string {
 export interface TradingSettings {
   pairs: string[];
   barDelaySecs: number;
-  /** LLM に判断させる間隔（分。5 の倍数、UTC 0:00 起点）。プランと終値判定は 5M 足ごと */
+  /** LLM に判断させる間隔（分。5 の倍数、UTC 0:00 起点）。終値判定の損切りは 5M 足ごと */
   decisionIntervalMinutes: number;
-  /** 重要指標の発表直後に、判断間隔を待たずに判断する */
-  eventDecisions: boolean;
   guard: GuardConfig;
 }
 
@@ -462,62 +458,6 @@ export interface SymbolCatalogEntry {
   enabled: boolean;
 }
 
-export interface FundamentalObservation {
-  date: string;
-  value: number;
-}
-
-/** Rust 側 FundamentalFacts（snake_case のまま） */
-export interface FundamentalFacts {
-  symbol: string;
-  as_of: string;
-  profile: string | null;
-  series: {
-    id: string;
-    title: string;
-    units: string | null;
-    source: string;
-    latest: FundamentalObservation | null;
-    previous: FundamentalObservation | null;
-    about_1m_ago: FundamentalObservation | null;
-    about_3m_ago: FundamentalObservation | null;
-    about_12m_ago: FundamentalObservation | null;
-  }[];
-  positioning_cftc: {
-    code: string;
-    market: string;
-    trader_group: string;
-    weeks: { report_date: string; long: number; short: number; net: number; open_interest: number | null }[];
-    net_52w_high: number | null;
-    net_52w_low: number | null;
-  }[];
-  economic_calendar: {
-    time_utc: string;
-    currency: string;
-    title: string;
-    impact?: string;
-    forecast?: string;
-    previous: string | null;
-    released: boolean;
-  }[];
-  official_releases: { source: string; published_utc: string; title: string }[];
-  related_markets: {
-    symbol: string;
-    last_daily_close: number;
-    last_daily_bar: string;
-    change_1d_pct: number | null;
-    change_5d_pct: number | null;
-    change_20d_pct: number | null;
-  }[];
-  unavailable: SourceStatus[];
-}
-
-export interface SourceStatus {
-  source: string;
-  fetched_at: string | null;
-  error: string | null;
-}
-
 export interface RuntimeInfo {
   orderMode: "paper" | "live";
   schedulerEnabled: boolean;
@@ -527,6 +467,8 @@ export interface RuntimeInfo {
   guardConfigPath: string;
   dbPath: string;
   llmCli: string;
+  /** claude --model に渡すモデル（null なら CLI の既定） */
+  llmModel: string | null;
   llmTimeoutSecs: number;
   ctraderTokenPresent: boolean;
   ctraderRefreshTokenPresent: boolean;
@@ -548,6 +490,7 @@ export interface GuardConfig {
   max_positions_per_pair: number;
   max_positions_total: number;
   daily_loss_limit_pct: number;
+  /** 予約注文の有効期限の上限（時間） */
   plan_max_hours: number;
   fixed_volume_lots: number;
   risk_pct: number | null;
@@ -567,25 +510,23 @@ export interface GuardConfig {
   hard_stop_atr: number;
 }
 
-export interface ConditionalPlan {
-  wait_for: string;
-  then_action: "BUY" | "SELL" | "HOLD";
-  invalidate_if: string;
-  expires_at: string;
-  trigger_price: number | null;
-  trigger_condition: "CLOSE_ABOVE" | "CLOSE_BELOW" | null;
-  invalidate_price: number | null;
-  invalidate_condition: "CLOSE_ABOVE" | "CLOSE_BELOW" | null;
-  stop_loss: number | null;
-  take_profit: number | null;
-}
-
-export interface PendingPlan {
+/** ブローカーに置いてある予約注文（Rust 側 WorkingOrder） */
+export interface WorkingOrder {
   id: string;
-  pair: string;
-  created_at: string;
-  cot_log_id: string | null;
-  plan: ConditionalPlan;
+  symbol: string;
+  side: "BUY" | "SELL";
+  kind: "LIMIT" | "STOP";
+  volumeLots: number;
+  entryPrice: number;
+  /** ブローカーに置いた SL（終値判定モードならハードSL） */
+  stopLoss: number;
+  takeProfit: number;
+  /** 終値判定モードの損切りライン（LLM の SL） */
+  closeStop?: number;
+  createdAt: string;
+  expiresAt: string;
+  invalidationReason: string;
+  cotLogId?: string;
 }
 
 export interface GuardCheck {
@@ -602,9 +543,11 @@ export interface DecideResponse {
     reasoning: string;
   };
   guard: { passed: boolean; failed: string[]; checks: GuardCheck[] };
+  /** 新しい予約注文を置いたか */
   executed: boolean;
-  plan_id: string | null;
-  plan_events: { kind: string; plan_id: string }[];
+  order_id: string | null;
+  /** 既存の注文・建玉への操作の結果（1 操作 1 行） */
+  manage_results: string[];
   chart_dir: string;
 }
 
@@ -646,8 +589,10 @@ export interface ReplayReport {
   rejected: ReplayBucket;
   unobserved_rate: number;
   hold_rate: number;
-  plan_rate: number;
-  plan_triggered: number;
+  /** 予約注文を出した判断の割合 */
+  order_rate: number;
+  orders_filled: number;
+  orders_expired: number;
   conflicts_empty_rate: number;
 }
 

@@ -9,8 +9,9 @@ import { ChartPreview } from "@/components/trading/ChartPreview";
 import { TradeHistoryTable } from "@/components/trading/TradeHistoryTable";
 import { LessonsManager } from "@/components/trading/LessonsManager";
 import { ReplayViewer } from "@/components/trading/ReplayViewer";
-import { PlanMonitor } from "@/components/trading/PlanMonitor";
-import { FundamentalsPanel } from "@/components/trading/FundamentalsPanel";
+import { OrderMonitor } from "@/components/trading/OrderMonitor";
+import { BalanceChart } from "@/components/trading/BalanceChart";
+import { DecideNowButton } from "@/components/trading/DecideNowButton";
 import { Tabs, TabsContent } from "@/components/ui/tabs";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -35,10 +36,8 @@ import { PlugZap } from "lucide-react";
 
 type EngineStatus = "connecting" | "online" | "offline";
 
-const TAB_IDS = ["overview", "cot", "chart", "fundamentals", "trades", "lessons", "replay"];
+const TAB_IDS = ["overview", "cot", "chart", "trades", "lessons", "replay"];
 
-/** 概要タブに出す直近件数 */
-const RECENT_COUNT = 3;
 const COT_PAGE_SIZE = 30;
 const TRADE_PAGE_SIZE = 20;
 
@@ -69,9 +68,6 @@ export default function TradingDashboard() {
   const [engineStatus, setEngineStatus] = React.useState<EngineStatus>("connecting");
   const [metrics, setMetrics] = React.useState<AccountMetrics | null>(null);
   const [positions, setPositions] = React.useState<Position[]>([]);
-  // 概要タブ用の直近分と、各タブのページ分を別々に持つ
-  const [recentTrades, setRecentTrades] = React.useState<TradeHistory[]>([]);
-  const [recentCotLogs, setRecentCotLogs] = React.useState<CoTLog[]>([]);
   const [tradePage, setTradePage] = React.useState(1);
   const [tradesPage, setTradesPage] = React.useState<Page<TradeHistory>>(emptyPage);
   const [cotPage, setCotPage] = React.useState(1);
@@ -85,6 +81,8 @@ export default function TradingDashboard() {
   // 銘柄プルダウンの選択肢（エンジンの稼働設定から取得）
   const [pairs, setPairs] = React.useState<string[]>([]);
   const [lessons, setLessons] = React.useState<LessonLearned[]>([]);
+  // 判断・決済の直後に予約注文の一覧を取り直させる
+  const [ordersKey, setOrdersKey] = React.useState(0);
   // 表示するビューは URL ハッシュで決まる（サイドバーの `/#cot` などから切り替える）
   const hash = useHash();
   const activeTab = TAB_IDS.includes(hash) ? hash : "overview";
@@ -101,20 +99,6 @@ export default function TradingDashboard() {
     }
   }, []);
 
-  // 概要タブの「直近◯件」
-  const fetchRecent = React.useCallback(async () => {
-    try {
-      const [rtRes, rcRes] = await Promise.all([
-        tradingApi.getTrades({ limit: RECENT_COUNT }),
-        tradingApi.getCoTLogs({ limit: RECENT_COUNT }),
-      ]);
-      if (rtRes.success && rtRes.data) setRecentTrades(rtRes.data.items);
-      if (rcRes.success && rcRes.data) setRecentCotLogs(rcRes.data.items);
-    } catch {
-      // 疎通エラーは fetchLive 側で表示するのでここでは握りつぶす
-    }
-  }, []);
-
   // 約定履歴タブの一覧（ページ・絞り込み条件が変われば即時取得し直す）
   const fetchTrades = React.useCallback(async () => {
     try {
@@ -125,7 +109,7 @@ export default function TradingDashboard() {
       });
       if (res.success && res.data) setTradesPage(res.data);
     } catch {
-      // 同上
+      // 疎通エラーは fetchLive 側で表示するのでここでは握りつぶす
     }
   }, [tradePage, tradeFilterDebounced]);
 
@@ -156,13 +140,13 @@ export default function TradingDashboard() {
   // 手動リフレッシュや発注・決済の直後に、常時更新分と表示中タブの分だけを取り直す
   const refresh = React.useCallback(async () => {
     const byTab: Record<string, () => Promise<void>> = {
-      overview: fetchRecent,
       trades: fetchTrades,
       cot: fetchCotLogs,
       lessons: fetchLessons,
     };
+    setOrdersKey((k) => k + 1);
     await Promise.all([fetchLive(), byTab[activeTab]?.()]);
-  }, [activeTab, fetchLive, fetchRecent, fetchTrades, fetchCotLogs, fetchLessons]);
+  }, [activeTab, fetchLive, fetchTrades, fetchCotLogs, fetchLessons]);
 
   // 入力が落ち着いてから検索を実行する
   React.useEffect(() => {
@@ -188,13 +172,13 @@ export default function TradingDashboard() {
   // タブに関係なく常時ポーリングするのはこれだけ
   usePolling(fetchLive, LIVE_INTERVAL, true);
   // 一覧系は表示中のタブの分だけを、ゆるめの間隔で更新する
-  usePolling(fetchRecent, LIST_INTERVAL, activeTab === "overview");
   usePolling(fetchTrades, LIST_INTERVAL, activeTab === "trades");
   usePolling(fetchCotLogs, LIST_INTERVAL, activeTab === "cot");
 
   React.useEffect(() => {
     if (activeTab !== "lessons") return;
-    fetchLessons();
+    const id = setTimeout(fetchLessons, 0);
+    return () => clearTimeout(id);
   }, [activeTab, fetchLessons]);
 
   // ボット稼働トグル切り替え
@@ -207,11 +191,11 @@ export default function TradingDashboard() {
       }
       if (newState === "running") {
         toast.success("自動売買エンジンの稼働を開始しました", {
-          description: "5分足確定ごとにLLM推論とリスクチェックが実行されます。",
+          description: "判断間隔ごとに LLM が予約注文と建玉を見直します。",
         });
       } else {
         toast.warning("自動売買を一時停止しました", {
-          description: "新規発注は停止されます（既存ポジションはブローカー側SL/TPで継続保護）。",
+          description: "LLM の判断と新規発注を止めます。置いてある予約注文はブローカーに残り、約定しうるので、不要なら取り消してください。",
         });
       }
     } catch (err) {
@@ -226,7 +210,7 @@ export default function TradingDashboard() {
     try {
       const res = await tradingApi.emergencyStop();
       toast.error("緊急全決済を執行しました", {
-        description: res.data || res.message || "保有中のポジションを成行決済し、自動売買を停止しました。",
+        description: res.data || res.message || "予約注文を取り消し、保有中のポジションを成行決済して、自動売買を停止しました。",
       });
     } catch (err) {
       toast.error("緊急全決済の送信に失敗しました", { description: errorMessage(err) });
@@ -295,7 +279,7 @@ export default function TradingDashboard() {
         const created = res.data;
         setLessons((prev) => [created, ...prev]);
         toast.success("新しい教訓ルールを登録しました", {
-          description: "次回のLLM推論プロンプトに禁止・注意事項として注入されます。",
+          description: "有効にした教訓は、次の判断から注意して読む観点としてプロンプトに入ります。",
         });
       } else {
         toast.error("教訓ルールの登録に失敗しました", { description: res.message });
@@ -351,11 +335,6 @@ export default function TradingDashboard() {
 
         {/* メインビュータブ */}
         <Tabs value={activeTab} className="space-y-4">
-          {/* ファンダメンタルズの事実 タブ */}
-          <TabsContent value="fundamentals" className="space-y-4">
-            {activeTab === "fundamentals" && <FundamentalsPanel />}
-          </TabsContent>
-
           {/* リプレイ結果 タブ */}
           <TabsContent value="replay" className="space-y-4">
             <ReplayViewer />
@@ -363,30 +342,19 @@ export default function TradingDashboard() {
 
           {/* 全体概要タブ */}
           <TabsContent value="overview" className="space-y-4">
-            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-              {/* 左カラム: ポジション + チャート (7/12) */}
-              <div className="lg:col-span-7 space-y-6">
-                <PositionTable
-                  positions={positions}
-                  onClosePosition={handleClosePosition}
-                />
-                <ChartPreview />
-              </div>
-
-              {/* 右カラム: 条件付きプラン + LLM思考ログ (5/12) */}
-              <div className="lg:col-span-5 space-y-6">
-                <PlanMonitor onDecided={refresh} />
-                <CoTViewer logs={recentCotLogs} />
-                <TradeHistoryTable trades={recentTrades} />
-              </div>
+            {/* 残高の推移と、口座の中身（建玉・予約注文） */}
+            <div className="space-y-6">
+              <BalanceChart refreshKey={ordersKey} />
+              <PositionTable positions={positions} onClosePosition={handleClosePosition} />
+              <OrderMonitor refreshKey={ordersKey} onChanged={refresh} />
             </div>
-
           </TabsContent>
 
           {/* LLM思考ログ タブ */}
           <TabsContent value="cot" className="space-y-4">
             <CoTViewer
               logs={cotLogsPage.items}
+              actions={<DecideNowButton onDecided={refresh} />}
               pagination={{
                 page: cotPage,
                 pageSize: COT_PAGE_SIZE,
@@ -434,6 +402,7 @@ export default function TradingDashboard() {
           <TabsContent value="lessons" className="space-y-4">
             <LessonsManager
               lessons={lessons}
+              pairs={pairs}
               onToggleLesson={handleToggleLesson}
               onAddLesson={handleAddLesson}
               onDeleteLesson={handleDeleteLesson}

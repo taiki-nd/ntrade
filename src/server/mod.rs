@@ -24,6 +24,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/health", get(health_check))
         // 1. 全体ステータス & メトリクス
         .route("/api/status", get(handlers::status::get_status))
+        .route("/api/balance-history", get(handlers::status::get_balance_history))
         // 2. ボット制御 (稼働/停止/緊急全決済)
         .route("/api/control/state", post(handlers::control::update_state))
         .route("/api/control/emergency-stop", post(handlers::control::emergency_stop))
@@ -50,21 +51,17 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/replay/runs", get(handlers::replay::list_runs))
         .route("/api/replay/runs/{id}", get(handlers::replay::run_detail))
         .route("/api/replay/coverage", get(handlers::replay::coverage))
-        // 9. 判断サイクル（Snapshot → LLM → ガード → 執行/プラン登録）と条件付きプラン
+        // 9. 判断サイクル（Snapshot → LLM → 注文・建玉の操作 → ガード → 予約注文）と予約注文
         .route("/api/decide", post(handlers::decide::decide_now))
-        .route("/api/plans", get(handlers::plans::list_plans))
-        .route("/api/plans/{id}", delete(handlers::plans::discard_plan))
-        .route("/api/guard/config", get(handlers::plans::guard_config))
+        .route("/api/orders", get(handlers::orders::list_orders))
+        .route("/api/orders/{id}", delete(handlers::orders::cancel_order))
+        .route("/api/guard/config", get(handlers::orders::guard_config))
         // 10. 取引設定（対象ペア・待ち秒数・事後ガード）。SQLite に保存し再起動なしで反映
         .route("/api/settings", get(handlers::settings::get_settings).put(handlers::settings::update_settings))
-        .route("/api/runtime", get(handlers::plans::runtime_info))
+        .route("/api/runtime", get(handlers::orders::runtime_info))
         // 11. 銘柄一覧（ブローカーの全銘柄。資産クラス付き）と銘柄仕様
         .route("/api/symbols", get(handlers::symbols::list_symbols))
         .route("/api/symbols/spec", get(handlers::symbols::symbol_spec))
-        // 12. ファンダメンタルズの事実（判断に渡すもの）と情報源の取得状況
-        .route("/api/fundamentals", get(handlers::fundamentals::get_facts))
-        .route("/api/fundamentals/status", get(handlers::fundamentals::get_status))
-        .route("/api/fundamentals/refresh", post(handlers::fundamentals::refresh))
         // 8. cTrader OAuth 認証連携
         .route("/api/auth/ctrader/url", get(handlers::auth::get_oauth_url))
         .route("/api/auth/ctrader/exchange", post(handlers::auth::exchange_oauth_code))

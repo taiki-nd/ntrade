@@ -70,7 +70,7 @@ export default function SettingsPage() {
       <div className="space-y-6 max-w-4xl">
         <div className="flex items-center justify-between">
           <p className="text-sm text-muted-foreground">
-            対象ペアとガードはこの画面の「取引設定」で変更できます（SQLite に保存・再起動不要）。それ以外は環境変数（<code className="font-mono text-xs">.env</code>）で設定し、変更後はエンジンの再起動が必要です。
+            対象銘柄とガードはこの画面の「取引設定」で変更できます（SQLite に保存・再起動不要）。それ以外は環境変数（<code className="font-mono text-xs">.env</code>）で設定し、変更後はエンジンの再起動が必要です。
           </p>
           <Button variant="outline" size="sm" onClick={load} disabled={loading} className="h-8 gap-1.5 text-xs">
             {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
@@ -108,9 +108,12 @@ export default function SettingsPage() {
                     }
                   />
                   <Row label="スケジューラ (NTRADE_SCHEDULER)" value={runtime.schedulerEnabled ? "有効（5分足確定ごと）" : "無効"} />
-                  <Row label="対象ペア（並行に判断）" value={runtime.pairs.join(", ")} />
+                  <Row label="対象銘柄（並行に判断）" value={runtime.pairs.join(", ")} />
                   <Row label="足確定後の待ち秒数" value={`${runtime.barDelaySecs} 秒`} />
-                  <Row label="LLM CLI" value={`${runtime.llmCli} (timeout ${runtime.llmTimeoutSecs}s)`} />
+                  <Row
+                    label="LLM（NTRADE_LLM_MODEL）"
+                    value={`${runtime.llmCli} -p --model ${runtime.llmModel ?? "（CLI の既定）"}（タイムアウト ${runtime.llmTimeoutSecs} 秒）`}
+                  />
                   <Row label="取引設定の保存先" value={runtime.guardConfigPath} />
                   <Row label="SQLite" value={runtime.dbPath} />
                   <Row label=".env" value={runtime.envFilePresent ? "あり" : "なし（.env.example をコピーしてください）"} />

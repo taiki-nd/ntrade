@@ -16,10 +16,10 @@ import {
 import { toast } from "sonner";
 
 const TF_LABEL: Record<ChartTimeframe, string> = {
-  "4H": "4H 環境認識",
-  "1H": "1H スイング構造",
-  "15M": "15M セットアップ",
-  "5M": "5M 攻防",
+  "4H": "4H",
+  "1H": "1H",
+  "15M": "15M",
+  "5M": "5M",
 };
 
 function fmt(v: number | null | undefined, digits = 1): string {
@@ -130,10 +130,10 @@ export function ChartPreview() {
         <div className="space-y-1">
           <CardTitle className="text-base font-semibold flex items-center gap-2">
             <LineChart className="h-5 w-5 text-primary" />
-            <span>Snapshot: LLM が見ているチャート</span>
+            <span>チャート</span>
           </CardTitle>
           <CardDescription className="text-xs">
-            時間足ごとに1枚。ローソク足・EMA20/50・価格ラベル付き水平線のみ（判定は描かない）
+            直近の判断時点の足と、LLM に数値で渡している水準（前日・当日高安、スイング、キリ番）。LLM 自身は画像を見ていません
           </CardDescription>
         </div>
 

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// 取引アクション
+/// 取引アクション（新規の予約注文を置くか）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum Action {
@@ -9,117 +9,105 @@ pub enum Action {
     Hold,
 }
 
-/// 注文種別
+/// 注文種別。新規は予約注文（LIMIT / STOP）だけを出す。
+/// LLM の判断には数十秒かかるので、成行では判断した価格から離れたところで約定してしまう。
+/// 価格を指定してブローカーに置いておけば、判断の遅れは「注文を置くまでの時間」になるだけで済む
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum EntryType {
-    Market,
+    /// 指値: 今より有利な価格まで戻ったら約定（押し目買い・戻り売り）
     Limit,
-    /// 今は入らず、`conditional_plan` の条件成立を待つ
+    /// 逆指値: その価格を抜けたら約定（ブレイクに乗る）
+    Stop,
+    /// 旧: 成行。保存済みのリプレイ結果を読むためだけに残す
+    Market,
+    /// 旧: 条件付きプラン。同上
     Conditional,
 }
 
-/// LLM の相場解釈（ファンダメンタルズ → 価格の位置 → 無効化 → 反対材料）
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// LLM の相場解釈（流れ → 価格の位置 → 無効化 → 反対材料）
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Analysis {
-    /// ファンダメンタルズの事実から読んだ方向感と、その根拠にした事実・指標発表のリスク
+    /// 上位足（1H/15M）の流れと、直近（5M）の値動きの構造
     #[serde(default)]
-    pub fundamental_view: String,
-    /// 価格の位置（前日高安・スイング・ATR から見た現在値）と、エントリー・利確の価格の根拠
+    pub market_structure: String,
+    /// エントリー・利確の価格の根拠（どの水準を使ったか）
     #[serde(default)]
     pub price_levels: String,
-    /// 旧: 4H/1H の環境認識（チャート画像の読み）。プライスアクション判断の廃止で今は出力しない
+    /// どこを抜けたらこの読みは間違いになるか（SLの根拠）
     #[serde(default)]
-    pub macro_context: String,
-    /// 旧: 15M/5M の注文の攻防（チャート画像の読み）。今は出力しない
-    #[serde(default)]
-    pub order_flow: String,
-    /// どこを抜けたらこの相場観は間違いになるか（SLの根拠）
     pub invalidation: String,
     /// シナリオに反する材料（必ず1つ以上）
+    #[serde(default)]
     pub conflicts: String,
+    /// 旧: ファンダメンタルズの読み。保存済みの判断を読むためだけに残す
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub fundamental_view: String,
 }
 
-/// 機械的に評価できる価格条件の種別（5M または 15M の確定足の終値で判定）
+/// 既存の予約注文・建玉に対する操作の対象
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum PriceCondition {
-    CloseAbove,
-    CloseBelow,
+#[serde(rename_all = "UPPERCASE")]
+pub enum ManageTarget {
+    Order,
+    Position,
 }
 
-/// 今は入らないが条件が揃えば入る、という条件付きプラン
-///
-/// `wait_for` / `invalidate_if` は人間向けの説明。プログラム（Executor / Replay）は
-/// `trigger_*` / `invalidate_*` の構造化フィールドだけを評価する。
+/// 既存の予約注文・建玉に対する操作
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum ManageOp {
+    /// 予約注文の取消
+    Cancel,
+    /// 建玉の成行決済
+    Close,
+    /// 価格・SL/TP・期限の変更（None の項目は変えない）
+    Modify,
+}
+
+/// 既存の予約注文・建玉をどうするか。ここに挙げなかったものはそのまま残す
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ConditionalPlan {
-    /// 成立条件の説明（例: "5Mが154.24を実体で上抜けて確定"）
-    pub wait_for: String,
-    /// 成立時のアクション
-    pub then_action: Action,
-    /// プランを破棄する条件の説明
-    pub invalidate_if: String,
-    /// 期限（"YYYY-MM-DD HH:MM:SS UTC"）
-    pub expires_at: String,
-    /// 成立判定: 5M確定足の終値が trigger_price を trigger_condition の向きに抜けたら成立
-    #[serde(default)]
-    pub trigger_price: Option<f64>,
-    #[serde(default)]
-    pub trigger_condition: Option<PriceCondition>,
-    /// 破棄判定: 5M確定足の終値が invalidate_price を invalidate_condition の向きに抜けたら破棄
-    #[serde(default)]
-    pub invalidate_price: Option<f64>,
-    #[serde(default)]
-    pub invalidate_condition: Option<PriceCondition>,
-    /// 成立時のSL/TP
-    #[serde(default)]
-    pub stop_loss: Option<f64>,
-    #[serde(default)]
-    pub take_profit: Option<f64>,
-}
-
-impl ConditionalPlan {
-    /// プログラムが評価できる形になっているか
-    pub fn is_structured(&self) -> bool {
-        self.trigger_price.is_some()
-            && self.trigger_condition.is_some()
-            && self.invalidate_price.is_some()
-            && self.invalidate_condition.is_some()
-    }
-}
-
-/// 旧: LLM が画像で確認した各時間足の最新足時刻。チャート画像を渡さなくなったので今は出力させない
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct Observed {
-    #[serde(default)]
-    pub latest_bar_4h: Option<String>,
-    #[serde(default)]
-    pub latest_bar_1h: Option<String>,
-    #[serde(default)]
-    pub latest_bar_15m: Option<String>,
-    #[serde(default)]
-    pub latest_bar_5m: Option<String>,
-}
-
-/// LLM が返す意思決定
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TradeDecision {
-    pub action: Action,
-    pub confidence: f64,
-    #[serde(default)]
-    pub entry_type: Option<EntryType>,
+pub struct ManageAction {
+    pub target: ManageTarget,
+    /// `account_state` に出ている注文 ID / 建玉 ID
+    pub id: String,
+    pub op: ManageOp,
+    /// 予約注文の新しい価格（MODIFY のときだけ）
     #[serde(default)]
     pub entry_price: Option<f64>,
     #[serde(default)]
     pub stop_loss: Option<f64>,
     #[serde(default)]
     pub take_profit: Option<f64>,
+    /// 予約注文の新しい期限（今から何分後か。MODIFY のときだけ）
+    #[serde(default)]
+    pub expiry_minutes: Option<u32>,
+    #[serde(default)]
+    pub reason: String,
+}
+
+/// LLM が返す意思決定
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TradeDecision {
+    /// 新しい予約注文を置くなら BUY / SELL、置かないなら HOLD
+    pub action: Action,
+    pub confidence: f64,
+    #[serde(default)]
+    pub entry_type: Option<EntryType>,
+    /// 予約注文の価格
+    #[serde(default)]
+    pub entry_price: Option<f64>,
+    #[serde(default)]
+    pub stop_loss: Option<f64>,
+    #[serde(default)]
+    pub take_profit: Option<f64>,
+    /// 予約注文の有効期限（今から何分後か）。期限までに約定しなければブローカーが取り消す
+    #[serde(default)]
+    pub expiry_minutes: Option<u32>,
     pub analysis: Analysis,
+    /// 既存の予約注文・建玉への操作
     #[serde(default)]
-    pub conditional_plan: Option<ConditionalPlan>,
-    #[serde(default)]
-    pub observed: Observed,
+    pub manage: Vec<ManageAction>,
     pub reasoning: String,
 }
 
@@ -129,7 +117,7 @@ impl TradeDecision {
         self.confidence = ((self.confidence * 10.0).round() / 10.0).clamp(0.0, 1.0);
     }
 
-    /// 安全側のフォールバック（HOLD）
+    /// 安全側のフォールバック（HOLD・既存の注文と建玉はそのまま）
     pub fn fallback_hold(reason: impl Into<String>) -> Self {
         let reason = reason.into();
         Self {
@@ -139,70 +127,95 @@ impl TradeDecision {
             entry_price: None,
             stop_loss: None,
             take_profit: None,
+            expiry_minutes: None,
             analysis: Analysis {
-                fundamental_view: "N/A (system fallback)".into(),
+                market_structure: "N/A (system fallback)".into(),
                 price_levels: "N/A (system fallback)".into(),
-                macro_context: String::new(),
-                order_flow: String::new(),
                 invalidation: "N/A".into(),
                 conflicts: "N/A".into(),
+                fundamental_view: String::new(),
             },
-            conditional_plan: None,
-            observed: Observed::default(),
+            manage: Vec::new(),
             reasoning: format!("FALLBACK_HOLD: {reason}"),
         }
     }
 
     /// `claude -p --json-schema` に渡す JSON Schema
     pub fn json_schema() -> serde_json::Value {
+        let price = serde_json::json!({ "type": ["number", "null"] });
         serde_json::json!({
             "type": "object",
             "additionalProperties": false,
-            "required": ["action", "confidence", "analysis", "reasoning"],
+            "required": ["action", "confidence", "analysis", "manage", "reasoning"],
             "properties": {
                 "action": { "type": "string", "enum": ["BUY", "SELL", "HOLD"] },
                 "confidence": {
                     "type": "number",
                     "minimum": 0,
                     "maximum": 1,
-                    "description": "相場の優位性・エントリー機会に対する確信度（0.0〜1.0、0.1刻み）"
+                    "description": "新しい予約注文のシナリオに対する確信度（0.0〜1.0、0.1刻み）"
                 },
-                "entry_type": { "type": ["string", "null"], "enum": ["MARKET", "LIMIT", "CONDITIONAL", null] },
-                "entry_price": { "type": ["number", "null"] },
-                "stop_loss": { "type": ["number", "null"] },
-                "take_profit": { "type": ["number", "null"] },
+                "entry_type": { "type": ["string", "null"], "enum": ["LIMIT", "STOP", null] },
+                "entry_price": price,
+                "stop_loss": price,
+                "take_profit": price,
+                "expiry_minutes": { "type": ["integer", "null"], "minimum": 1 },
                 "analysis": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": ["fundamental_view", "price_levels", "invalidation", "conflicts"],
+                    "required": ["market_structure", "price_levels", "invalidation", "conflicts"],
                     "properties": {
-                        "fundamental_view": { "type": "string" },
+                        "market_structure": { "type": "string" },
                         "price_levels": { "type": "string" },
                         "invalidation": { "type": "string" },
                         "conflicts": { "type": "string" }
                     }
                 },
-                "conditional_plan": {
-                    "type": ["object", "null"],
-                    "additionalProperties": false,
-                    "required": ["wait_for", "then_action", "invalidate_if", "expires_at",
-                                 "trigger_price", "trigger_condition", "invalidate_price", "invalidate_condition",
-                                 "stop_loss", "take_profit"],
-                    "properties": {
-                        "wait_for": { "type": "string" },
-                        "then_action": { "type": "string", "enum": ["BUY", "SELL", "HOLD"] },
-                        "invalidate_if": { "type": "string" },
-                        "expires_at": { "type": "string" },
-                        "trigger_price": { "type": ["number", "null"] },
-                        "trigger_condition": { "type": ["string", "null"], "enum": ["CLOSE_ABOVE", "CLOSE_BELOW", null] },
-                        "invalidate_price": { "type": ["number", "null"] },
-                        "invalidate_condition": { "type": ["string", "null"], "enum": ["CLOSE_ABOVE", "CLOSE_BELOW", null] },
-                        "stop_loss": { "type": ["number", "null"] },
-                        "take_profit": { "type": ["number", "null"] }
+                "manage": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["target", "id", "op", "reason"],
+                        "properties": {
+                            "target": { "type": "string", "enum": ["ORDER", "POSITION"] },
+                            "id": { "type": "string" },
+                            "op": { "type": "string", "enum": ["CANCEL", "CLOSE", "MODIFY"] },
+                            "entry_price": price,
+                            "stop_loss": price,
+                            "take_profit": price,
+                            "expiry_minutes": { "type": ["integer", "null"], "minimum": 1 },
+                            "reason": { "type": "string" }
+                        }
                     }
                 },
                 "reasoning": { "type": "string" }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_saved_decisions_still_deserialize() {
+        // 旧スキーマ（ファンダメンタルズ・条件付きプラン・観測整合）で保存したリプレイ結果
+        let old = r#"{"action":"HOLD","confidence":0.4,"entry_type":"CONDITIONAL",
+            "analysis":{"fundamental_view":"f","price_levels":"p","invalidation":"i","conflicts":"c"},
+            "conditional_plan":{"wait_for":"w"},"observed":{},"reasoning":"r"}"#;
+        let d: TradeDecision = serde_json::from_str(old).unwrap();
+        assert_eq!(d.entry_type, Some(EntryType::Conditional));
+        assert_eq!(d.analysis.fundamental_view, "f");
+        assert!(d.manage.is_empty());
+    }
+
+    #[test]
+    fn schema_only_offers_pending_entries() {
+        let s = TradeDecision::json_schema();
+        let kinds = s["properties"]["entry_type"]["enum"].as_array().unwrap();
+        assert!(!kinds.iter().any(|k| k == "MARKET" || k == "CONDITIONAL"));
+        assert_eq!(s["properties"]["manage"]["items"]["properties"]["op"]["enum"].as_array().unwrap().len(), 3);
     }
 }

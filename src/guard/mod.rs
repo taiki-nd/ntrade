@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::snapshot::{AtrTimeframe, MarketSnapshot};
-use crate::strategy::types::{Action, ConditionalPlan, TradeDecision};
+use crate::strategy::types::{Action, EntryType, ManageAction, ManageOp, TradeDecision};
 
 pub const DEFAULT_GUARD_CONFIG_PATH: &str = "config/guard.toml";
 
@@ -55,6 +55,7 @@ pub struct GuardConfig {
     pub max_positions_per_pair: usize,
     pub max_positions_total: usize,
     pub daily_loss_limit_pct: f64,
+    /// 予約注文の有効期限の上限（時間）。旧: 条件付きプランの期限の上限（保存済みの設定を読めるよう名前は据え置き）
     pub plan_max_hours: f64,
     pub fixed_volume_lots: f64,
     pub risk_pct: Option<f64>,
@@ -192,6 +193,9 @@ impl GuardConfig {
 pub struct GuardContext {
     pub open_positions_pair: usize,
     pub open_positions_total: usize,
+    /// まだ約定していない予約注文。約定すれば建玉になるので、建玉数の上限に含めて数える
+    pub working_orders_pair: usize,
+    pub working_orders_total: usize,
     /// 当日の確定損益（資金比 %、損失は負）
     pub daily_pnl_pct: f64,
     /// 評価時刻（None なら Snapshot の時刻）
@@ -245,17 +249,12 @@ fn snapshot_time(snapshot: &MarketSnapshot) -> Option<DateTime<Utc>> {
     parse_utc(&snapshot.timestamp)
 }
 
-/// 全ガードを評価する。決定の種類（BUY/SELL/HOLD/プラン付きHOLD）に応じて適用範囲が変わる。
+/// 新規の予約注文を検証する（HOLD なら何も見ない）。既存の注文・建玉の操作は `manage_problem` で見る
 pub fn evaluate(decision: &TradeDecision, snapshot: &MarketSnapshot, ctx: &GuardContext, cfg: &GuardConfig) -> GuardVerdict {
     let mut c = Checker { checks: Vec::new() };
     let now = ctx.now.or_else(|| snapshot_time(snapshot)).unwrap_or_else(Utc::now);
 
-    // 観測整合（LLM が読んだチャート画像の最新足と Snapshot の照合）は、画像を渡さなくなったので行わない
-    let is_trade = matches!(decision.action, Action::Buy | Action::Sell);
-    let plan = decision.conditional_plan.as_ref().filter(|p| p.then_action != Action::Hold);
-
-    // 1. 即時エントリーの検証
-    if is_trade {
+    if matches!(decision.action, Action::Buy | Action::Sell) {
         c.add(
             "CONFIDENCE_LOW",
             decision.confidence >= cfg.min_confidence,
@@ -264,18 +263,73 @@ pub fn evaluate(decision: &TradeDecision, snapshot: &MarketSnapshot, ctx: &Guard
         match (decision.entry_price, decision.stop_loss, decision.take_profit) {
             (Some(entry), Some(sl), Some(tp)) => {
                 check_levels(&mut c, decision.action, entry, sl, tp, snapshot, cfg);
+                check_order(&mut c, decision, entry, snapshot, cfg);
             }
             _ => c.add("NO_SL_TP", false, "entry/stop_loss/take_profit must all be set for BUY/SELL"),
         }
         check_environment(&mut c, snapshot, ctx, cfg, now);
     }
 
-    // 2. 条件付きプランの検証（成立時は LLM の再判断が同じ検証を通るので、構造と期限だけ見る）
-    if let Some(p) = plan {
-        check_plan(&mut c, p, snapshot, cfg, now);
-    }
-
     c.finish()
+}
+
+/// 予約注文としての妥当性: 種類・現在値に対する置き場所・有効期限
+fn check_order(c: &mut Checker, d: &TradeDecision, entry: f64, snapshot: &MarketSnapshot, cfg: &GuardConfig) {
+    let kind = d.entry_type.filter(|k| matches!(k, EntryType::Limit | EntryType::Stop));
+    c.add("ENTRY_TYPE", kind.is_some(), format!("entry_type {:?} must be LIMIT or STOP", d.entry_type));
+    if let Some(kind) = kind {
+        let current = snapshot.current_price;
+        if current > 0.0 {
+            let ok = order_price_on_correct_side(d.action, kind, entry, current);
+            c.add("ORDER_PRICE_SIDE", ok, format!("{:?} {:?} at {entry} vs current {current}", d.action, kind));
+        }
+    }
+    let max = (cfg.plan_max_hours * 60.0).round() as u32;
+    match d.expiry_minutes {
+        Some(m) => c.add("ORDER_EXPIRY", m >= 1 && m <= max, format!("expiry {m} min must be within 1..={max}")),
+        None => c.add("ORDER_EXPIRY", false, "expiry_minutes must be set (pending orders always expire)"),
+    }
+}
+
+/// 指値は現在値より有利な側（BUY は下・SELL は上）、逆指値は不利な側（BUY は上・SELL は下）に置く。
+/// 逆側に置くと即座に約定するか、ブローカーに拒否される
+pub fn order_price_on_correct_side(action: Action, kind: EntryType, entry: f64, current: f64) -> bool {
+    match (action, kind) {
+        (Action::Buy, EntryType::Limit) | (Action::Sell, EntryType::Stop) => entry < current,
+        (Action::Sell, EntryType::Limit) | (Action::Buy, EntryType::Stop) => entry > current,
+        _ => false,
+    }
+}
+
+/// 既存の注文・建玉への操作が実行できない形なら理由を返す。
+///
+/// 対象の向き（BUY/SELL）と現在値に対して、SL/TP が逆側にあるとブローカーに拒否されるか即決済になるので、
+/// それだけを見る。操作そのものの是非（建値に動かすか・撤退するか）は LLM の裁量に任せる。
+pub fn manage_problem(m: &ManageAction, side: Action, entry: Option<f64>, current: f64) -> Option<String> {
+    let sign = match side {
+        Action::Buy => 1.0,
+        Action::Sell => -1.0,
+        Action::Hold => return Some("target side unknown".into()),
+    };
+    if m.op != ManageOp::Modify {
+        return None;
+    }
+    if m.entry_price.is_none() && m.stop_loss.is_none() && m.take_profit.is_none() && m.expiry_minutes.is_none() {
+        return Some("MODIFY without any new value".into());
+    }
+    // 予約注文は新しい価格（無ければ今の価格）、建玉は現在値を基準にする
+    let base = m.entry_price.or(entry).unwrap_or(current);
+    if let Some(sl) = m.stop_loss {
+        if (base - sl) * sign <= 0.0 {
+            return Some(format!("stop_loss {sl} is on the wrong side of {base}"));
+        }
+    }
+    if let Some(tp) = m.take_profit {
+        if (tp - base) * sign <= 0.0 {
+            return Some(format!("take_profit {tp} is on the wrong side of {base}"));
+        }
+    }
+    None
 }
 
 fn check_levels(c: &mut Checker, action: Action, entry: f64, sl: f64, tp: f64, snapshot: &MarketSnapshot, cfg: &GuardConfig) {
@@ -325,10 +379,14 @@ fn check_levels(c: &mut Checker, action: Action, entry: f64, sl: f64, tp: f64, s
 
 fn check_environment(c: &mut Checker, snapshot: &MarketSnapshot, ctx: &GuardContext, cfg: &GuardConfig, now: DateTime<Utc>) {
     check_spread(c, snapshot, cfg);
+    let (pair, total) = (ctx.open_positions_pair + ctx.working_orders_pair, ctx.open_positions_total + ctx.working_orders_total);
     c.add(
         "MAX_POSITIONS",
-        ctx.open_positions_pair < cfg.max_positions_per_pair && ctx.open_positions_total < cfg.max_positions_total,
-        format!("open pair={} total={} (limits {}/{})", ctx.open_positions_pair, ctx.open_positions_total, cfg.max_positions_per_pair, cfg.max_positions_total),
+        pair < cfg.max_positions_per_pair && total < cfg.max_positions_total,
+        format!(
+            "positions+orders pair={pair} total={total} (orders {}/{}; limits {}/{})",
+            ctx.working_orders_pair, ctx.working_orders_total, cfg.max_positions_per_pair, cfg.max_positions_total
+        ),
     );
     c.add(
         "DAILY_LOSS_LIMIT",
@@ -367,34 +425,11 @@ fn check_spread(c: &mut Checker, snapshot: &MarketSnapshot, cfg: &GuardConfig) {
     c.add("SPREAD_TOO_WIDE", over.is_empty(), over.join("; "));
 }
 
-fn check_plan(c: &mut Checker, plan: &ConditionalPlan, snapshot: &MarketSnapshot, cfg: &GuardConfig, now: DateTime<Utc>) {
-    c.add("PLAN_UNSTRUCTURED", plan.is_structured(), "trigger/invalidate price+condition must be set");
-    c.add("PLAN_NO_SL_TP", plan.stop_loss.is_some() && plan.take_profit.is_some(), "plan stop_loss/take_profit must be set");
-    match parse_utc(&plan.expires_at) {
-        Some(exp) => {
-            let max = now + Duration::minutes((cfg.plan_max_hours * 60.0) as i64);
-            c.add(
-                "PLAN_EXPIRY",
-                exp > now && exp <= max,
-                format!("expires_at {} must be within ({}, {}]", plan.expires_at, now, max),
-            );
-        }
-        None => c.add("PLAN_EXPIRY", false, format!("unparsable expires_at {:?}", plan.expires_at)),
-    }
-    // SL の向きは trigger 価格を仮のエントリーとして確認
-    if let (Some(trigger), Some(sl), Some(tp)) = (plan.trigger_price, plan.stop_loss, plan.take_profit) {
-        let sign = if plan.then_action == Action::Buy { 1.0 } else { -1.0 };
-        c.add("PLAN_SL_WRONG_SIDE", (trigger - sl) * sign > 0.0, format!("trigger {trigger} sl {sl}"));
-        c.add("PLAN_TP_WRONG_SIDE", (tp - trigger) * sign > 0.0, format!("trigger {trigger} tp {tp}"));
-        let _ = snapshot;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::snapshot::{AccountState, SnapshotConfig, SnapshotInput};
-    use crate::strategy::types::{Analysis, EntryType, Observed, PriceCondition};
+    use crate::strategy::types::{Analysis, ManageTarget};
     use chrono::TimeZone;
 
     fn snapshot() -> MarketSnapshot {
@@ -422,22 +457,18 @@ mod tests {
         )
     }
 
-    fn decision(snap: &MarketSnapshot) -> TradeDecision {
+    /// 現在値（約 154.01）より下の BUY 指値
+    fn decision(_snap: &MarketSnapshot) -> TradeDecision {
         TradeDecision {
             action: Action::Buy,
             confidence: 0.8,
-            entry_type: Some(EntryType::Market),
-            entry_price: Some(154.00),
-            stop_loss: Some(153.92),  // 8 pips
-            take_profit: Some(154.16), // RR 2.0
-            analysis: Analysis { fundamental_view: "f".into(), price_levels: "p".into(), macro_context: "a".into(), order_flow: "b".into(), invalidation: "c".into(), conflicts: "d".into() },
-            conditional_plan: None,
-            observed: Observed {
-                latest_bar_4h: snap.latest_bars.h4.clone(),
-                latest_bar_1h: snap.latest_bars.h1.clone(),
-                latest_bar_15m: snap.latest_bars.m15.clone(),
-                latest_bar_5m: snap.latest_bars.m5.clone(),
-            },
+            entry_type: Some(EntryType::Limit),
+            entry_price: Some(153.90),
+            stop_loss: Some(153.82),  // 8 pips
+            take_profit: Some(154.06), // RR 2.0
+            expiry_minutes: Some(60),
+            analysis: Analysis { market_structure: "m".into(), price_levels: "p".into(), invalidation: "c".into(), conflicts: "d".into(), fundamental_view: String::new() },
+            manage: Vec::new(),
             reasoning: "r".into(),
         }
     }
@@ -460,25 +491,23 @@ mod tests {
         assert!(evaluate(&d, &snap, &GuardContext::default(), &cfg).failed.contains(&"CONFIDENCE_LOW".to_string()));
 
         let mut d = decision(&snap);
-        d.take_profit = Some(154.05); // RR 0.6
+        d.take_profit = Some(153.95); // RR 0.6
         assert!(evaluate(&d, &snap, &GuardContext::default(), &cfg).failed.contains(&"RR_TOO_LOW".to_string()));
 
         let mut d = decision(&snap);
-        d.stop_loss = Some(153.99); // 1 pip
-        d.take_profit = Some(154.03);
+        d.stop_loss = Some(153.89); // 1 pip
+        d.take_profit = Some(153.93);
         let f = evaluate(&d, &snap, &GuardContext::default(), &cfg).failed;
         assert!(f.contains(&"SL_TOO_TIGHT".to_string()) && f.contains(&"SL_ATR_RANGE".to_string()));
 
         let mut d = decision(&snap);
-        d.stop_loss = Some(154.10);
+        d.stop_loss = Some(154.00);
         assert!(evaluate(&d, &snap, &GuardContext::default(), &cfg).failed.contains(&"SL_WRONG_SIDE".to_string()));
 
-        // 画像を渡さないので観測整合は見ない（observed が空でも通る）
-        let mut d = decision(&snap);
-        d.observed = Observed::default();
-        assert!(!evaluate(&d, &snap, &GuardContext::default(), &cfg).failed.contains(&"OBSERVED_MISMATCH".to_string()));
-
         let ctx = GuardContext { open_positions_total: 1, ..Default::default() };
+        assert!(evaluate(&decision(&snap), &snap, &ctx, &cfg).failed.contains(&"MAX_POSITIONS".to_string()));
+        // 約定待ちの予約注文も建玉数に含める
+        let ctx = GuardContext { working_orders_pair: 1, working_orders_total: 1, ..Default::default() };
         assert!(evaluate(&decision(&snap), &snap, &ctx, &cfg).failed.contains(&"MAX_POSITIONS".to_string()));
 
         let ctx = GuardContext { daily_pnl_pct: -3.5, ..Default::default() };
@@ -499,8 +528,8 @@ mod tests {
         snap.volatility.atr14_5m_pips = Some(5.0);
         snap.volatility.atr14_1h_pips = Some(15.0);
         let mut d = decision(&snap);
-        d.stop_loss = Some(153.70); // 30 pips = 6 x ATR5M, 2 x ATR1H
-        d.take_profit = Some(154.60);
+        d.stop_loss = Some(153.60); // 30 pips = 6 x ATR5M, 2 x ATR1H
+        d.take_profit = Some(154.50);
         let fails = |d: &TradeDecision, snap: &MarketSnapshot, cfg: &GuardConfig| {
             evaluate(d, snap, &GuardContext::default(), cfg).failed.contains(&"SL_ATR_RANGE".to_string())
         };
@@ -508,8 +537,8 @@ mod tests {
         assert!(fails(&d, &snap, &GuardConfig { sl_atr_max_tf: AtrTimeframe::M5, ..GuardConfig::default() }));
         // 上限の時間足の ATR が無くても、下限（5M）は見る
         snap.volatility.atr14_1h_pips = None;
-        d.stop_loss = Some(153.99);
-        d.take_profit = Some(154.03);
+        d.stop_loss = Some(153.89);
+        d.take_profit = Some(153.93);
         assert!(fails(&d, &snap, &GuardConfig::default()));
         // 項目追加前に保存された設定は 1H で測る
         let old: GuardConfig = serde_json::from_str(r#"{"sl_atr_max":4.0}"#).unwrap();
@@ -537,32 +566,60 @@ mod tests {
     }
 
     #[test]
-    fn hold_with_plan_checks_plan_only() {
+    fn pending_order_type_side_and_expiry() {
         let snap = snapshot();
+        let cfg = GuardConfig::default();
+        let fails = |d: &TradeDecision, name: &str| evaluate(d, &snap, &GuardContext::default(), &cfg).failed.contains(&name.to_string());
+
+        // 成行（旧）は出させない
+        let mut d = decision(&snap);
+        d.entry_type = Some(EntryType::Market);
+        assert!(fails(&d, "ENTRY_TYPE"));
+
+        // BUY 指値を現在値より上に置くと即約定してしまう
+        let mut d = decision(&snap);
+        d.entry_price = Some(154.10);
+        d.stop_loss = Some(154.02);
+        d.take_profit = Some(154.26);
+        assert!(fails(&d, "ORDER_PRICE_SIDE"));
+        // 同じ価格でも逆指値（ブレイク買い）なら正しい
+        d.entry_type = Some(EntryType::Stop);
+        assert!(!fails(&d, "ORDER_PRICE_SIDE"), "{:?}", evaluate(&d, &snap, &GuardContext::default(), &cfg).failed);
+
+        let mut d = decision(&snap);
+        d.expiry_minutes = None;
+        assert!(fails(&d, "ORDER_EXPIRY"));
+        d.expiry_minutes = Some(9 * 60);
+        assert!(fails(&d, "ORDER_EXPIRY"));
+
+        // HOLD は何も見ない
         let mut d = decision(&snap);
         d.action = Action::Hold;
-        d.confidence = 0.4;
-        d.entry_price = None;
-        d.stop_loss = None;
-        d.take_profit = None;
-        d.conditional_plan = Some(ConditionalPlan {
-            wait_for: "w".into(),
-            then_action: Action::Buy,
-            invalidate_if: "i".into(),
-            expires_at: "2026-09-15 12:00:00 UTC".into(),
-            trigger_price: Some(154.10),
-            trigger_condition: Some(PriceCondition::CloseAbove),
-            invalidate_price: Some(153.90),
-            invalidate_condition: Some(PriceCondition::CloseBelow),
-            stop_loss: Some(153.95),
-            take_profit: Some(154.40),
-        });
-        let v = evaluate(&d, &snap, &GuardContext::default(), &GuardConfig::default());
-        assert!(v.passed, "{:?}", v.failed);
+        d.confidence = 0.2;
+        assert!(evaluate(&d, &snap, &GuardContext::default(), &cfg).passed);
+    }
 
-        let mut late = d.clone();
-        late.conditional_plan.as_mut().unwrap().expires_at = "2026-09-16 12:00:00 UTC".into();
-        assert!(evaluate(&late, &snap, &GuardContext::default(), &GuardConfig::default()).failed.contains(&"PLAN_EXPIRY".to_string()));
+    #[test]
+    fn manage_checks_only_executability() {
+        let m = |op, sl: Option<f64>, tp: Option<f64>| ManageAction {
+            target: ManageTarget::Position,
+            id: "1".into(),
+            op,
+            entry_price: None,
+            stop_loss: sl,
+            take_profit: tp,
+            expiry_minutes: None,
+            reason: String::new(),
+        };
+        // BUY 建玉の SL を建値 154.00 へ（現在値 154.20）
+        assert_eq!(manage_problem(&m(ManageOp::Modify, Some(154.00), None), Action::Buy, None, 154.20), None);
+        // 現在値より上の SL は即決済になる
+        assert!(manage_problem(&m(ManageOp::Modify, Some(154.30), None), Action::Buy, None, 154.20).is_some());
+        assert!(manage_problem(&m(ManageOp::Modify, None, Some(154.10)), Action::Buy, None, 154.20).is_some());
+        assert!(manage_problem(&m(ManageOp::Modify, None, None), Action::Buy, None, 154.20).is_some());
+        assert_eq!(manage_problem(&m(ManageOp::Close, None, None), Action::Sell, None, 154.20), None);
+        // 予約注文は注文の価格を基準にする（SELL 指値 154.50 の SL 154.60）
+        assert_eq!(manage_problem(&m(ManageOp::Modify, Some(154.60), None), Action::Sell, Some(154.50), 154.20), None);
     }
 
     #[test]

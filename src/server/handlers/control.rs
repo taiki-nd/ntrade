@@ -20,11 +20,27 @@ pub async fn update_state(
 }
 
 /// POST /api/control/emergency-stop
-/// 緊急全決済 & ボット停止
+/// 緊急全決済 & 予約注文の全取消 & ボット停止
 pub async fn emergency_stop(
     State(state): State<AppState>,
 ) -> Json<ApiResponse<String>> {
-    info!("EXECUTING EMERGENCY STOP: Closing all open positions...");
+    info!("EXECUTING EMERGENCY STOP: Cancelling working orders and closing all open positions...");
+
+    // 予約注文を残すと、停止後に約定して建玉ができてしまう。取り消せなかった注文は照合で残る
+    let orders = state.working_orders.read().await.clone();
+    let sink = state.order_sink.read().await.clone();
+    let mut cancelled = 0;
+    for o in &orders {
+        match sink.cancel_pending(&o.id).await {
+            Ok(()) => {
+                cancelled += 1;
+                state.working_orders.write().await.retain(|w| w.id != o.id);
+            }
+            Err(e) => warn!(order = %o.id, "Failed to cancel working order at broker: {e:#}"),
+        }
+    }
+    state.persist_working_orders().await;
+    let orders_note = if orders.is_empty() { String::new() } else { format!("予約注文 {cancelled}/{} 件を取り消し、", orders.len()) };
 
     let mut positions_lock = state.positions.write().await;
     let mut metrics_lock = state.metrics.write().await;
@@ -34,7 +50,7 @@ pub async fn emergency_stop(
     *bot_state_lock = BotState::Paused;
 
     if positions_lock.is_empty() {
-        return Json(ApiResponse::ok("保有ポジションはありませんでした。ボットを一時停止しました。".to_string()));
+        return Json(ApiResponse::ok(format!("{orders_note}保有ポジションはありませんでした。ボットを一時停止しました。")));
     }
 
     let ctrader_opt = {
@@ -93,7 +109,7 @@ pub async fn emergency_stop(
     state.record_trades(closed).await;
 
     let msg = format!(
-        "緊急全決済を実行しました: {} 件のポジションを成行決済し、自動売買を一時停止しました（確定損益: ¥{:.0}）",
+        "緊急全決済を実行しました: {orders_note}{} 件のポジションを成行決済し、自動売買を一時停止しました（確定損益: ¥{:.0}）",
         count, total_pnl
     );
     info!("{}", msg);

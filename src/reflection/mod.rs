@@ -46,9 +46,8 @@ pub fn build_reflection_prompt(trade: &TradeHistory, cot: Option<&CoTLog>, post_
     let cot_text = cot
         .map(|c| {
             format!(
-                "ファンダメンタルズの読み: {}\n価格の位置: {}\n損切りの根拠: {}\n反対材料: {}\n判断理由: {}\n確信度: {:.2}",
-                if c.fundamental_view.is_empty() { "（記録なし）" } else { &c.fundamental_view },
-                c.macro_context, c.invalidation, c.conflicts, c.reasoning, c.confidence
+                "流れの読み: {}\n注文の価格の根拠: {}\n損切りの根拠: {}\n反対材料: {}\n判断理由: {}\n確信度: {:.2}",
+                c.macro_context, c.order_flow, c.invalidation, c.conflicts, c.reasoning, c.confidence
             )
         })
         .unwrap_or_else(|| "（エントリー時の判断ログなし）".to_string());
@@ -56,12 +55,13 @@ pub fn build_reflection_prompt(trade: &TradeHistory, cot: Option<&CoTLog>, post_
         CloseReason::StopLoss => "損切り（SL到達）",
         CloseReason::Invalidated => "損切り（5M確定足の終値が無効化ラインを越えた）",
         CloseReason::TakeProfit => "利確（TP到達）",
+        CloseReason::Discretionary => "LLM の判断で決済",
         CloseReason::Manual => "手動決済",
         CloseReason::CircuitBreaker => "サーキットブレーカー",
     };
 
     format!(
-        r#"あなたは客観的で厳格なプロのマルチアセット・トレーダー（FX・貴金属・株価指数・エネルギーの CFD）兼リスクアナリストです。
+        r#"あなたは客観的で厳格なプロの日中短期トレーダー（FX・貴金属・株価指数の CFD）兼リスクアナリストです。
 以下のトレードを振り返り、根本原因と「今後同じ局面で特に注意して読むための1文」を返してください。
 
 【トレード】
@@ -82,8 +82,8 @@ pub fn build_reflection_prompt(trade: &TradeHistory, cot: Option<&CoTLog>, post_
 - 「なぜ負けたか」ではなく「エントリー時点で見えていたはずなのに読み落とした事実は何か」を特定してください。
 - 判断は妥当で結果だけが悪かった（読み落としがない）場合は decision_was_sound を true にし、lesson は空文字にしてください。
 - lesson は「〇〇の局面では△△に注意して読む」という読解上の注意として書き、「必ずHOLD」のような絶対ルールにはしないでください。
-- ファンダメンタルズの事実の読み違い（金利・物価・建玉・指標予定などの解釈の誤り、発表リスクの見落とし）もあり得ます。後から出た情報ではなく、エントリー時点の判断ログに書かれた読みの範囲で評価してください。
-- category は RISK（SL幅・RR・ロット）/ TIMING（時間帯・イベント前後の入り方）/ PATTERN（価格の位置の読み違い）/ NEWS（指標・イベント・ファンダメンタルズの読み違い）から選んでください。
+- エントリーは予約注文（指値・逆指値）です。注文の種類（押し目待ちか、ブレイク追随か）と置いた価格の選び方も評価の対象です。後から出た情報ではなく、エントリー時点の判断ログに書かれた読みの範囲で評価してください。
+- category は RISK（SL幅・RR・ロット）/ TIMING（時間帯・セッションの移り変わり・注文の期限）/ PATTERN（流れや水準の読み違い・注文の種類の選び違い）/ NEWS（値動きの急変・指標発表時の振れ）から選んでください。
 "#,
         pair = trade.symbol,
         side = trade.side,

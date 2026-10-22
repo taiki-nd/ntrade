@@ -30,14 +30,19 @@ pub struct LlmClientConfig {
     pub model: Option<String>,
 }
 
+/// 判断に使うモデル（`claude --model` に渡す別名）。`NTRADE_LLM_MODEL` で差し替えられる
+pub const DEFAULT_MODEL: &str = "opus";
+
 impl Default for LlmClientConfig {
     fn default() -> Self {
+        let model = std::env::var("NTRADE_LLM_MODEL").ok().map(|m| m.trim().to_string()).filter(|m| !m.is_empty());
         Self {
             cli_binary: "claude".to_string(),
-            timeout_secs: 120,
+            // 予約注文なので判断の遅れは約定価格に響かない。大きいモデルの応答を待てるだけの余裕を取る
+            timeout_secs: 180,
             max_turns: 3,
             allowed_tools: Vec::new(),
-            model: None,
+            model: Some(model.unwrap_or_else(|| DEFAULT_MODEL.to_string())),
         }
     }
 }

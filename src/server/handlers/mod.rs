@@ -9,6 +9,5 @@ pub mod trades;
 pub mod replay;
 pub mod settings;
 pub mod decide;
-pub mod plans;
-pub mod fundamentals;
+pub mod orders;
 pub mod symbols;

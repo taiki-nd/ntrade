@@ -86,6 +86,7 @@ const CLOSE_REASON_LABELS: Record<string, string> = {
   TAKE_PROFIT: "利確 (TP)",
   STOP_LOSS: "損切り (SL)",
   INVALIDATED: "損切り (終値)",
+  DISCRETIONARY: "LLM 判断で決済",
   MANUAL: "手動決済",
   CIRCUIT_BREAKER: "強制停止",
 };
@@ -142,23 +143,30 @@ export function TradeHistoryTable({ trades, pagination, filter, onDelete }: Trad
     switch (reason) {
       case "TAKE_PROFIT":
         return (
-          <Badge className="bg-emerald-600/15 text-emerald-700 dark:text-emerald-400 border-emerald-500/30 gap-1 text-[11px]">
+          <Badge className="bg-profit/15 text-profit border-profit/30 gap-1 text-[11px]">
             <CheckCircle className="h-3 w-3" />
             利確 (TP)
           </Badge>
         );
       case "STOP_LOSS":
         return (
-          <Badge className="bg-rose-600/15 text-rose-700 dark:text-rose-400 border-rose-500/30 gap-1 text-[11px]">
+          <Badge className="bg-loss/15 text-loss border-loss/30 gap-1 text-[11px]">
             <AlertTriangle className="h-3 w-3" />
             損切り (SL)
           </Badge>
         );
       case "INVALIDATED":
         return (
-          <Badge className="bg-rose-600/15 text-rose-700 dark:text-rose-400 border-rose-500/30 gap-1 text-[11px]">
+          <Badge className="bg-loss/15 text-loss border-loss/30 gap-1 text-[11px]">
             <AlertTriangle className="h-3 w-3" />
             損切り (終値)
+          </Badge>
+        );
+      case "DISCRETIONARY":
+        return (
+          <Badge variant="outline" className="gap-1 text-[11px]">
+            <BrainCircuit className="h-3 w-3" />
+            LLM 判断で決済
           </Badge>
         );
       case "MANUAL":
@@ -170,7 +178,7 @@ export function TradeHistoryTable({ trades, pagination, filter, onDelete }: Trad
         );
       case "CIRCUIT_BREAKER":
         return (
-          <Badge className="bg-amber-600/15 text-amber-700 dark:text-amber-400 border-amber-500/30 gap-1 text-[11px]">
+          <Badge className="bg-warning/15 text-warning border-warning/30 gap-1 text-[11px]">
             強制停止
           </Badge>
         );
@@ -198,15 +206,18 @@ export function TradeHistoryTable({ trades, pagination, filter, onDelete }: Trad
     );
   };
 
-  const columnCount = 10 + (onDelete ? 2 : 0);
+  // 概要タブ（ページ送り・絞り込みなし）は狭いカラムに置くので、価格と数量の列を省く
+  const compact = !pagination && !filter;
+  const wideOnly = compact ? "hidden" : "";
+  const columnCount = (compact ? 6 : 10) + (onDelete ? 2 : 0);
 
   return (
     <Card className="shadow-xs">
       <CardHeader className="flex flex-col lg:flex-row lg:items-center justify-between gap-3 pb-3">
         <div className="space-y-1">
           <CardTitle className="text-base font-semibold flex items-center gap-2">
-            <History className="h-5 w-5 text-indigo-500" />
-            <span>約定履歴 (Trade History)</span>
+            <History className="h-5 w-5 text-primary" />
+            <span>{compact ? "直近の決済" : "約定履歴"}</span>
           </CardTitle>
           <CardDescription className="text-xs">
             決済済みトレードの結果と、エントリーの根拠になった判断
@@ -451,13 +462,13 @@ export function TradeHistoryTable({ trades, pagination, filter, onDelete }: Trad
                 )}
                 {sortHead("symbol", "銘柄", "w-[100px]")}
                 <TableHead className="w-[80px]">売買</TableHead>
-                {sortHead("volumeLots", "数量", "text-right")}
-                <TableHead className="text-right">エントリー</TableHead>
-                <TableHead className="text-right">決済価格</TableHead>
+                {!compact && sortHead("volumeLots", "数量", "text-right")}
+                {!compact && <TableHead className="text-right">エントリー</TableHead>}
+                {!compact && <TableHead className="text-right">決済価格</TableHead>}
                 {sortHead("pnlPips", "損益 (pips)", "text-right")}
                 {sortHead("pnlAmount", "確定損益", "text-right")}
                 <TableHead className="text-center">決済理由</TableHead>
-                {sortHead("closeTime", "決済時刻", "text-right")}
+                {!compact && sortHead("closeTime", "決済時刻", "text-right")}
                 <TableHead className="text-center">判断</TableHead>
                 {onDelete && <TableHead className="w-[52px] text-center">削除</TableHead>}
               </TableRow>
@@ -497,8 +508,8 @@ export function TradeHistoryTable({ trades, pagination, filter, onDelete }: Trad
                           className={cn(
                             "gap-1 font-semibold text-xs",
                             trd.side === "BUY"
-                              ? "border-emerald-500/40 bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-400"
-                              : "border-rose-500/40 bg-rose-50 text-rose-700 dark:bg-rose-950/40 dark:text-rose-400"
+                              ? "border-profit/40 bg-profit/10 text-profit"
+                              : "border-loss/40 bg-loss/10 text-loss"
                           )}
                         >
                           {trd.side === "BUY" ? (
@@ -509,21 +520,21 @@ export function TradeHistoryTable({ trades, pagination, filter, onDelete }: Trad
                           {trd.side}
                         </Badge>
                       </TableCell>
-                      <TableCell className="text-right font-mono tabular-nums text-sm">
+                      <TableCell className={cn("text-right font-mono tabular-nums text-sm", wideOnly)}>
                         {trd.volumeLots.toFixed(2)} lot
                       </TableCell>
-                      <TableCell className="text-right font-mono tabular-nums text-sm">
+                      <TableCell className={cn("text-right font-mono tabular-nums text-sm", wideOnly)}>
                         {trd.entryPrice.toFixed(priceDigits(trd.symbol))}
                       </TableCell>
-                      <TableCell className="text-right font-mono tabular-nums text-sm font-medium">
+                      <TableCell className={cn("text-right font-mono tabular-nums text-sm font-medium", wideOnly)}>
                         {trd.closePrice.toFixed(priceDigits(trd.symbol))}
                       </TableCell>
                       <TableCell
                         className={cn(
                           "text-right font-mono tabular-nums text-sm font-semibold",
                           isPositive
-                            ? "text-emerald-600 dark:text-emerald-400"
-                            : "text-rose-600 dark:text-rose-400"
+                            ? "text-profit"
+                            : "text-loss"
                         )}
                       >
                         {isPositive ? "+" : ""}
@@ -533,8 +544,8 @@ export function TradeHistoryTable({ trades, pagination, filter, onDelete }: Trad
                         className={cn(
                           "text-right font-mono tabular-nums text-sm font-bold",
                           isPositive
-                            ? "text-emerald-600 dark:text-emerald-400"
-                            : "text-rose-600 dark:text-rose-400"
+                            ? "text-profit"
+                            : "text-loss"
                         )}
                       >
                         {isPositive ? "+" : ""}
@@ -543,7 +554,7 @@ export function TradeHistoryTable({ trades, pagination, filter, onDelete }: Trad
                       <TableCell className="text-center">
                         {getCloseReasonBadge(trd.closeReason)}
                       </TableCell>
-                      <TableCell className="text-right text-xs text-muted-foreground font-mono tabular-nums">
+                      <TableCell className={cn("text-right text-xs text-muted-foreground font-mono tabular-nums", wideOnly)}>
                         {trd.closeTime}
                       </TableCell>
 

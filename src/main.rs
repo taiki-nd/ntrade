@@ -32,11 +32,11 @@ async fn main() -> Result<()> {
     // cTrader トークンの期限監視・自動更新（SQLite に保存）と切断時の再接続
     tokio::spawn(state.clone().run_token_refresh_loop());
 
-    // ファンダメンタルズの事実データの定期取得（判断サイクルはキャッシュを読むだけ）
-    tokio::spawn(ntrade::fundamentals::run_loop(state.fundamentals.clone()));
-
-    // ブローカーとの建玉照合（SL/TP 執行の取り込み）。bot の稼働状態に依らず常時回す
+    // ブローカーとの建玉・予約注文の照合（約定・SL/TP 執行の取り込み）。bot の稼働状態に依らず常時回す
     tokio::spawn(state.clone().run_reconcile_loop());
+
+    // 残高の推移を cTrader の決済・入出金履歴から取り込む（ダッシュボードのグラフ用）
+    tokio::spawn(state.clone().run_balance_history_loop());
 
     // 5分足確定ごとの常駐スケジューラ（NTRADE_SCHEDULER=off で無効化）
     if std::env::var("NTRADE_SCHEDULER").map(|v| v == "off").unwrap_or(false) {
@@ -65,11 +65,10 @@ async fn main() -> Result<()> {
     info!("  - GET  /api/chart/latest?tf=4H|1H|15M|5M&pair=USDJPY");
     info!("  - GET  /api/snapshot/latest?pair=USDJPY");
     info!("  - POST /api/decide?pair=USDJPY");
-    info!("  - GET  /api/plans, DELETE /api/plans/:id");
+    info!("  - GET  /api/orders, DELETE /api/orders/:id");
     info!("  - GET  /api/guard/config");
     info!("  - GET  /api/settings, PUT /api/settings");
     info!("  - GET  /api/symbols?q=, /api/symbols/spec?pair=");
-    info!("  - GET  /api/fundamentals?pair=, /api/fundamentals/status, POST /api/fundamentals/refresh");
     info!("  - GET  /api/replay/runs, /api/replay/runs/:id, /api/replay/coverage");
     info!("  - GET  /api/auth/ctrader/url");
     info!("  - POST /api/auth/ctrader/exchange");

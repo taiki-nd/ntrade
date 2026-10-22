@@ -8,6 +8,8 @@ import { Switch } from "@/components/ui/switch";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
+import { Label } from "@/components/ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import {
   Lightbulb,
   Plus,
@@ -24,8 +26,18 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 
+/** 教訓の分類（反省のカテゴリと同じ） */
+const CATEGORY_LABELS: Record<LessonLearned["category"], string> = {
+  PATTERN: "流れ・水準の読み",
+  TIMING: "時間帯・注文の期限",
+  NEWS: "急変・指標発表",
+  RISK: "資金管理・SL 幅",
+};
+
 interface LessonsManagerProps {
   lessons: LessonLearned[];
+  /** 対象銘柄の選択肢（取引設定の銘柄） */
+  pairs?: string[];
   onToggleLesson: (id: string) => void;
   onAddLesson: (newLesson: Omit<LessonLearned, "id" | "createdAt">) => void;
   onDeleteLesson: (id: string) => void;
@@ -33,6 +45,7 @@ interface LessonsManagerProps {
 
 export function LessonsManager({
   lessons,
+  pairs = [],
   onToggleLesson,
   onAddLesson,
   onDeleteLesson,
@@ -60,29 +73,23 @@ export function LessonsManager({
     setOpenAddDialog(false);
   };
 
-  const getCategoryBadge = (cat: LessonLearned["category"]) => {
-    switch (cat) {
-      case "PATTERN":
-        return <Badge variant="secondary" className="text-[10px]">パターン認識</Badge>;
-      case "TIMING":
-        return <Badge variant="secondary" className="text-[10px]">時間帯・市場</Badge>;
-      case "NEWS":
-        return <Badge variant="destructive" className="text-[10px]">指標・ニュース</Badge>;
-      case "RISK":
-        return <Badge variant="outline" className="text-[10px]">資金管理</Badge>;
-    }
-  };
+  const getCategoryBadge = (cat: LessonLearned["category"]) => (
+    <Badge variant={cat === "RISK" ? "outline" : "secondary"} className="text-[10px]">
+      {CATEGORY_LABELS[cat] ?? cat}
+    </Badge>
+  );
+  const symbolItems: Record<string, string> = { ALL: "ALL (全銘柄)", ...Object.fromEntries(pairs.map((p) => [p, p])) };
 
   return (
     <Card className="shadow-xs">
       <CardHeader className="flex flex-row items-center justify-between pb-3">
         <div className="space-y-1">
           <CardTitle className="text-base font-semibold flex items-center gap-2">
-            <Lightbulb className="h-5 w-5 text-amber-500" />
-            <span>AI 自己反省 & 教訓マネージャー (Lessons Learned)</span>
+            <Lightbulb className="h-5 w-5 text-warning" />
+            <span>教訓</span>
           </CardTitle>
           <CardDescription className="text-xs">
-            損切り・失敗トレードの自己反省（Self-Reflection）から自動蓄積され、次回の推論プロンプトに反映される教訓ルール
+            損切りになった取引を LLM が振り返って候補を作り、同じ分類の候補が 3 回たまると有効になります。有効な教訓は判断のプロンプトに「注意して読む観点」として入ります
           </CardDescription>
         </div>
 
@@ -100,7 +107,7 @@ export function LessonsManager({
             <form onSubmit={handleAddSubmit}>
               <DialogHeader>
                 <DialogTitle className="flex items-center gap-2">
-                  <Sparkles className="h-4 w-4 text-amber-500" />
+                  <Sparkles className="h-4 w-4 text-warning" />
                   新規ルールの追加
                 </DialogTitle>
                 <DialogDescription>
@@ -109,9 +116,9 @@ export function LessonsManager({
               </DialogHeader>
               <div className="space-y-4 py-3">
                 <div className="space-y-1.5">
-                  <label className="text-xs font-semibold">ルール本文（禁止事項・注意）</label>
+                  <Label className="text-xs font-semibold">教訓（注意して読む観点）</Label>
                   <Textarea
-                    placeholder="例: 4H上位足が上昇トレンドの局面では、5M逆張りショートは厳禁。"
+                    placeholder="例: アジア時間の薄い値動きでの高値ブレイクは、逆指値で追う前に 15M の実体で抜けたかを確かめる"
                     value={ruleInput}
                     onChange={(e) => setRuleInput(e.target.value)}
                     rows={3}
@@ -120,35 +127,44 @@ export function LessonsManager({
                 </div>
                 <div className="grid grid-cols-2 gap-3">
                   <div className="space-y-1.5">
-                    <label className="text-xs font-semibold">対象通貨ペア</label>
-                    <select
-                      className="w-full rounded-md border bg-background px-3 py-1.5 text-sm"
-                      value={symbolInput}
-                      onChange={(e) => setSymbolInput(e.target.value)}
-                    >
-                      <option value="ALL">ALL (全銘柄)</option>
-                      <option value="USDJPY">USDJPY</option>
-                      <option value="EURUSD">EURUSD</option>
-                    </select>
+                    <Label className="text-xs font-semibold">対象銘柄</Label>
+                    <Select value={symbolInput} items={symbolItems} onValueChange={(v) => setSymbolInput(String(v ?? "ALL"))}>
+                      <SelectTrigger size="sm" className="w-full text-sm">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {Object.entries(symbolItems).map(([v, l]) => (
+                          <SelectItem key={v} value={v}>
+                            {l}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
                   </div>
                   <div className="space-y-1.5">
-                    <label className="text-xs font-semibold">カテゴリ</label>
-                    <select
-                      className="w-full rounded-md border bg-background px-3 py-1.5 text-sm"
+                    <Label className="text-xs font-semibold">分類</Label>
+                    <Select
                       value={categoryInput}
-                      onChange={(e) => setCategoryInput(e.target.value as LessonLearned["category"])}
+                      items={CATEGORY_LABELS}
+                      onValueChange={(v) => setCategoryInput((v ?? "PATTERN") as LessonLearned["category"])}
                     >
-                      <option value="PATTERN">パターン認識</option>
-                      <option value="TIMING">時間帯・市場</option>
-                      <option value="NEWS">指標・ニュース</option>
-                      <option value="RISK">資金管理</option>
-                    </select>
+                      <SelectTrigger size="sm" className="w-full text-sm">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {Object.entries(CATEGORY_LABELS).map(([v, l]) => (
+                          <SelectItem key={v} value={v}>
+                            {l}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
                   </div>
                 </div>
                 <div className="space-y-1.5">
-                  <label className="text-xs font-semibold">理由・背景（コンテキスト）</label>
+                  <Label className="text-xs font-semibold">理由・背景</Label>
                   <Input
-                    placeholder="例: 踏み上げリスクが高く損切り多発のため"
+                    placeholder="例: 期限内に戻されて損切りが続いたため"
                     value={contextInput}
                     onChange={(e) => setContextInput(e.target.value)}
                   />

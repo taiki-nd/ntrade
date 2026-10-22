@@ -19,7 +19,7 @@ export interface Position {
   closeStop?: number;
 }
 
-export type CloseReason = "TAKE_PROFIT" | "STOP_LOSS" | "INVALIDATED" | "MANUAL" | "CIRCUIT_BREAKER";
+export type CloseReason = "TAKE_PROFIT" | "STOP_LOSS" | "INVALIDATED" | "DISCRETIONARY" | "MANUAL" | "CIRCUIT_BREAKER";
 
 export interface TradeHistory {
   id: string;
@@ -47,22 +47,23 @@ export interface CoTLog {
   symbol: string;
   action: ActionType;
   confidence: number;
-  entryType?: "MARKET" | "LIMIT" | "CONDITIONAL";
+  /** 新規注文の種類。MARKET / CONDITIONAL は旧データ */
+  entryType?: "LIMIT" | "STOP" | "MARKET" | "CONDITIONAL";
   entryPrice?: number;
   stopLoss?: number;
   takeProfit?: number;
   riskRewardRatio?: number;
   /** ファンダメンタルズの読み（事実から読んだ地合い・根拠・イベントリスク）。旧データは空 */
   fundamentalView?: string;
-  /** 環境認識（4H/1H） */
+  /** 流れの読み（上位足と直近の値動き）。旧データは 4H/1H の環境認識・価格の位置 */
   macroContext: string;
-  /** 注文の攻防（15M/5M） */
+  /** 注文の価格・利確の根拠。旧データは 15M/5M の注文の攻防 */
   orderFlow: string;
   /** 無効化ライン（SLの根拠） */
   invalidation: string;
   /** 反対材料 */
   conflicts?: string;
-  /** ガードで弾かれた場合のガード名 */
+  /** 新規注文のガード不通過・発注エラーと、既存の注文・建玉への操作の結果（`splitGuardResult` で分ける） */
   guardResult?: string;
   reasoning: string;
   executed: boolean;
@@ -72,6 +73,12 @@ export interface CoTLog {
    * プランは HOLD 判断と一緒に出るため、発注した記録と根拠の判断は別ログになる。
    */
   originCotLogId?: string;
+}
+
+/** 残高の推移の1点（決済・入出金の直後の残高。time はエンジンの UTC 文字列） */
+export interface BalancePoint {
+  time: string;
+  balance: number;
 }
 
 export interface AccountMetrics {

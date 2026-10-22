@@ -1,11 +1,8 @@
-//! 常駐スケジューラ: 5分足確定ごとに全ペアのサイクルを並行に回し、ポジション同期と自己反省を行う。
+//! 常駐スケジューラ: 5分足確定ごとに全ペアのサイクルを並行に回し、建玉・予約注文の同期と自己反省を行う。
 //!
-//! 5M 足ごとに行うのは確定足でのプラン評価と終値判定の損切り。LLM の判断は
-//! - 判断間隔（`decision_interval_minutes`）の足
-//! - 条件付きプランが成立した足
-//! - 重要指標の発表直後の足（`event_decisions` が有効なとき）
-//!
-//! に限る。ブローカーの取引時間外の銘柄はサイクルごと飛ばす（止まった足で判断させない）。
+//! 5M 足ごとに行うのは終値判定の損切り。LLM の判断（予約注文を置く・見直す）は判断間隔
+//! （`decision_interval_minutes`）の足に限る。予約注文の約定はブローカーが判定するので、判断の合間も待たずに約定する。
+//! ブローカーの取引時間外の銘柄はサイクルごと飛ばす（止まった足で判断させない）。
 //!
 //! 対象ペア・待ち秒数・判断間隔は取引設定（`settings::TradingSettings`、画面から変更可）を
 //! 毎サイクル読み直すので、変更は再起動なしで次の足から反映される。
@@ -35,10 +32,7 @@ pub fn next_tick(now: DateTime<Utc>, delay_secs: i64) -> DateTime<Utc> {
 pub async fn run(state: AppState) {
     {
         let s = state.settings.read().await;
-        info!(
-            pairs = ?s.pairs, delay = s.bar_delay_secs, decision_interval = s.decision_interval_minutes,
-            event_decisions = s.event_decisions, "scheduler started (5M cadence)"
-        );
+        info!(pairs = ?s.pairs, delay = s.bar_delay_secs, decision_interval = s.decision_interval_minutes, "scheduler started (5M cadence)");
     }
 
     loop {
@@ -74,20 +68,11 @@ pub async fn run(state: AppState) {
                 // 仕様が引けないときは従来どおり回す（足の取得で失敗すればそこで止まる）
                 Err(e) => warn!(pair, "scheduler: market status unknown: {e:#}"),
             }
-            let event = if settings.event_decisions && !scheduled {
-                state.fundamentals.take_event_trigger(&pair, tick_now).await
-            } else {
-                None
-            };
-            if let Some(e) = &event {
-                info!(pair, event = %e.title, currency = %e.currency, at = %e.time, "scheduler: decision after a scheduled release");
-            }
-            let decide = scheduled || event.is_some();
             let state = state.clone();
             cycles.spawn(async move {
-                match run_cycle_locked(&state, &pair, decide).await {
+                match run_cycle_locked(&state, &pair, scheduled).await {
                     Ok(Some(r)) => info!(pair, action = ?r.decision.action, guard = r.guard.passed, executed = r.executed, "cycle ok"),
-                    Ok(None) => tracing::debug!(pair, "cycle: plans/stops checked, no decision this bar"),
+                    Ok(None) => tracing::debug!(pair, "cycle: stops checked, no decision this bar"),
                     Err(e) => warn!(pair, "cycle failed: {e:#}"),
                 }
             });
@@ -126,8 +111,7 @@ pub async fn reflect_on_closed(state: &AppState, closed: Vec<TradeHistory>) {
             }
         };
         tokio::spawn(async move {
-            // 反省の材料は LLM の判断そのもの。プラン成立の再判断はそれ自体が LLM 判断なのでそのまま使い、
-            // 旧データの機械的な成立ログ（cot-plan-*）だけ元の判断まで辿る
+            // 反省の材料は LLM の判断そのもの。旧データの機械的な成立ログ（cot-plan-*）だけ元の判断まで辿る
             let cot = match t.cot_log_id.clone() {
                 Some(id) => state
                     .with_db(move |db| {

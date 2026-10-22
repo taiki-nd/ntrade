@@ -1,7 +1,7 @@
 //! MarketSnapshot: LLM に渡す「客観的事実」の集合。
 //!
-//! 画像4枚（4H/1H/15M/5M）、15M/5M の生OHLC、ATR・前日高安・キリ番・スイング価格リスト
-//! などを組み立てる。パターン判定・トレンドラベル・サポレジ判定は一切含まない。
+//! 画像4枚（4H/1H/15M/5M）、1H/15M/5M の生OHLC、ATR・前日高安・キリ番・スイング価格リスト、
+//! 口座の建玉と予約注文などを組み立てる。パターン判定・トレンドラベル・サポレジ判定は一切含まない。
 //! 本番（現在時刻）でもリプレイ（過去時刻）でも同じ経路で生成される。
 
 pub mod measures;
@@ -14,7 +14,6 @@ use std::path::{Path, PathBuf};
 
 use crate::chart::{ChartPlotter, ChartPlotterConfig, PriceLevel, TimeframeChart};
 use crate::ctrader::CandleBar;
-use crate::strategy::types::ConditionalPlan;
 use measures::*;
 
 /// 生OHLC 1本（コンパクト表現）
@@ -122,11 +121,30 @@ pub struct SwingPoints {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OpenPositionSummary {
+    /// 建玉 ID（`manage` で決済・SL/TP 変更するときに使う）
+    pub id: String,
     pub side: String,
     pub entry_price: f64,
     pub stop_loss: Option<f64>,
     pub take_profit: Option<f64>,
     pub open_time: String,
+    /// 含み損益（pips）
+    pub pnl_pips: f64,
+}
+
+/// ブローカーに置いてある、まだ約定していない予約注文
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkingOrderSummary {
+    /// 注文 ID（`manage` で取消・変更するときに使う）
+    pub id: String,
+    pub side: String,
+    /// LIMIT / STOP
+    pub kind: String,
+    pub entry_price: f64,
+    pub stop_loss: f64,
+    pub take_profit: f64,
+    pub created_at: String,
+    pub expires_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -136,28 +154,12 @@ pub struct RecentDecision {
     pub summary: String,
 }
 
-/// 前回までに立てた条件付きプランが、直近の確定 5M 足で成立したことの通知。
-///
-/// プランは成立しても自動では発注しない。成立足の終値はプランを立てた時の想定価格（`trigger_price`）から
-/// ずれるので、この通知を添えて「今の価格で入るか」を LLM に判断し直させる。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TriggeredPlan {
-    /// プランを立てた判断の時刻
-    pub planned_at: String,
-    /// 成立した 5M 足の開始時刻
-    pub triggered_bar: String,
-    /// 成立した 5M 足の終値
-    pub triggered_close: f64,
-    pub plan: ConditionalPlan,
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AccountState {
     pub open_positions: Vec<OpenPositionSummary>,
+    #[serde(default)]
+    pub working_orders: Vec<WorkingOrderSummary>,
     pub recent_decisions: Vec<RecentDecision>,
-    /// 直近の確定足で成立した条件付きプラン（無ければ JSON に出さない）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub triggered_plan: Option<TriggeredPlan>,
 }
 
 /// 銘柄の素性（ブローカーの銘柄仕様から。未取得なら銘柄名と pip 幅だけ）
@@ -209,6 +211,8 @@ pub struct MarketSnapshot {
     pub volatility: Volatility,
     pub reference_levels: ReferenceLevels,
     pub swing_points: SwingPoints,
+    #[serde(default)]
+    pub bars_1h: Vec<BarRow>,
     pub bars_15m: Vec<BarRow>,
     pub bars_5m: Vec<BarRow>,
     pub account_state: AccountState,
@@ -246,6 +250,7 @@ pub struct SnapshotInput<'a> {
 /// Snapshot 生成の設定
 #[derive(Debug, Clone)]
 pub struct SnapshotConfig {
+    pub raw_bars_1h: usize,
     pub raw_bars_15m: usize,
     pub raw_bars_5m: usize,
     pub swing_window: usize,
@@ -256,6 +261,7 @@ pub struct SnapshotConfig {
 impl Default for SnapshotConfig {
     fn default() -> Self {
         Self {
+            raw_bars_1h: 24,
             raw_bars_15m: 30,
             raw_bars_5m: 30,
             swing_window: 2,
@@ -345,6 +351,7 @@ impl MarketSnapshot {
                 h1: tail(find_swing_points(input.bars_1h, cfg.swing_window)),
                 m15: tail(find_swing_points(input.bars_15m, cfg.swing_window)),
             },
+            bars_1h: last_n_rows(input.bars_1h, cfg.raw_bars_1h),
             bars_15m: last_n_rows(input.bars_15m, cfg.raw_bars_15m),
             bars_5m: last_n_rows(input.bars_5m, cfg.raw_bars_5m),
             account_state: input.account_state.clone(),

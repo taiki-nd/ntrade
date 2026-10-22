@@ -2,9 +2,9 @@
 //!
 //! 判断と取引の対応は `cot_log_id` で辿る: `cot_logs.id` ← `positions.cot_log_id` / `trades.cot_log_id`、
 //! 教訓は `lessons.trigger_trade_id` → `trades.id`。
-//! 条件付きプランが成立すると LLM が入るかを判断し直す。取引はその再判断のログに紐づき、
-//! プランを立てた判断へは `cot_logs.origin_cot_log_id` で辿る。
-//! 旧データ（`cot-plan-*`）は LLM を通さずに発注した機械的な成立ログで、根拠は origin 側にある。
+//! 予約注文は `working_orders.cot_log_id` に置いた判断を持ち、約定した建玉にそれを引き継ぐ。
+//! 旧データ: 条件付きプランの成立時の再判断は、プランを立てた判断へ `cot_logs.origin_cot_log_id` で辿る。
+//! `cot-plan-*` は LLM を通さずに発注した機械的な成立ログで、根拠は origin 側にある。
 //! 時刻は API と同じ "YYYY-MM-DD HH:MM:SS"（UTC）の文字列で持つ（辞書順 = 時系列順）。
 
 use anyhow::Result;
@@ -12,7 +12,8 @@ use rusqlite::{named_params, params, OptionalExtension, Row};
 use serde::Serialize;
 
 use super::Db;
-use crate::server::types::{CloseReason, CoTLog, LessonLearned, Position, TradeHistory, TradeQuery};
+use crate::ctrader::BalanceEvent;
+use crate::server::types::{BalancePoint, CloseReason, CoTLog, LessonLearned, Position, TradeHistory, TradeQuery, WorkingOrder};
 
 /// ページング結果
 #[derive(Debug, Clone, Serialize)]
@@ -162,6 +163,24 @@ impl Db {
         let _ = self.conn.execute("ALTER TABLE cot_logs ADD COLUMN origin_cot_log_id TEXT", []);
         let _ = self.conn.execute("ALTER TABLE positions ADD COLUMN close_stop REAL", []);
         let _ = self.conn.execute("ALTER TABLE cot_logs ADD COLUMN fundamental_view TEXT", []);
+        // 約定待ちの予約注文（再起動しても判断との対応と終値判定ラインを失わないため）
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS working_orders (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, json TEXT NOT NULL);",
+        )?;
+        // 口座残高が動いた出来事（決済・入出金）。cTrader の履歴から取り込む。時刻は epoch 秒
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS balance_history (
+                account_id INTEGER NOT NULL,
+                id TEXT NOT NULL,
+                ts INTEGER NOT NULL,
+                version INTEGER,
+                balance REAL NOT NULL,
+                PRIMARY KEY (account_id, id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_balance_history_ts ON balance_history (account_id, ts);
+            "#,
+        )?;
 
         self.conn.execute_batch(
             r#"
@@ -275,6 +294,26 @@ impl Db {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn replace_working_orders(&mut self, orders: &[WorkingOrder]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM working_orders", [])?;
+        {
+            let mut stmt = tx.prepare("INSERT INTO working_orders (id, created_at, json) VALUES (?1, ?2, ?3)")?;
+            for o in orders {
+                stmt.execute(params![o.id, o.created_at, serde_json::to_string(o)?])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 予約注文の古い順
+    pub fn working_orders(&self) -> Result<Vec<WorkingOrder>> {
+        let mut stmt = self.conn.prepare("SELECT json FROM working_orders ORDER BY created_at ASC, rowid ASC")?;
+        let rows: Vec<String> = stmt.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
+        rows.iter().map(|j| Ok(serde_json::from_str(j)?)).collect()
     }
 
     /// 建玉の古い順
@@ -406,6 +445,57 @@ impl Db {
             .conn
             .query_row(&format!("SELECT {LESSON_COLS} FROM lessons WHERE id = ?1"), params![id], row_to_lesson)
             .optional()?)
+    }
+
+    // ------------------------------------------------------ balance_history
+
+    /// 取り込み済みの出来事は上書きする（同じ期間を取り直しても重複しない）
+    pub fn insert_balance_events(&mut self, account_id: i64, events: &[BalanceEvent]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO balance_history (account_id, id, ts, version, balance) VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for e in events {
+                stmt.execute(params![account_id, e.id, e.time.timestamp(), e.version, e.balance])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 取り込み済みの最新の出来事の時刻（epoch 秒）
+    pub fn latest_balance_ts(&self, account_id: i64) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row("SELECT MAX(ts) FROM balance_history WHERE account_id = ?1", params![account_id], |r| r.get(0))?)
+    }
+
+    /// `from`（epoch 秒）以降の残高の推移を古い順に返す。期間の頭から線を引けるよう、
+    /// それより前の最後の残高を `from` 時点の点として先頭に置く
+    pub fn balance_history(&self, account_id: i64, from: Option<i64>) -> Result<Vec<BalancePoint>> {
+        let point = |ts: i64, balance: f64| BalancePoint { time: super::fmt_ts(ts), balance };
+        let mut points = Vec::new();
+        if let Some(from) = from {
+            let before: Option<f64> = self
+                .conn
+                .query_row(
+                    "SELECT balance FROM balance_history WHERE account_id = ?1 AND ts < ?2
+                     ORDER BY ts DESC, version DESC LIMIT 1",
+                    params![account_id, from],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            points.extend(before.map(|b| point(from, b)));
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT ts, balance FROM balance_history WHERE account_id = ?1 AND (?2 IS NULL OR ts >= ?2)
+             ORDER BY ts, version",
+        )?;
+        for row in stmt.query_map(params![account_id, from], |r| Ok(point(r.get(0)?, r.get(1)?)))? {
+            points.push(row?);
+        }
+        Ok(points)
     }
 }
 
@@ -726,5 +816,31 @@ mod tests {
         assert!(all[0].active);
         assert!(db.delete_lesson("les-1").unwrap());
         assert!(!db.delete_lesson("les-1").unwrap());
+    }
+
+    #[test]
+    fn balance_history_starts_at_range_and_dedupes() {
+        use chrono::TimeZone;
+        let mut db = Db::open_in_memory().unwrap();
+        let ev = |id: &str, ts: i64, version: i64, balance: f64| BalanceEvent {
+            id: id.into(),
+            time: chrono::Utc.timestamp_opt(ts, 0).unwrap(),
+            version: Some(version),
+            balance,
+        };
+        assert_eq!(db.latest_balance_ts(1).unwrap(), None);
+        db.insert_balance_events(1, &[ev("cash-1", 100, 1, 1000.0), ev("deal-1", 200, 2, 1100.0), ev("deal-2", 200, 3, 1050.0)])
+            .unwrap();
+        // 取り直しても重複しない。別口座は混ざらない
+        db.insert_balance_events(1, &[ev("deal-2", 200, 3, 1050.0)]).unwrap();
+        db.insert_balance_events(2, &[ev("deal-9", 150, 1, 5.0)]).unwrap();
+        assert_eq!(db.latest_balance_ts(1).unwrap(), Some(200));
+
+        let all = db.balance_history(1, None).unwrap();
+        assert_eq!(all.iter().map(|p| p.balance).collect::<Vec<_>>(), vec![1000.0, 1100.0, 1050.0]);
+        // 期間の頭には、それ以前の最後の残高が置かれる
+        let recent = db.balance_history(1, Some(150)).unwrap();
+        assert_eq!(recent[0], BalancePoint { time: crate::storage::fmt_ts(150), balance: 1000.0 });
+        assert_eq!(recent.len(), 3);
     }
 }

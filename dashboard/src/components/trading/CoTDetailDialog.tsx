@@ -27,6 +27,7 @@ import {
   ShieldAlert,
   GitBranch,
   Landmark,
+  ListChecks,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -34,14 +35,14 @@ export function ActionBadge({ action, className }: { action: ActionType; classNa
   switch (action) {
     case "BUY":
       return (
-        <Badge className={cn("bg-emerald-600 hover:bg-emerald-600 text-white gap-1 shrink-0", className)}>
+        <Badge className={cn("bg-profit hover:bg-profit/90 text-white gap-1 shrink-0", className)}>
           <ArrowUpRight className="h-3.5 w-3.5" />
           BUY
         </Badge>
       );
     case "SELL":
       return (
-        <Badge className={cn("bg-rose-600 hover:bg-rose-600 text-white gap-1 shrink-0", className)}>
+        <Badge className={cn("bg-loss hover:bg-loss/90 text-white gap-1 shrink-0", className)}>
           <ArrowDownRight className="h-3.5 w-3.5" />
           SELL
         </Badge>
@@ -50,15 +51,58 @@ export function ActionBadge({ action, className }: { action: ActionType; classNa
       return (
         <Badge variant="outline" className={cn("text-muted-foreground gap-1 border-dashed shrink-0", className)}>
           <MinusCircle className="h-3.5 w-3.5" />
-          HOLD (見送り)
+          HOLD
         </Badge>
       );
   }
 }
 
+/** 新規注文の種類（旧データの成行・条件付きプランを含む） */
+export const ENTRY_TYPE_LABELS: Record<string, string> = {
+  LIMIT: "指値",
+  STOP: "逆指値",
+  MARKET: "成行",
+  CONDITIONAL: "条件付き",
+};
+
+/** 判断で行った、既存の予約注文・建玉への操作 1 件 */
+export interface ManageNote {
+  op: string;
+  target: string;
+  id: string;
+  result: string;
+  failed: boolean;
+}
+
+const MANAGE_OP_LABELS: Record<string, string> = { CANCEL: "取消", CLOSE: "決済", MODIFY: "変更" };
+const MANAGE_TARGET_LABELS: Record<string, string> = { ORDER: "予約注文", POSITION: "建玉" };
+
+/**
+ * 判断ログの guard_result を「新規注文の不通過理由・発注エラー」と「注文・建玉への操作」に分ける。
+ * エンジンは `<ガード名|...> / MANAGE <OP> <TARGET> <ID>: <結果> / MANAGE ...` の形で記録する
+ */
+export function splitGuardResult(guardResult?: string): { guard?: string; manage: ManageNote[] } {
+  if (!guardResult) return { manage: [] };
+  const chunks = guardResult.startsWith("MANAGE ") ? ["", guardResult.slice(7)] : guardResult.split(" / MANAGE ");
+  const guard = chunks[0].trim() || undefined;
+  const manage = chunks.slice(1).map((c) => {
+    const m = c.replace(/^MANAGE /, "").match(/^(\S+) (\S+) (\S+): ([\s\S]*)$/);
+    if (!m) return { op: "", target: "", id: "", result: c, failed: c.includes("FAILED") };
+    return { op: m[1], target: m[2], id: m[3], result: m[4], failed: m[4].startsWith("FAILED") };
+  });
+  return { guard: guard === "PASS" ? undefined : guard, manage };
+}
+
+/** 操作 1 件の表示用ラベル（例: 「建玉 123 を変更」） */
+export function manageNoteLabel(n: ManageNote): string {
+  if (!n.op) return n.result;
+  return `${MANAGE_TARGET_LABELS[n.target] ?? n.target} ${n.id} を${MANAGE_OP_LABELS[n.op] ?? n.op}`;
+}
+
 export function getGuardShortLabel(guardResult?: string): string | null {
-  if (!guardResult || guardResult === "PASS") return null;
-  const parts = guardResult.split("|").map((p) => p.trim()).filter(Boolean);
+  const guard = splitGuardResult(guardResult).guard;
+  if (!guard) return null;
+  const parts = guard.split("|").map((p) => p.trim()).filter(Boolean);
   if (parts.length === 0) return null;
 
   const labelMap: Record<string, string> = {
@@ -74,6 +118,9 @@ export function getGuardShortLabel(guardResult?: string): string | null {
     DAILY_LOSS_LIMIT: "損失限度到達",
     NEWS_BLACKOUT: "指標前後",
     OBSERVED_MISMATCH: "観測不整合",
+    ENTRY_TYPE: "注文種別不正",
+    ORDER_PRICE_SIDE: "注文価格の位置不正",
+    ORDER_EXPIRY: "期限不正",
     PLAN_UNSTRUCTURED: "プラン不正",
     PLAN_NO_SL_TP: "プランSL未設定",
     PLAN_EXPIRY: "期限切れ",
@@ -113,17 +160,17 @@ export function ExecutionBadge({
       <Badge
         variant="outline"
         className={cn(
-          "text-[10px] text-emerald-600 dark:text-emerald-400 border-emerald-500/30 bg-emerald-500/10 gap-1 shrink-0 py-0 px-1.5 h-5 font-medium",
+          "text-[10px] text-profit border-profit/30 bg-profit/10 gap-1 shrink-0 py-0 px-1.5 h-5 font-medium",
           className
         )}
       >
         <ShieldCheck className="h-3 w-3" />
-        発注済
+        注文済
       </Badge>
     );
   }
 
-  const isOrderFailed = guardResult?.includes("ORDER_FAILED");
+  const isOrderFailed = splitGuardResult(guardResult).guard?.includes("ORDER_FAILED");
   const shortLabel = getGuardShortLabel(guardResult);
 
   if (isOrderFailed) {
@@ -131,7 +178,7 @@ export function ExecutionBadge({
       <Badge
         variant="outline"
         className={cn(
-          "text-[10px] text-rose-700 dark:text-rose-400 border-rose-500/40 bg-rose-500/10 gap-1 shrink-0 py-0 px-1.5 h-5 font-semibold",
+          "text-[10px] text-loss border-loss/40 bg-loss/10 gap-1 shrink-0 py-0 px-1.5 h-5 font-semibold",
           className
         )}
         title={guardResult ? `発注エラー: ${guardResult}` : "発注エラー"}
@@ -146,7 +193,7 @@ export function ExecutionBadge({
     <Badge
       variant="outline"
       className={cn(
-        "text-[10px] text-amber-700 dark:text-amber-400 border-amber-500/40 bg-amber-500/10 gap-1 shrink-0 py-0 px-1.5 h-5 font-semibold",
+        "text-[10px] text-warning border-warning/40 bg-warning/10 gap-1 shrink-0 py-0 px-1.5 h-5 font-semibold",
         className
       )}
       title={guardResult ? `未発注理由: ${guardResult}` : "未発注"}
@@ -194,6 +241,28 @@ function getGuardReasonDetails(code: string, log?: CoTDetail["log"]): GuardReaso
   }
 
   switch (key) {
+    case "ENTRY_TYPE":
+      return {
+        code: key,
+        title: "注文の種類が不正",
+        description: "新規の注文は指値（LIMIT）か逆指値（STOP）だけです。成行や種類の無い注文は出しません。",
+      };
+    case "ORDER_PRICE_SIDE":
+      return {
+        code: key,
+        title: "注文価格の位置が種類と合わない",
+        description: extraDetail
+          ? `指値は現在値より有利な側、逆指値は不利な側に置く必要があります（${extraDetail}）。逆側に置くと即座に約定するかブローカーに拒否されます。`
+          : "指値は現在値より有利な側、逆指値は不利な側に置く必要があります。",
+      };
+    case "ORDER_EXPIRY":
+      return {
+        code: key,
+        title: "注文の期限が不正",
+        description: extraDetail
+          ? `予約注文には上限内の有効期限が必要です（${extraDetail}）。`
+          : "予約注文には設定の上限内の有効期限が必要です。",
+      };
     case "MARGIN_LIMIT":
       return {
         code: key,
@@ -374,8 +443,11 @@ function getGuardReasonDetails(code: string, log?: CoTDetail["log"]): GuardReaso
 }
 
 function parseGuardReasons(guardResult?: string, log?: CoTDetail["log"]): GuardReasonInfo[] {
-  if (!guardResult || guardResult === "PASS") return [];
-  return guardResult
+  const guard = splitGuardResult(guardResult).guard;
+  if (!guard) return [];
+  // 発注エラーの本文には "|" が入りうるので分けない
+  if (guard.startsWith("ORDER_FAILED")) return [getGuardReasonDetails(guard, log)];
+  return guard
     .split("|")
     .map((r) => r.trim())
     .filter(Boolean)
@@ -393,12 +465,11 @@ export function CoTDetailDialog({ cotLogId, onClose }: CoTDetailDialogProps) {
   // 取得結果は ID ごとに持ち、別の判断を開いた直後に前の内容を出さない
   const [loaded, setLoaded] = React.useState<{ id: string; detail?: CoTDetail; error?: string } | null>(null);
   // 条件付きプランは「成立を受けた再判断（旧データは成立ログ）」と「プランを立てた判断」に分かれるため、同じダイアログ内で行き来する
-  const [viewingId, setViewingId] = React.useState<string | null>(null);
+  // 開いた判断（cotLogId）ごとに持ち、別の判断を開き直したら元に戻す
+  const [viewing, setViewing] = React.useState<{ base: string | null; id: string } | null>(null);
+  const viewingId = viewing?.base === cotLogId ? viewing.id : null;
+  const setViewingId = (id: string | null) => setViewing(id ? { base: cotLogId, id } : null);
   const shownId = viewingId ?? cotLogId;
-
-  React.useEffect(() => {
-    setViewingId(null);
-  }, [cotLogId]);
 
   React.useEffect(() => {
     if (!shownId) return;
@@ -425,6 +496,9 @@ export function CoTDetailDialog({ cotLogId, onClose }: CoTDetailDialogProps) {
   const log = detail?.log;
   const digits = log ? priceDigits(log.symbol) : 5;
   const guardReasons = React.useMemo(() => parseGuardReasons(log?.guardResult, log), [log]);
+  const { guard: guardPart, manage: manageNotes } = React.useMemo(() => splitGuardResult(log?.guardResult), [log]);
+  const orderFailed = !!guardPart?.includes("ORDER_FAILED");
+  const entryLabel = log?.entryType ? ENTRY_TYPE_LABELS[log.entryType] ?? log.entryType : null;
   const effectiveRR = React.useMemo(() => getEffectiveRiskRewardRatio(log), [log]);
 
   return (
@@ -433,8 +507,8 @@ export function CoTDetailDialog({ cotLogId, onClose }: CoTDetailDialogProps) {
         <DialogHeader>
           <div className="flex items-center justify-between pr-6">
             <DialogTitle className="flex items-center gap-2.5 text-lg flex-wrap">
-              <BrainCircuit className="h-5 w-5 text-indigo-500 shrink-0" />
-              <span>推論詳細{log ? `: ${log.symbol}` : ""}</span>
+              <BrainCircuit className="h-5 w-5 text-primary shrink-0" />
+              <span>判断の詳細{log ? `: ${log.symbol}` : ""}</span>
               {log && (
                 <div className="flex items-center gap-1.5 shrink-0">
                   <ActionBadge action={log.action} />
@@ -448,8 +522,8 @@ export function CoTDetailDialog({ cotLogId, onClose }: CoTDetailDialogProps) {
             </DialogTitle>
           </div>
           <DialogDescription className="text-xs font-mono text-muted-foreground break-all">
-            推論ID: {shownId}
-            {log && ` | 時刻: ${log.timestamp} | スプレッド: ${log.spreadPips} pips`}
+            判断ID: {shownId}
+            {log && ` | ${log.timestamp} (UTC) | スプレッド: ${log.spreadPips} pips`}
           </DialogDescription>
         </DialogHeader>
 
@@ -466,8 +540,8 @@ export function CoTDetailDialog({ cotLogId, onClose }: CoTDetailDialogProps) {
             {/* 確信度 & リスクリワード */}
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 p-3 rounded-lg bg-muted/40 border">
               <div className="min-w-0">
-                <span className="text-xs text-muted-foreground">推論確信度</span>
-                <div className="text-lg font-bold font-mono text-indigo-600 dark:text-indigo-400">
+                <span className="text-xs text-muted-foreground">確信度</span>
+                <div className="text-lg font-bold font-mono text-primary">
                   {(log.confidence * 100).toFixed(0)}%
                 </div>
               </div>
@@ -476,30 +550,30 @@ export function CoTDetailDialog({ cotLogId, onClose }: CoTDetailDialogProps) {
                 <>
                   <div className="min-w-0">
                     <span className="text-xs text-muted-foreground">想定リスクリワード比</span>
-                    <div className="text-lg font-bold font-mono text-emerald-600 dark:text-emerald-400">
+                    <div className="text-lg font-bold font-mono text-profit">
                       {effectiveRR != null ? `1 : ${effectiveRR.toFixed(2)}` : "-"}
                     </div>
                   </div>
                   <div className="min-w-0">
-                    <span className="text-xs text-muted-foreground">発注執行ステータス</span>
+                    <span className="text-xs text-muted-foreground">新規注文</span>
                     <div className="text-sm font-semibold mt-1">
                       {log.executed ? (
-                        <span className="text-emerald-600 dark:text-emerald-400 flex items-center gap-1">
+                        <span className="text-profit flex items-center gap-1">
                           <ShieldCheck className="h-4 w-4 shrink-0" />
-                          <span>発注済み</span>
+                          <span>{entryLabel ? `${entryLabel}を発注` : "発注済み"}</span>
                         </span>
-                      ) : log.guardResult?.includes("ORDER_FAILED") ? (
-                        <span className="text-rose-600 dark:text-rose-400 flex items-center gap-1">
+                      ) : orderFailed ? (
+                        <span className="text-loss flex items-center gap-1">
                           <ShieldAlert className="h-4 w-4 shrink-0" />
                           <span>未発注（発注エラー）</span>
                         </span>
-                      ) : log.guardResult && log.guardResult !== "PASS" ? (
-                        <span className="text-amber-600 dark:text-amber-400 flex items-center gap-1">
+                      ) : guardPart ? (
+                        <span className="text-warning flex items-center gap-1">
                           <ShieldAlert className="h-4 w-4 shrink-0" />
                           <span>未発注（ガード抑止{getGuardShortLabel(log.guardResult) ? `: ${getGuardShortLabel(log.guardResult)}` : ""}）</span>
                         </span>
                       ) : (
-                        <span className="text-amber-600 dark:text-amber-400 flex items-center gap-1">
+                        <span className="text-warning flex items-center gap-1">
                           <ShieldAlert className="h-4 w-4 shrink-0" />
                           <span>未発注（未執行）</span>
                         </span>
@@ -515,32 +589,32 @@ export function CoTDetailDialog({ cotLogId, onClose }: CoTDetailDialogProps) {
               <div
                 className={cn(
                   "space-y-2.5 p-3.5 rounded-lg border",
-                  log.guardResult?.includes("ORDER_FAILED")
-                    ? "border-rose-500/30 bg-rose-500/5 dark:bg-rose-950/20"
-                    : "border-amber-500/30 bg-amber-500/5 dark:bg-amber-950/20"
+                  orderFailed
+                    ? "border-loss/30 bg-loss/5"
+                    : "border-warning/30 bg-warning/5"
                 )}
               >
                 <div className="flex items-start justify-between gap-2 flex-wrap">
                   <div
                     className={cn(
                       "flex min-w-0 items-center gap-2 text-xs font-semibold",
-                      log.guardResult?.includes("ORDER_FAILED")
-                        ? "text-rose-700 dark:text-rose-400"
-                        : "text-amber-700 dark:text-amber-400"
+                      orderFailed
+                        ? "text-loss"
+                        : "text-warning"
                     )}
                   >
                     <ShieldAlert className="h-4 w-4 shrink-0" />
                     <span>
-                      {log.guardResult?.includes("ORDER_FAILED")
+                      {orderFailed
                         ? "未発注理由（注文執行エラー）"
                         : guardReasons.length > 0
                         ? "未発注理由（事後ガードによる抑止）"
                         : "未発注理由（注文未執行）"}
                     </span>
                   </div>
-                  {log.guardResult && (
+                  {guardPart && (
                     <span className="min-w-0 w-full sm:w-auto max-w-full text-[11px] font-mono text-muted-foreground bg-muted/60 px-1.5 py-0.5 rounded border whitespace-pre-wrap break-all">
-                      {log.guardResult}
+                      {guardPart}
                     </span>
                   )}
                 </div>
@@ -553,15 +627,15 @@ export function CoTDetailDialog({ cotLogId, onClose }: CoTDetailDialogProps) {
                         className={cn(
                           "p-2.5 rounded-md bg-card/80 border space-y-1 text-xs shadow-xs",
                           reason.code === "ORDER_FAILED"
-                            ? "border-rose-500/30"
-                            : "border-amber-500/20"
+                            ? "border-loss/30"
+                            : "border-warning/20"
                         )}
                       >
                         <div className="flex items-center gap-2 flex-wrap">
                           <span
                             className={cn(
                               "font-semibold",
-                              reason.code === "ORDER_FAILED" ? "text-rose-600 dark:text-rose-400" : "text-foreground"
+                              reason.code === "ORDER_FAILED" ? "text-loss" : "text-foreground"
                             )}
                           >
                             {reason.title}
@@ -571,8 +645,8 @@ export function CoTDetailDialog({ cotLogId, onClose }: CoTDetailDialogProps) {
                             className={cn(
                               "text-[10px] font-mono py-0 px-1.5 h-4",
                               reason.code === "ORDER_FAILED"
-                                ? "text-rose-600 border-rose-500/30"
-                                : "text-muted-foreground border-amber-500/30"
+                                ? "text-loss border-loss/30"
+                                : "text-muted-foreground border-warning/30"
                             )}
                           >
                             {reason.code}
@@ -592,7 +666,7 @@ export function CoTDetailDialog({ cotLogId, onClose }: CoTDetailDialogProps) {
               </div>
             )}
 
-            {/* 条件付きプランは「プランを立てた判断」と「成立を受けた再判断」に分かれる。
+            {/* 旧データ: 条件付きプランは「プランを立てた判断」と「成立を受けた再判断」に分かれる。
                 cot-plan-* は再判断を導入する前の、LLM を通さずに発注した成立ログ */}
             {(detail.origin || viewingId) && (
               <div className="flex flex-wrap items-center gap-2 p-3 rounded-lg border bg-muted/30">
@@ -649,8 +723,8 @@ export function CoTDetailDialog({ cotLogId, onClose }: CoTDetailDialogProps) {
                           className={cn(
                             "font-mono font-semibold",
                             t.pnlPips >= 0
-                              ? "text-emerald-600 dark:text-emerald-400"
-                              : "text-rose-600 dark:text-rose-400"
+                              ? "text-profit"
+                              : "text-loss"
                           )}
                         >
                           {t.pnlPips >= 0 ? "+" : ""}
@@ -664,22 +738,45 @@ export function CoTDetailDialog({ cotLogId, onClose }: CoTDetailDialogProps) {
               )}
             </div>
 
-            {/* 価格設定 (BUY / SELLの場合) */}
+            {/* 既存の予約注文・建玉への操作 */}
+            {manageNotes.length > 0 && (
+              <div className="space-y-2 p-3 rounded-lg border bg-card">
+                <div className="flex items-center gap-2 text-xs font-semibold text-muted-foreground">
+                  <ListChecks className="h-4 w-4" />
+                  <span>既存の注文・建玉への操作</span>
+                </div>
+                <ul className="space-y-1.5 text-sm">
+                  {manageNotes.map((n, i) => (
+                    <li key={i} className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="font-medium">{manageNoteLabel(n)}</span>
+                      <Badge
+                        variant="outline"
+                        className={cn("text-[11px] font-mono max-w-full whitespace-normal break-all", n.failed ? "border-loss/40 text-loss" : "text-muted-foreground")}
+                      >
+                        {n.result}
+                      </Badge>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
+            {/* 注文の価格 (BUY / SELLの場合) */}
             {log.action !== "HOLD" && log.entryPrice && (
               <div className="grid grid-cols-3 gap-2 text-center p-3 rounded-lg border bg-card">
                 <div>
-                  <span className="text-xs text-muted-foreground">想定エントリー価格</span>
+                  <span className="text-xs text-muted-foreground">{entryLabel ? `${entryLabel}の価格` : "エントリー価格"}</span>
                   <p className="font-mono text-base font-bold">{log.entryPrice.toFixed(digits)}</p>
                 </div>
                 <div>
                   <span className="text-xs text-muted-foreground">ストップロス (SL)</span>
-                  <p className="font-mono text-base font-bold text-rose-600 dark:text-rose-400">
+                  <p className="font-mono text-base font-bold text-loss">
                     {log.stopLoss?.toFixed(digits)}
                   </p>
                 </div>
                 <div>
                   <span className="text-xs text-muted-foreground">テイクプロフィット (TP)</span>
-                  <p className="font-mono text-base font-bold text-emerald-600 dark:text-emerald-400">
+                  <p className="font-mono text-base font-bold text-profit">
                     {log.takeProfit?.toFixed(digits)}
                   </p>
                 </div>
@@ -697,31 +794,31 @@ export function CoTDetailDialog({ cotLogId, onClose }: CoTDetailDialogProps) {
               </div>
             )}
 
-            {/* 価格の位置（ファンダ判断以降）／ 旧データは 4H・1H の環境認識 */}
+            {/* 流れの読み（日中短期）／ ファンダ判断の時期は価格の位置 */}
             <div className="space-y-1.5 p-3 rounded-lg border bg-card">
               <div className="flex items-center gap-2 text-xs font-semibold text-muted-foreground">
-                <TrendingUp className="h-4 w-4 text-blue-500" />
-                <span>{log.fundamentalView ? "1. 価格の位置とエントリー・利確の根拠" : "1. 環境認識 (4H / 1H)"}</span>
+                <TrendingUp className="h-4 w-4 text-primary" />
+                <span>{log.fundamentalView ? "1. 価格の位置とエントリー・利確の根拠" : "1. 流れの読み（上位足と直近の値動き）"}</span>
               </div>
               <p className="text-sm leading-relaxed">{log.macroContext}</p>
             </div>
 
-            {/* 注文の攻防 (15M / 5M)。プライスアクション判断だった旧データのみ */}
+            {/* 注文の価格の根拠（旧: プライスアクション判断の注文の攻防） */}
             {log.orderFlow && (
               <div className="space-y-1.5 p-3 rounded-lg border bg-card">
                 <div className="flex items-center gap-2 text-xs font-semibold text-muted-foreground">
-                  <Sparkles className="h-4 w-4 text-amber-500" />
-                  <span>2. 注文の攻防 (15M / 5M)</span>
+                  <Sparkles className="h-4 w-4 text-warning" />
+                  <span>2. 注文の価格・利確の根拠</span>
                 </div>
                 <p className="text-sm leading-relaxed font-medium">{log.orderFlow}</p>
               </div>
             )}
 
             {/* シナリオ無効化価格 (客観的SL理由) */}
-            <div className="space-y-1.5 p-3 rounded-lg border border-rose-500/20 bg-rose-50/30 dark:bg-rose-950/20">
-              <div className="flex items-center gap-2 text-xs font-semibold text-rose-600 dark:text-rose-400">
+            <div className="space-y-1.5 p-3 rounded-lg border border-loss/20 bg-loss/30">
+              <div className="flex items-center gap-2 text-xs font-semibold text-loss">
                 <ShieldCheck className="h-4 w-4" />
-                <span>3. シナリオ無効化ライン（客観的損切り根拠）</span>
+                <span>3. 読みが崩れる価格（損切りの根拠）</span>
               </div>
               <p className="text-sm leading-relaxed text-foreground">{log.invalidation}</p>
             </div>
@@ -739,8 +836,8 @@ export function CoTDetailDialog({ cotLogId, onClose }: CoTDetailDialogProps) {
             {/* 総合思考ロジック (Reasoning全文) */}
             <div className="space-y-1.5 p-3 rounded-lg border bg-muted/30">
               <div className="flex items-center gap-2 text-xs font-semibold text-muted-foreground">
-                <Target className="h-4 w-4 text-indigo-500" />
-                <span>5. LLM 総合判断理由 (CoT Reasoning)</span>
+                <Target className="h-4 w-4 text-primary" />
+                <span>5. 判断理由のまとめ</span>
               </div>
               <p className="text-sm leading-relaxed text-muted-foreground whitespace-pre-wrap">
                 {log.reasoning}

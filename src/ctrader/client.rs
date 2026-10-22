@@ -1,11 +1,12 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use ctrader_rs::proto::common::{
-    ProtoMessage, ProtoOaAccessRights, ProtoOaAssetClassListReq, ProtoOaAssetClassListRes, ProtoOaAssetListReq,
-    ProtoOaAssetListRes, ProtoOaClosePositionReq, ProtoOaErrorRes, ProtoOaExecutionEvent, ProtoOaExecutionType,
-    ProtoOaGetTrendbarsReq, ProtoOaGetTrendbarsRes, ProtoOaOrderErrorEvent, ProtoOaPayloadType, ProtoOaSpotEvent,
-    ProtoOaSymbol, ProtoOaSymbolByIdReq, ProtoOaSymbolByIdRes, ProtoOaSymbolCategoryListReq,
-    ProtoOaSymbolCategoryListRes, ProtoOaTradeSide, ProtoOaTradingMode,
+    ProtoMessage, ProtoOaAccessRights, ProtoOaAmendOrderReq, ProtoOaAssetClassListReq, ProtoOaAssetClassListRes,
+    ProtoOaAssetListReq, ProtoOaAssetListRes, ProtoOaCancelOrderReq, ProtoOaClosePositionReq, ProtoOaErrorRes,
+    ProtoOaExecutionEvent, ProtoOaExecutionType, ProtoOaGetTrendbarsReq, ProtoOaGetTrendbarsRes, ProtoOaNewOrderReq,
+    ProtoOaOrderErrorEvent, ProtoOaOrderStatus, ProtoOaOrderType, ProtoOaPayloadType, ProtoOaSpotEvent, ProtoOaSymbol,
+    ProtoOaSymbolByIdReq, ProtoOaSymbolByIdRes, ProtoOaSymbolCategoryListReq, ProtoOaSymbolCategoryListRes,
+    ProtoOaTimeInForce, ProtoOaTradeSide, ProtoOaTradingMode,
 };
 use ctrader_rs::{Client, Config};
 use prost::Message as _;
@@ -19,7 +20,8 @@ use tracing::{debug, info, warn};
 
 use super::config::CTraderConfig;
 use super::types::{
-    quote_currency_from_name, AccountSummary, BarPeriod, BrokerPosition, CandleBar, ClosedDeal, Quote, SymbolInfo,
+    quote_currency_from_name, AccountSummary, BalanceEvent, BarPeriod, BrokerOrder, BrokerPosition, CandleBar, ClosedDeal, OrderFate,
+    PendingKind, Quote, SymbolInfo,
 };
 use crate::instrument::{self, Holiday, InstrumentSpec, WeeklyInterval};
 
@@ -728,11 +730,19 @@ impl CTraderService {
             is_live: self.config.is_live,
             access_rights,
             deposit_currency,
+            registered_at: t
+                .registration_timestamp
+                .and_then(|ms| chrono::TimeZone::timestamp_millis_opt(&Utc, ms).single()),
         })
     }
 
     /// ブローカー側の保有ポジション一覧（reconcile）
     pub async fn get_open_positions(&self) -> Result<Vec<BrokerPosition>> {
+        Ok(self.get_open_book().await?.0)
+    }
+
+    /// ブローカー側の保有ポジションと予約注文（1 回の reconcile で両方取る）
+    pub async fn get_open_book(&self) -> Result<(Vec<BrokerPosition>, Vec<BrokerOrder>)> {
         let res = self
             .client
             .reconcile(self.config.account_id, false)
@@ -740,6 +750,27 @@ impl CTraderService {
             .context("Failed to reconcile positions from cTrader")?;
         let by_id: HashMap<i64, String> =
             self.symbols.read().await.values().map(|s| (s.symbol_id, s.symbol_name.clone())).collect();
+        let mut orders = Vec::with_capacity(res.order.len());
+        for o in &res.order {
+            let kind = match ProtoOaOrderType::try_from(o.order_type) {
+                Ok(ProtoOaOrderType::Limit) => Some(PendingKind::Limit),
+                Ok(ProtoOaOrderType::Stop) => Some(PendingKind::Stop),
+                _ => None,
+            };
+            orders.push(BrokerOrder {
+                order_id: o.order_id,
+                symbol_id: o.trade_data.symbol_id,
+                symbol_name: by_id.get(&o.trade_data.symbol_id).cloned(),
+                is_buy: o.trade_data.trade_side == ProtoOaTradeSide::Buy as i32,
+                kind,
+                volume_lots: self.volume_to_lots_by_id(o.trade_data.symbol_id, o.trade_data.volume).await,
+                price: o.limit_price.or(o.stop_price),
+                stop_loss: o.stop_loss,
+                take_profit: o.take_profit,
+                expires_at: o.expiration_timestamp.and_then(|ms| chrono::TimeZone::timestamp_millis_opt(&Utc, ms).single()),
+                comment: o.trade_data.comment.clone().filter(|c| !c.is_empty()),
+            });
+        }
         let mut out = Vec::with_capacity(res.position.len());
         for p in &res.position {
             out.push(BrokerPosition {
@@ -759,9 +790,225 @@ impl CTraderService {
                 used_margin: p
                     .used_margin
                     .map(|m| m as f64 / 10f64.powi(p.money_digits.unwrap_or(2) as i32)),
+                comment: p.trade_data.comment.clone().filter(|c| !c.is_empty()),
             });
         }
-        Ok(out)
+        Ok((out, orders))
+    }
+
+    /// 予約注文の結末（約定・取消・期限切れ）。ブローカーから注文が消えたときに、どうなったかを引く
+    pub async fn order_fate(&self, order_id: i64) -> Result<OrderFate> {
+        let res = self
+            .client
+            .order_details(self.config.account_id, order_id)
+            .await
+            .with_context(|| format!("Failed to fetch order details for {order_id}"))?;
+        let o = &res.order;
+        Ok(match ProtoOaOrderStatus::try_from(o.order_status) {
+            Ok(ProtoOaOrderStatus::OrderStatusFilled) => match o.position_id {
+                Some(position_id) => OrderFate::Filled { position_id },
+                None => OrderFate::Unknown,
+            },
+            Ok(ProtoOaOrderStatus::OrderStatusCancelled) => OrderFate::Cancelled,
+            Ok(ProtoOaOrderStatus::OrderStatusExpired) => OrderFate::Expired,
+            Ok(ProtoOaOrderStatus::OrderStatusRejected) => OrderFate::Rejected,
+            Ok(ProtoOaOrderStatus::OrderStatusAccepted) => OrderFate::Working,
+            _ => OrderFate::Unknown,
+        })
+    }
+
+    /// 価格を銘柄の桁数に丸める（桁数の合わない価格は注文ごと拒否される）
+    async fn round_price(&self, symbol_name: &str, price: f64) -> f64 {
+        let digits = match self.symbol_spec(symbol_name).await {
+            Ok(spec) => spec.digits,
+            Err(_) => instrument::price_digits(symbol_name) as i32,
+        };
+        let scale = 10f64.powi(digits.clamp(0, 10));
+        (price * scale).round() / scale
+    }
+
+    async fn round_opt(&self, symbol_name: &str, price: Option<f64>) -> Option<f64> {
+        match price {
+            Some(p) => Some(self.round_price(symbol_name, p).await),
+            None => None,
+        }
+    }
+
+    /// 要求を clientMsgId 無しで送る。応答は非請求の執行イベントとして届くので、呼び出し側が
+    /// `await_execution` で拾う（ctrader-rs の request/response では拾えないため）
+    async fn send_unsolicited(&self, payload_type: u32, payload: Vec<u8>) -> Result<()> {
+        let envelope = ProtoMessage { payload_type, payload: Some(payload), client_msg_id: None };
+        let mut frame = Vec::new();
+        envelope.encode(&mut frame)?;
+        self.client.transport.send(&frame).await.map_err(|e| anyhow!(e).context("Failed to send order request"))
+    }
+
+    /// 予約注文（指値・逆指値）を SL/TP・有効期限付きで置く。受理された注文 ID を返す。
+    ///
+    /// SL/TP は絶対価格で付ける（予約注文は約定価格を待たずに絶対価格を指定できる）。
+    /// `comment` には判断 ID を入れ、建玉に引き継がせて照合時に判断へ辿れるようにする。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn place_pending_order(
+        &self,
+        symbol_name: &str,
+        is_buy: bool,
+        kind: PendingKind,
+        volume: i64,
+        price: f64,
+        stop_loss: f64,
+        take_profit: f64,
+        expires_at: chrono::DateTime<Utc>,
+        comment: &str,
+    ) -> Result<i64> {
+        let symbol_id = self.get_symbol_id(symbol_name).await?;
+        let price = self.round_price(symbol_name, price).await;
+        let (stop_loss, take_profit) =
+            (self.round_price(symbol_name, stop_loss).await, self.round_price(symbol_name, take_profit).await);
+        let client_order_id = format!("nt-{}", Utc::now().timestamp_micros());
+        let req = ProtoOaNewOrderReq {
+            payload_type: Some(ProtoOaPayloadType::ProtoOaNewOrderReq as i32),
+            ctid_trader_account_id: self.config.account_id,
+            symbol_id,
+            order_type: match kind {
+                PendingKind::Limit => ProtoOaOrderType::Limit as i32,
+                PendingKind::Stop => ProtoOaOrderType::Stop as i32,
+            },
+            trade_side: if is_buy { ProtoOaTradeSide::Buy as i32 } else { ProtoOaTradeSide::Sell as i32 },
+            volume,
+            limit_price: (kind == PendingKind::Limit).then_some(price),
+            stop_price: (kind == PendingKind::Stop).then_some(price),
+            time_in_force: Some(ProtoOaTimeInForce::GoodTillDate as i32),
+            expiration_timestamp: Some(expires_at.timestamp_millis()),
+            stop_loss: Some(stop_loss),
+            take_profit: Some(take_profit),
+            comment: Some(comment.to_string()),
+            label: Some("ntrade".to_string()),
+            client_order_id: Some(client_order_id.clone()),
+            ..Default::default()
+        };
+        info!(
+            symbol_name, is_buy, ?kind, volume, price, stop_loss, take_profit, expires = %expires_at, comment,
+            "Placing pending order"
+        );
+        let mut rx = self.order_events.subscribe();
+        let deadline = Instant::now() + ORDER_OUTCOME_TIMEOUT;
+        self.send_unsolicited(ProtoOaPayloadType::ProtoOaNewOrderReq as u32, req.encode_to_vec()).await?;
+        let ev = self
+            .await_execution(&mut rx, deadline, &[ProtoOaExecutionType::OrderAccepted], |ev| {
+                ev.order.as_ref().and_then(|o| o.client_order_id.as_deref()) == Some(client_order_id.as_str())
+            })
+            .await?;
+        ev.order.map(|o| o.order_id).ok_or_else(|| anyhow!("order accepted without order id"))
+    }
+
+    /// 予約注文の価格・SL/TP・期限を変える（None の項目は変えない）
+    #[allow(clippy::too_many_arguments)]
+    pub async fn amend_pending_order(
+        &self,
+        symbol_name: &str,
+        order_id: i64,
+        kind: PendingKind,
+        price: Option<f64>,
+        stop_loss: Option<f64>,
+        take_profit: Option<f64>,
+        expires_at: Option<chrono::DateTime<Utc>>,
+    ) -> Result<()> {
+        let price = self.round_opt(symbol_name, price).await;
+        let stop_loss = self.round_opt(symbol_name, stop_loss).await;
+        let take_profit = self.round_opt(symbol_name, take_profit).await;
+        let req = ProtoOaAmendOrderReq {
+            payload_type: Some(ProtoOaPayloadType::ProtoOaAmendOrderReq as i32),
+            ctid_trader_account_id: self.config.account_id,
+            order_id,
+            limit_price: price.filter(|_| kind == PendingKind::Limit),
+            stop_price: price.filter(|_| kind == PendingKind::Stop),
+            stop_loss,
+            take_profit,
+            expiration_timestamp: expires_at.map(|t| t.timestamp_millis()),
+            ..Default::default()
+        };
+        info!(order_id, ?price, ?stop_loss, ?take_profit, ?expires_at, "Amending pending order");
+        let mut rx = self.order_events.subscribe();
+        let deadline = Instant::now() + ORDER_OUTCOME_TIMEOUT;
+        self.send_unsolicited(ProtoOaPayloadType::ProtoOaAmendOrderReq as u32, req.encode_to_vec()).await?;
+        self.await_execution(&mut rx, deadline, &[ProtoOaExecutionType::OrderReplaced], |ev| {
+            ev.order.as_ref().map(|o| o.order_id) == Some(order_id)
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// 予約注文を取り消す
+    pub async fn cancel_pending_order(&self, order_id: i64) -> Result<()> {
+        let req = ProtoOaCancelOrderReq {
+            payload_type: Some(ProtoOaPayloadType::ProtoOaCancelOrderReq as i32),
+            ctid_trader_account_id: self.config.account_id,
+            order_id,
+        };
+        info!(order_id, "Cancelling pending order");
+        let mut rx = self.order_events.subscribe();
+        let deadline = Instant::now() + ORDER_OUTCOME_TIMEOUT;
+        self.send_unsolicited(ProtoOaPayloadType::ProtoOaCancelOrderReq as u32, req.encode_to_vec()).await?;
+        self.await_execution(&mut rx, deadline, &[ProtoOaExecutionType::OrderCancelled], |ev| {
+            ev.order.as_ref().map(|o| o.order_id) == Some(order_id)
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// 指定した種類の執行イベントが届くまで待つ。拒否・注文エラーはエラーにする
+    async fn await_execution(
+        &self,
+        rx: &mut broadcast::Receiver<OrderOutcome>,
+        deadline: Instant,
+        accept: &[ProtoOaExecutionType],
+        matches: impl Fn(&ProtoOaExecutionEvent) -> bool,
+    ) -> Result<ProtoOaExecutionEvent> {
+        loop {
+            let outcome = match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Ok(o)) => o,
+                Ok(Err(broadcast::error::RecvError::Lagged(n))) => {
+                    warn!("Missed {n} cTrader events while waiting for order result");
+                    continue;
+                }
+                Ok(Err(broadcast::error::RecvError::Closed)) => {
+                    return Err(anyhow!("cTrader event stream closed while waiting for order result"))
+                }
+                Err(_) => {
+                    return Err(anyhow!(
+                        "No execution event received within {}s; order state at broker is unknown",
+                        ORDER_OUTCOME_TIMEOUT.as_secs()
+                    ))
+                }
+            };
+            match outcome {
+                OrderOutcome::OrderError { error_code, description } => {
+                    return Err(anyhow!(
+                        "cTrader rejected order: {error_code}{}{}",
+                        description.map(|d| format!(" ({d})")).unwrap_or_default(),
+                        order_error_hint(&error_code)
+                    ));
+                }
+                OrderOutcome::Execution(ev) => {
+                    if !matches(&ev) {
+                        continue;
+                    }
+                    let exec_type = ProtoOaExecutionType::try_from(ev.execution_type).ok();
+                    match exec_type {
+                        Some(t) if accept.contains(&t) => return Ok(*ev),
+                        Some(ProtoOaExecutionType::OrderRejected) | Some(ProtoOaExecutionType::OrderCancelRejected) => {
+                            let code = ev.error_code.as_deref().unwrap_or("no error code");
+                            return Err(anyhow!(
+                                "cTrader {}: {code}{}",
+                                exec_type.map(|t| t.as_str_name()).unwrap_or("UNKNOWN"),
+                                order_error_hint(code)
+                            ));
+                        }
+                        _ => continue,
+                    }
+                }
+            }
+        }
     }
 
     /// 指定ポジションの決済（closing deal）をブローカーの約定履歴から取得する。
@@ -817,6 +1064,67 @@ impl CTraderService {
                 .volume_to_lots_by_id(d.symbol_id, detail.closed_volume.unwrap_or(d.filled_volume))
                 .await,
         }))
+    }
+
+    /// `[from, to)` の間に口座残高が動いた出来事（決済約定・入出金）を、直後の残高つきで返す。
+    ///
+    /// 入出金履歴は 1 回の要求で 1 週間までしか引けないので、週ごとに区切って取得する。
+    pub async fn get_balance_events(
+        &self,
+        from: chrono::DateTime<Utc>,
+        to: chrono::DateTime<Utc>,
+    ) -> Result<Vec<BalanceEvent>> {
+        const WEEK_MS: i64 = 7 * 24 * 3600 * 1000;
+        let account = self.config.account_id;
+        let at = |ms: i64| chrono::TimeZone::timestamp_millis_opt(&Utc, ms).single().unwrap_or_else(Utc::now);
+        let mut events = Vec::new();
+        let mut start = from.timestamp_millis();
+        let end = to.timestamp_millis();
+        while start < end {
+            let chunk_end = (start + WEEK_MS).min(end);
+
+            // 決済約定（close_position_detail.balance が決済後の残高）
+            let res = self
+                .client
+                .deal_list(account, start, chunk_end, None)
+                .await
+                .context("Failed to fetch deal list")?;
+            if res.has_more {
+                warn!(from = start, to = chunk_end, "deal list truncated; some balance points may be missing");
+            }
+            for d in &res.deal {
+                let Some(detail) = d.close_position_detail.as_ref() else { continue };
+                let scale = 10f64.powi(detail.money_digits.unwrap_or(2) as i32);
+                events.push(BalanceEvent {
+                    id: format!("deal-{}", d.deal_id),
+                    time: at(d.execution_timestamp),
+                    version: detail.balance_version,
+                    balance: detail.balance as f64 / scale,
+                });
+            }
+
+            let res = self
+                .client
+                .get_cash_flow_history(account, start, chunk_end)
+                .await
+                .context("Failed to fetch cash flow history")?;
+            for c in &res.deposit_withdraw {
+                let scale = 10f64.powi(c.money_digits.unwrap_or(2) as i32);
+                events.push(BalanceEvent {
+                    id: format!("cash-{}", c.balance_history_id),
+                    time: at(c.change_balance_timestamp),
+                    version: c.balance_version,
+                    balance: c.balance as f64 / scale,
+                });
+            }
+
+            start = chunk_end;
+            // 開設日から遡る初回は要求が続くので、レート制限に当たらないよう間を空ける
+            if start < end {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+        Ok(events)
     }
 
     /// 保有ポジションごとの含み損益（口座通貨）。ブローカー側の確定値なので手数料込みで一致する。

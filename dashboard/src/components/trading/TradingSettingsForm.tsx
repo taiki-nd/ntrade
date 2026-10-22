@@ -171,7 +171,7 @@ export function TradingSettingsForm() {
           <div>
             <h3 className="text-sm font-medium">対象銘柄</h3>
             <p className="text-xs text-muted-foreground">
-              FX・貴金属・株価指数・エネルギーの CFD を選べます。名前や資産クラス（gold, Metals, Indices など）で検索すると、cTrader の銘柄一覧から候補が出ます
+              FX・貴金属・株価指数の CFD を選べます（既定は USDJPY / EURUSD / XAUUSD）。名前や資産クラス（gold, Metals, Indices など）で検索すると、cTrader の銘柄一覧から候補が出ます
               （ゼロ口座なら <code className="font-mono">USDJPY_z</code> のようにサフィックス付き。素の <code className="font-mono">USDJPY</code> は発注できません）。
               ロットサイズ・最小発注量・取引時間はブローカーの銘柄仕様から自動で取ります。先頭の銘柄が画面と API の既定になります（クリックで先頭へ）。
             </p>
@@ -179,7 +179,7 @@ export function TradingSettingsForm() {
           <div className="flex flex-wrap items-center gap-1.5">
             {draft.pairs.map((p, i) => (
               <Badge key={p} variant={i === 0 ? "default" : "outline"} className="gap-1 pr-1 font-mono">
-                <span className="cursor-pointer" onClick={() => makeDefault(p)} title="既定ペアにする">
+                <span className="cursor-pointer" onClick={() => makeDefault(p)} title="既定の銘柄にする">
                   {p}
                 </span>
                 <Button variant="ghost" size="icon-xs" onClick={() => removePair(p)} aria-label={`${p} を外す`} className="h-4 w-4">
@@ -232,12 +232,8 @@ export function TradingSettingsForm() {
               step="5"
               value={draft.decisionIntervalMinutes}
               onChange={(v) => setDraft({ ...draft, decisionIntervalMinutes: v ?? 5 })}
-              hint="5 の倍数（UTC 0:00 起点）。プランの成立と終値判定の損切りは 5 分足ごとに見ます"
+              hint="5 の倍数（UTC 0:00 起点）。予約注文の約定はブローカーが判定し、終値判定の損切りは 5 分足ごとに見ます"
             />
-          </div>
-          <div className="flex items-center gap-2">
-            <Switch checked={draft.eventDecisions} onCheckedChange={(v) => setDraft({ ...draft, eventDecisions: v })} />
-            <Label className="text-xs">重要指標の発表直後（5 分足 1 本確定後）に、判断間隔を待たずに判断する</Label>
           </div>
         </section>
 
@@ -276,7 +272,7 @@ export function TradingSettingsForm() {
               </Select>
               <p className="text-[11px] text-muted-foreground">LLM は上位足の構造で SL を置くため、5M だと値幅の大きい銘柄はほぼ弾かれます</p>
             </div>
-            <NumberField label="条件付きプラン最長 (時間)" value={g.plan_max_hours} onChange={setNum("plan_max_hours")} />
+            <NumberField label="予約注文の期限 上限 (時間)" value={g.plan_max_hours} onChange={setNum("plan_max_hours")} />
           </div>
         </section>
 
@@ -308,15 +304,21 @@ export function TradingSettingsForm() {
 
         {/* 資金管理 */}
         <section className="space-y-3">
-          <h3 className="text-sm font-medium">ポジションと資金管理</h3>
+          <h3 className="text-sm font-medium">建玉・予約注文と資金管理</h3>
           <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-            <NumberField label="ポジション上限（ペアごと）" step="1" value={g.max_positions_per_pair} onChange={setNum("max_positions_per_pair")} />
             <NumberField
-              label="ポジション上限（全体）"
+              label="建玉 + 予約注文の上限（銘柄ごと）"
+              step="1"
+              value={g.max_positions_per_pair}
+              onChange={setNum("max_positions_per_pair")}
+              hint="約定待ちの予約注文も 1 件として数えます"
+            />
+            <NumberField
+              label="建玉 + 予約注文の上限（全体）"
               step="1"
               value={g.max_positions_total}
               onChange={setNum("max_positions_total")}
-              hint={g.max_positions_total < draft.pairs.length ? "ペア数より少ないため、同時に持てないペアがあります" : undefined}
+              hint={g.max_positions_total < draft.pairs.length ? "銘柄数より少ないため、同時に注文・保有できない銘柄があります" : undefined}
             />
             <NumberField label="日次損失上限 (%)" value={g.daily_loss_limit_pct} onChange={setNum("daily_loss_limit_pct")} />
             <NumberField label="固定ロット" value={g.fixed_volume_lots} onChange={setNum("fixed_volume_lots")} hint="リスク % 未設定時に使用" />

@@ -32,6 +32,32 @@ pub struct Position {
     pub close_stop: Option<f64>,
 }
 
+/// ブローカーに置いてある、まだ約定していない予約注文（ntrade の記録）
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkingOrder {
+    /// ブローカーの注文 ID
+    pub id: String,
+    pub symbol: String,
+    pub side: String, // "BUY" | "SELL"
+    pub kind: crate::ctrader::PendingKind,
+    pub volume_lots: f64,
+    pub entry_price: f64,
+    /// ブローカーに置いた SL（`stop_mode = close` ならハードSL）
+    pub stop_loss: f64,
+    pub take_profit: f64,
+    /// `stop_mode = close` のとき、約定後の建玉に引き継ぐ終値判定の損切りライン（LLM の SL）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_stop: Option<f64>,
+    /// "YYYY-MM-DD HH:MM:SS"（UTC）
+    pub created_at: String,
+    pub expires_at: String,
+    pub invalidation_reason: String,
+    /// この注文を置いた判断（CoT ログ）。約定した建玉に引き継ぐ
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cot_log_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CloseReason {
@@ -39,6 +65,8 @@ pub enum CloseReason {
     StopLoss,
     /// `stop_mode = close`: 5M 確定足の終値が LLM の SL（無効化ライン）を越えたため ntrade が成行決済した
     Invalidated,
+    /// LLM が判断サイクルで決済を選んだ（`manage` の CLOSE）
+    Discretionary,
     Manual,
     CircuitBreaker,
 }
@@ -118,6 +146,20 @@ pub struct ConnectionStatus {
     pub account_number: String,
 }
 
+/// 口座残高の推移の1点（決済・入出金の直後の残高）
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BalancePoint {
+    pub time: String,
+    pub balance: f64,
+}
+
+/// GET /api/balance-history のクエリ。`days` を省略すると全期間
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct BalanceHistoryQuery {
+    pub days: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountMetrics {
@@ -156,6 +198,8 @@ pub struct RuntimeInfo {
     pub guard_config_path: String,
     pub db_path: String,
     pub llm_cli: String,
+    /// `claude --model` に渡すモデル（None なら CLI の既定）
+    pub llm_model: Option<String>,
     pub llm_timeout_secs: u64,
     pub env_file_present: bool,
     /// cTrader の認証情報（トークン）が設定されているか

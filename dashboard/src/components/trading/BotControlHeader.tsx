@@ -110,22 +110,22 @@ export function BotControlHeader({
       case "running":
         return (
           <div className="flex items-center gap-1.5" title="AUTO RUNNING">
-            <span className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse" />
-            <span className="text-sm font-semibold text-emerald-600 dark:text-emerald-400">稼働中</span>
+            <span className="h-2 w-2 rounded-full bg-profit" />
+            <span className="text-sm font-semibold text-profit">稼働中</span>
           </div>
         );
       case "paused":
         return (
           <div className="flex items-center gap-1.5" title="PAUSED">
-            <span className="h-2 w-2 rounded-full bg-amber-500" />
-            <span className="text-sm font-semibold text-amber-600 dark:text-amber-400">一時停止中</span>
+            <span className="h-2 w-2 rounded-full bg-warning" />
+            <span className="text-sm font-semibold text-warning">一時停止中</span>
           </div>
         );
       case "circuit_breaker":
         return (
           <div className="flex items-center gap-1.5" title="SHUTDOWN">
-            <span className="h-2 w-2 rounded-full bg-rose-600" />
-            <span className="text-sm font-semibold text-rose-600 dark:text-rose-400">サーキットブレーカー</span>
+            <span className="h-2 w-2 rounded-full bg-loss" />
+            <span className="text-sm font-semibold text-loss">サーキットブレーカー</span>
           </div>
         );
     }
@@ -133,7 +133,7 @@ export function BotControlHeader({
 
   const isCtraderConnected = metrics.connectionStatus.ctrader === "connected";
   const pnlClass = (v: number) =>
-    v > 0 ? "text-emerald-600 dark:text-emerald-400" : v < 0 ? "text-rose-600 dark:text-rose-400" : undefined;
+    v > 0 ? "text-profit" : v < 0 ? "text-loss" : undefined;
   const balanceTitle = [
     `${metrics.orderMode === "live" ? "ブローカー残高" : "ペーパー残高"}: ${formatCurrency(metrics.balance)}`,
     metrics.orderMode !== "live" && metrics.brokerBalance !== undefined
@@ -145,9 +145,9 @@ export function BotControlHeader({
 
   return (
     <>
-      <div className="flex min-w-0 flex-1 items-center justify-between gap-4 py-1.5 overflow-x-auto scrollbar-none">
-        {/* 左側: ステータス + 口座サマリー */}
-        <div className="flex items-center gap-x-4 lg:gap-x-5 min-w-0 shrink-0">
+      <div className="flex min-w-0 flex-1 items-center justify-between gap-4 py-1.5">
+        {/* 左側: ステータス + 口座サマリー。幅が足りなければ右から隠し、操作ボタンは必ず見せる */}
+        <div className="flex items-center gap-x-4 lg:gap-x-5 min-w-0 overflow-hidden">
           <div className="shrink-0">{getStatusBadge()}</div>
 
           <Separator orientation="vertical" className="hidden h-7 shrink-0 sm:block" />
@@ -173,13 +173,15 @@ export function BotControlHeader({
               sub={`${metrics.winningTradesToday}勝${metrics.totalTradesToday - metrics.winningTradesToday}敗`}
             />
             <Stat
-              label="スプレッド"
+              label="スプレッド (pips)"
               value={
                 Object.entries(metrics.spreads ?? {})
-                  .map(([pair, v]) => `${pair} ${v}`)
-                  .join(" / ") || "-"
+                  .map(([pair, v]) => `${pair.replace(/_[a-z]+$/i, "")} ${v}`)
+                  .join(" · ") || "-"
               }
-              sub="pips"
+              title={Object.entries(metrics.spreads ?? {})
+                .map(([pair, v]) => `${pair}: ${v} pips`)
+                .join("\n")}
             />
           </div>
         </div>
@@ -193,19 +195,19 @@ export function BotControlHeader({
             title={`cTrader連携設定${metrics.connectionStatus.accountNumber ? ` / ${metrics.connectionStatus.accountNumber}` : ""}`}
             className="h-8 gap-1.5 text-xs text-muted-foreground hover:text-foreground cursor-pointer"
           >
-            <Server className={`h-3.5 w-3.5 ${isCtraderConnected ? "text-emerald-500" : "text-rose-500"}`} />
+            <Server className={`h-3.5 w-3.5 ${isCtraderConnected ? "text-profit" : "text-loss"}`} />
             {isCtraderConnected ? (
               metrics.connectionStatus.pingMs > 0
                 ? `${metrics.connectionStatus.environment} (${metrics.connectionStatus.pingMs}ms)`
                 : metrics.connectionStatus.environment
             ) : (
-              <span className="text-rose-500 font-medium">cTrader未接続</span>
+              <span className="text-loss font-medium">cTrader未接続</span>
             )}
           </Button>
 
           <div
             className="hidden items-center gap-1.5 px-2 py-1 rounded-md bg-muted/60 text-xs font-mono text-muted-foreground xl:flex"
-            title="LLM Pipeline: claude -p / agy -p"
+            title="LLM: claude -p"
           >
             <Cpu className="h-3.5 w-3.5 text-primary" />
             <span>{metrics.connectionStatus.llm}</span>
@@ -216,7 +218,7 @@ export function BotControlHeader({
               variant="outline"
               size="sm"
               onClick={() => onStateChange("paused")}
-              className="h-8 text-xs text-amber-600 border-amber-300 hover:bg-amber-50 dark:border-amber-800 dark:hover:bg-amber-950/40 cursor-pointer"
+              className="h-8 text-xs text-warning border-warning/40 hover:bg-warning/10 cursor-pointer"
             >
               <Pause className="h-3.5 w-3.5" />
               一時停止
@@ -226,7 +228,7 @@ export function BotControlHeader({
               variant="default"
               size="sm"
               onClick={() => onStateChange("running")}
-              className="h-8 text-xs bg-emerald-600 hover:bg-emerald-700 text-white cursor-pointer"
+              className="h-8 text-xs bg-profit hover:bg-profit/90 text-white cursor-pointer"
             >
               <Play className="h-3.5 w-3.5" />
               自動売買開始
@@ -256,7 +258,7 @@ export function BotControlHeader({
               緊急全決済 & システム停止の確認
             </DialogTitle>
             <DialogDescription>
-              保有中のすべてのポジションを成行で即時決済し、ボットの新規自動発注を直ちに停止します。この操作は取り消せません。よろしいですか？
+              置いてある予約注文をすべて取り消し、保有中のすべてのポジションを成行で即時決済して、自動売買を停止します。この操作は取り消せません。よろしいですか？
             </DialogDescription>
           </DialogHeader>
           <DialogFooter className="gap-2 sm:gap-0">
@@ -273,7 +275,7 @@ export function BotControlHeader({
                 setShowEmergencyDialog(false);
               }}
             >
-              はい、直ちに全決済して停止
+              はい、取消・全決済して停止
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -284,7 +286,7 @@ export function BotControlHeader({
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2 text-primary">
-              <Link2 className="h-5 w-5 text-emerald-500" />
+              <Link2 className="h-5 w-5 text-profit" />
               cTrader Open API アプリ内連携
             </DialogTitle>
             <DialogDescription>
@@ -295,14 +297,14 @@ export function BotControlHeader({
           <div className="space-y-3 py-2 text-sm text-muted-foreground">
             <div className="rounded-lg border bg-muted/40 p-3 space-y-1.5">
               <div className="flex items-center gap-2 text-foreground font-medium">
-                <CheckCircle2 className="h-4 w-4 text-emerald-500" />
+                <CheckCircle2 className="h-4 w-4 text-profit" />
                 現在の接続口座:
               </div>
               <p className="text-xs pl-6">
                 {metrics.connectionStatus.accountNumber || "未接続"}
               </p>
               <div className="flex items-center gap-2 text-foreground font-medium pt-1">
-                <CheckCircle2 className="h-4 w-4 text-emerald-500" />
+                <CheckCircle2 className="h-4 w-4 text-profit" />
                 環境:
               </div>
               <p className="text-xs pl-6">
@@ -322,7 +324,7 @@ export function BotControlHeader({
               閉じる
             </Button>
             <Button
-              className="gap-2 bg-emerald-600 hover:bg-emerald-700 text-white cursor-pointer"
+              className="gap-2 bg-profit hover:bg-profit/90 text-white cursor-pointer"
               disabled={isLinking}
               onClick={handleStartOAuth}
             >

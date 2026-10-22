@@ -142,6 +142,9 @@ pub struct AccountSummary {
     /// 口座通貨（JPY など）。資産一覧から引けなかった場合は None
     #[serde(default)]
     pub deposit_currency: Option<String>,
+    /// 口座の開設日時（残高の推移を遡る起点）
+    #[serde(default)]
+    pub registered_at: Option<DateTime<Utc>>,
 }
 
 /// ブローカー側の保有ポジション（reconcile の結果）
@@ -159,6 +162,51 @@ pub struct BrokerPosition {
     /// この建玉が使っている証拠金（口座通貨）
     #[serde(default)]
     pub used_margin: Option<f64>,
+    /// 発注時の comment（予約注文から建った建玉は判断 ID を引き継ぐ）
+    #[serde(default)]
+    pub comment: Option<String>,
+}
+
+/// 予約注文の種類
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum PendingKind {
+    /// 指値（今より有利な価格まで戻ったら約定）
+    Limit,
+    /// 逆指値（価格がその水準を抜けたら約定）
+    Stop,
+}
+
+/// ブローカー側に置かれている予約注文（reconcile の結果）
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BrokerOrder {
+    pub order_id: i64,
+    pub symbol_id: i64,
+    pub symbol_name: Option<String>,
+    pub is_buy: bool,
+    /// LIMIT / STOP 以外（ストップリミットなど）は None
+    pub kind: Option<PendingKind>,
+    pub volume_lots: f64,
+    pub price: Option<f64>,
+    pub stop_loss: Option<f64>,
+    pub take_profit: Option<f64>,
+    pub expires_at: Option<DateTime<Utc>>,
+    /// 発注時に付けた comment（ntrade は判断 ID を入れる）
+    pub comment: Option<String>,
+}
+
+/// 注文 ID から引いた注文の結末
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum OrderFate {
+    /// 約定して建玉になった（建玉 ID）
+    Filled { position_id: i64 },
+    Cancelled,
+    Expired,
+    Rejected,
+    /// まだブローカーに置かれている
+    Working,
+    Unknown,
 }
 
 /// Spot 購読で受け取った直近の気配値
@@ -193,6 +241,17 @@ pub struct ClosedDeal {
     pub swap: f64,
     pub commission: f64,
     pub volume_lots: f64,
+}
+
+/// 口座残高が動いた出来事（決済・入出金）と、その直後の残高
+#[derive(Debug, Clone, PartialEq)]
+pub struct BalanceEvent {
+    /// "deal-<id>" / "cash-<id>"（同じ出来事を二重に数えないためのキー）
+    pub id: String,
+    pub time: DateTime<Utc>,
+    /// 残高の版。同時刻の出来事の前後関係に使う
+    pub version: Option<i64>,
+    pub balance: f64,
 }
 
 /// シンボル（銘柄一覧の1行）。仕様の詳細は `instrument::InstrumentSpec`（`CTraderService::symbol_spec`）

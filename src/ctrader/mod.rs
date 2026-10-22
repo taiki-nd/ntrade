@@ -7,5 +7,6 @@ pub use client::{CTraderService, MarketStatus, OrderOutcome, SymbolCatalogEntry,
 pub use config::{symbol_suffix_from_env, CTraderConfig};
 pub use token::TokenSet;
 pub use types::{
-    quote_currency_from_name, AccountSummary, BarPeriod, BrokerPosition, CandleBar, ClosedDeal, Quote, SymbolInfo,
+    quote_currency_from_name, AccountSummary, BalanceEvent, BarPeriod, BrokerOrder, BrokerPosition, CandleBar, ClosedDeal, OrderFate,
+    PendingKind, Quote, SymbolInfo,
 };

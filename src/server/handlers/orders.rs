@@ -3,21 +3,30 @@ use axum::{
     response::Json,
 };
 
-use crate::executor::PendingPlan;
 use crate::guard::GuardConfig;
 use crate::server::state::AppState;
-use crate::server::types::{ApiResponse, RuntimeInfo};
+use crate::server::types::{ApiResponse, RuntimeInfo, WorkingOrder};
 
-/// GET /api/plans
-pub async fn list_plans(State(state): State<AppState>) -> Json<ApiResponse<Vec<PendingPlan>>> {
-    Json(ApiResponse::ok(state.plan_book.read().await.plans.clone()))
+/// GET /api/orders … ブローカーに置いてある、まだ約定していない予約注文
+pub async fn list_orders(State(state): State<AppState>) -> Json<ApiResponse<Vec<WorkingOrder>>> {
+    Json(ApiResponse::ok(state.working_orders.read().await.clone()))
 }
 
-/// DELETE /api/plans/{id}
-pub async fn discard_plan(State(state): State<AppState>, Path(id): Path<String>) -> Json<ApiResponse<String>> {
-    match state.plan_book.write().await.discard(&id) {
-        Some(_) => Json(ApiResponse::ok_msg(id, "条件付きプランを破棄しました")),
-        None => Json(ApiResponse::err(format!("plan {id} not found"))),
+/// DELETE /api/orders/{id} … 予約注文をブローカーで取り消す
+pub async fn cancel_order(State(state): State<AppState>, Path(id): Path<String>) -> Json<ApiResponse<String>> {
+    if !state.working_orders.read().await.iter().any(|o| o.id == id) {
+        return Json(ApiResponse::err(format!("order {id} not found")));
+    }
+    // 判断サイクルの発注・操作と重ねない
+    let _guard = state.order_lock.lock().await;
+    let sink = state.order_sink.read().await.clone();
+    match sink.cancel_pending(&id).await {
+        Ok(()) => {
+            state.working_orders.write().await.retain(|o| o.id != id);
+            state.persist_working_orders().await;
+            Json(ApiResponse::ok_msg(id, "予約注文を取り消しました"))
+        }
+        Err(e) => Json(ApiResponse::err(format!("{e:#}"))),
     }
 }
 
@@ -41,6 +50,7 @@ pub async fn runtime_info(State(state): State<AppState>) -> Json<ApiResponse<Run
         guard_config_path: format!("SQLite app_settings.{}", crate::settings::SETTINGS_KEY),
         db_path: state.db_path.to_string_lossy().to_string(),
         llm_cli: llm.cli_binary.clone(),
+        llm_model: llm.model.clone(),
         llm_timeout_secs: llm.timeout_secs,
         env_file_present: std::path::Path::new(".env").exists(),
         ctrader_token_present: ctrader.as_ref().is_some_and(|c| !c.access_token.is_empty()),

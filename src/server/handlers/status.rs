@@ -1,8 +1,38 @@
-use axum::{extract::State, response::Json};
+use axum::{
+    extract::{Query, State},
+    response::Json,
+};
 use tracing::debug;
 
 use crate::server::state::AppState;
-use crate::server::types::AccountMetrics;
+use crate::server::types::{AccountMetrics, ApiResponse, BalanceHistoryQuery, BalancePoint};
+
+/// GET /api/balance-history?days=30
+/// 口座残高の推移（古い順）。cTrader の決済・入出金履歴から取り込んだ点に、現在の残高を末尾に足す。
+/// `days` を省略すると全期間
+pub async fn get_balance_history(
+    State(state): State<AppState>,
+    Query(q): Query<BalanceHistoryQuery>,
+) -> Json<ApiResponse<Vec<BalancePoint>>> {
+    let Some(account_id) = state.ctrader_config.read().await.as_ref().map(|c| c.account_id) else {
+        return Json(ApiResponse::ok(Vec::new()));
+    };
+    let from = q.days.map(|d| chrono::Utc::now().timestamp() - d * 86_400);
+    match state.with_db(move |db| db.balance_history(account_id, from)).await {
+        Ok(mut points) => {
+            // 線を現在まで伸ばす（最後の決済から今までは残高が変わっていない）
+            let m = state.metrics.read().await;
+            if m.broker_balance.is_some() {
+                points.push(BalancePoint {
+                    time: crate::storage::fmt_ts(chrono::Utc::now().timestamp()),
+                    balance: m.balance,
+                });
+            }
+            Json(ApiResponse::ok(points))
+        }
+        Err(e) => Json(ApiResponse::err(format!("{e:#}"))),
+    }
+}
 
 /// GET /api/status
 /// ダッシュボード全体のメトリクス & 稼働ステータスを返却

@@ -79,7 +79,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    println!("  claude -p で推論中（ファンダメンタルズの事実は渡していない。価格の数値のみ）...");
+    println!("  claude -p で推論中（価格の数値のみ）...");
     let client = LlmClient::new(LlmClientConfig::default());
     let started = std::time::Instant::now();
     let decision = client.infer(&prompt).await?;
@@ -90,13 +90,13 @@ async fn main() -> Result<()> {
     println!("  Confidence:  {:.2}", decision.confidence);
     println!("  Entry type:  {:?}", decision.entry_type);
     println!("  Entry/SL/TP: {:?} / {:?} / {:?}", decision.entry_price, decision.stop_loss, decision.take_profit);
-    println!("  Fundamental: {}", decision.analysis.fundamental_view);
+    println!("  Expiry:      {:?} min", decision.expiry_minutes);
+    println!("  Structure:   {}", decision.analysis.market_structure);
     println!("  Price levels:{}", decision.analysis.price_levels);
     println!("  Invalidation:{}", decision.analysis.invalidation);
     println!("  Conflicts:   {}", decision.analysis.conflicts);
-    if let Some(plan) = &decision.conditional_plan {
-        println!("  Plan:        wait_for={} | then={:?} | invalidate_if={} | expires={}",
-            plan.wait_for, plan.then_action, plan.invalidate_if, plan.expires_at);
+    for m in &decision.manage {
+        println!("  Manage:      {:?} {:?} {} ({})", m.op, m.target, m.id, m.reason);
     }
     println!("  Reasoning:   {}", decision.reasoning);
 

@@ -1,9 +1,11 @@
 //! 採点: 判断時刻以降の5M足で結果を機械的に判定する。
+//!
+//! 予約注文は「期限内に価格が届いたか（約定）」→「約定後に SL と TP のどちらに先に届いたか」の順に見る。
 
 use serde::{Deserialize, Serialize};
 
 use crate::ctrader::CandleBar;
-use crate::strategy::types::{Action, ConditionalPlan, TradeDecision};
+use crate::strategy::types::{Action, EntryType, TradeDecision};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -16,9 +18,11 @@ pub enum Outcome {
     SameBar,
     /// 規定本数内にどちらにも到達しない
     Timeout,
-    /// HOLD（条件付きプランなし）
+    /// HOLD（新しい注文なし）
     Hold,
-    /// 条件付きプランが期限内に成立しなかった
+    /// 予約注文が期限内に約定しなかった
+    OrderExpired,
+    /// 旧: 条件付きプランが期限内に成立しなかった（以下 Plan* は保存済みの run を読むためだけに残す）
     PlanExpired,
     /// 条件付きプランが破棄条件に達した
     PlanInvalidated,
@@ -42,6 +46,7 @@ impl Outcome {
             Outcome::SameBar => "SAME_BAR",
             Outcome::Timeout => "TIMEOUT",
             Outcome::Hold => "HOLD",
+            Outcome::OrderExpired => "ORDER_EXPIRED",
             Outcome::PlanExpired => "PLAN_EXPIRED",
             Outcome::PlanInvalidated => "PLAN_INVALIDATED",
             Outcome::PlanUnstructured => "PLAN_UNSTRUCTURED",
@@ -66,7 +71,7 @@ pub struct ScoreResult {
     pub outcome: Outcome,
     pub pnl_pips: Option<f64>,
     pub bars_to_exit: Option<usize>,
-    /// 実際にエントリーしたとみなした価格（プラン成立時は成立足の終値）
+    /// 実際にエントリーしたとみなした価格（逆指値が窓を空けて約定した場合は約定足の始値）
     pub entry_price: Option<f64>,
 }
 
@@ -209,83 +214,77 @@ fn score_from(bars: &[CandleBar], action: Action, entry: f64, sl: f64, tp: f64, 
     }
 }
 
-/// 条件付きプランを判断時刻以降の5M足（昇順）で進め、成立した足の位置を返す。
-/// 成立しなければ、その結末（期限切れ・破棄・評価不能・データ切れ）を返す。
-/// 本番の Executor と同じ `step_plan` で各確定足を評価する。
-pub fn plan_trigger_index(bars: &[CandleBar], plan: &ConditionalPlan) -> Result<usize, Outcome> {
-    use crate::executor::{step_plan, PlanStep};
-
-    if !plan.is_structured() {
-        return Err(Outcome::PlanUnstructured);
-    }
+/// 予約注文が約定する足と約定価格。届かなければ None。
+///
+/// - 指値: 価格まで届いたら約定（BUY は安値が、SELL は高値が届く）。約定価格は指値（有利な窓開けは見込まない）
+/// - 逆指値: 価格を抜けたら約定。窓を空けて抜けたら始値で約定する（不利側の滑り）
+pub fn pending_fill(bars: &[CandleBar], action: Action, kind: EntryType, price: f64) -> Option<(usize, f64)> {
+    let buy = action == Action::Buy;
     for (i, b) in bars.iter().enumerate() {
-        match step_plan(plan, b) {
-            PlanStep::Waiting => {}
-            PlanStep::Expired => return Err(Outcome::PlanExpired),
-            PlanStep::Invalidated => return Err(Outcome::PlanInvalidated),
-            PlanStep::Unstructured => return Err(Outcome::PlanUnstructured),
-            PlanStep::Triggered { .. } => return Ok(i),
+        match kind {
+            EntryType::Limit if (buy && b.low <= price) || (!buy && b.high >= price) => return Some((i, price)),
+            EntryType::Stop if buy && b.high >= price => return Some((i, b.open.max(price))),
+            EntryType::Stop if !buy && b.low <= price => return Some((i, b.open.min(price))),
+            _ => {}
         }
     }
-    // 期限前にデータが尽きた
-    Err(Outcome::NoData)
+    None
 }
 
-/// 条件付きプランを機械的に執行したとみなす採点（成立足の終値で入り、プランの SL/TP を使う）。
-/// 本番は成立時に LLM が判断し直すので、それと比べるための旧方式。
-pub fn evaluate_plan(bars: &[CandleBar], plan: &ConditionalPlan, cfg: &ScoreConfig) -> ScoreResult {
-    let i = match plan_trigger_index(bars, plan) {
-        Ok(i) => i,
-        Err(outcome) => return ScoreResult::flat(outcome),
+/// 予約注文の採点。`bars` は判断時刻以降の5M足（昇順）、`expiry_bars` は期限までの本数。
+///
+/// 約定した足の中では、約定と SL/TP のどちらが先かは分からない。SL に触れていれば損切りとし、
+/// TP にだけ触れていてもその足では利確とみなさない（不利側に倒す）
+#[allow(clippy::too_many_arguments)]
+pub fn score_pending(
+    bars: &[CandleBar],
+    action: Action,
+    kind: EntryType,
+    entry: f64,
+    sl: f64,
+    tp: f64,
+    expiry_bars: usize,
+    cfg: &ScoreConfig,
+) -> ScoreResult {
+    let window = &bars[..bars.len().min(expiry_bars)];
+    let Some((i, fill)) = pending_fill(window, action, kind, entry) else {
+        return ScoreResult::flat(if bars.len() < expiry_bars { Outcome::NoData } else { Outcome::OrderExpired });
     };
-    let (Some(sl), Some(tp)) = (plan.stop_loss, plan.take_profit) else {
-        return ScoreResult::flat(Outcome::NoSlTp);
-    };
-    let rest = &bars[i + 1..];
-    if rest.is_empty() {
-        return ScoreResult::flat(Outcome::NoData);
+    // 約定足の TP 側の値動きは約定前のものかもしれないので、約定価格までしか動かなかったとみなす
+    let mut fill_bar = bars[i].clone();
+    if action == Action::Buy {
+        fill_bar.high = fill;
+    } else {
+        fill_bar.low = fill;
     }
-    let mut r = score_from(rest, plan.then_action, bars[i].close, sl, tp, cfg);
-    r.bars_to_exit = r.bars_to_exit.map(|n| n + i + 1);
+    let mut rest = Vec::with_capacity(bars.len() - i);
+    rest.push(fill_bar);
+    rest.extend_from_slice(&bars[i + 1..]);
+    let mut r = score_from(&rest, action, fill, sl, tp, cfg);
+    r.bars_to_exit = r.bars_to_exit.map(|n| n + i);
     r
 }
 
-/// プラン成立時の再判断の採点。`bars` は再判断の時刻（成立足の確定時刻）以降の5M足。
-/// `offset` はプランを立てた判断から成立足までの本数で、`bars_to_exit` に足し込む。
-pub fn score_followup(bars: &[CandleBar], followup: &TradeDecision, guard_passed: bool, offset: usize, cfg: &ScoreConfig) -> ScoreResult {
-    if followup.action == Action::Hold {
-        return ScoreResult::flat(Outcome::PlanDeclined);
-    }
-    if !guard_passed {
-        return ScoreResult::flat(Outcome::PlanRejected);
-    }
-    let mut r = score_trade(bars, followup.action, followup.entry_price, followup.stop_loss, followup.take_profit, cfg);
-    r.bars_to_exit = r.bars_to_exit.map(|n| n + offset);
-    r
-}
-
-/// TradeDecision 全体の採点
+/// TradeDecision 全体の採点（`bars_after` は 5M 足。注文の期限は 5 分 = 1 本で数える）
 pub fn score_decision(bars_after: &[CandleBar], decision: &TradeDecision, cfg: &ScoreConfig) -> ScoreResult {
-    match decision.action {
-        Action::Buy | Action::Sell => score_trade(
-            bars_after,
-            decision.action,
-            decision.entry_price,
-            decision.stop_loss,
-            decision.take_profit,
-            cfg,
-        ),
-        Action::Hold => match &decision.conditional_plan {
-            Some(plan) if plan.then_action != Action::Hold => evaluate_plan(bars_after, plan, cfg),
-            _ => ScoreResult::flat(Outcome::Hold),
-        },
+    match (decision.action, decision.entry_type) {
+        (Action::Hold, _) => ScoreResult::flat(Outcome::Hold),
+        (action, Some(kind @ (EntryType::Limit | EntryType::Stop))) => {
+            let (Some(entry), Some(sl), Some(tp)) = (decision.entry_price, decision.stop_loss, decision.take_profit) else {
+                return ScoreResult::flat(Outcome::NoSlTp);
+            };
+            // 期限の無い注文はガードで弾かれるが、仮に執行した場合の集計のために 1 時間とみなす
+            let expiry_bars = (decision.expiry_minutes.unwrap_or(60) as usize).div_ceil(5).max(1);
+            score_pending(bars_after, action, kind, entry, sl, tp, expiry_bars, cfg)
+        }
+        // 旧: 成行（保存済みの run の採点し直し用）
+        (action, _) => score_trade(bars_after, action, decision.entry_price, decision.stop_loss, decision.take_profit, cfg),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::strategy::types::PriceCondition;
     use chrono::{Duration, TimeZone, Utc};
 
     fn bars(closes: &[(f64, f64, f64)]) -> Vec<CandleBar> {
@@ -409,73 +408,60 @@ mod tests {
         assert_eq!(score_trade(&flat, Action::Buy, None, None, None, &cfg()).outcome, Outcome::NoSlTp);
     }
 
-    fn plan() -> ConditionalPlan {
-        ConditionalPlan {
-            wait_for: "x".into(),
-            then_action: Action::Buy,
-            invalidate_if: "y".into(),
-            expires_at: "2026-09-15 10:00:00 UTC".into(),
-            trigger_price: Some(154.24),
-            trigger_condition: Some(PriceCondition::CloseAbove),
-            invalidate_price: Some(154.07),
-            invalidate_condition: Some(PriceCondition::CloseBelow),
-            stop_loss: Some(154.07),
-            take_profit: Some(154.60),
+    fn pending(action: Action, kind: EntryType, entry: f64, sl: f64, tp: f64) -> TradeDecision {
+        TradeDecision {
+            action,
+            entry_type: Some(kind),
+            entry_price: Some(entry),
+            stop_loss: Some(sl),
+            take_profit: Some(tp),
+            expiry_minutes: Some(15), // 3 本
+            ..TradeDecision::fallback_hold("t")
         }
     }
 
     #[test]
-    fn plan_triggers_then_scores_trade() {
+    fn limit_waits_for_the_price_then_scores_from_the_fill() {
+        let d = pending(Action::Buy, EntryType::Limit, 154.10, 154.00, 154.30);
         let b = bars(&[
-            (154.22, 154.15, 154.20), // 未成立
-            (154.30, 154.18, 154.26), // 成立 (close > 154.24) -> entry 154.26
-            (154.65, 154.25, 154.60), // TP
+            (154.25, 154.15, 154.20), // 未約定
+            (154.20, 154.08, 154.12), // 安値が 154.10 に届いて約定
+            (154.35, 154.11, 154.30), // TP
         ]);
-        let r = evaluate_plan(&b, &plan(), &cfg());
+        let r = score_decision(&b, &d, &cfg());
         assert_eq!(r.outcome, Outcome::TpHit);
-        assert_eq!(r.entry_price, Some(154.26));
+        assert_eq!(r.entry_price, Some(154.10));
         assert_eq!(r.bars_to_exit, Some(3));
+        assert!((r.pnl_pips.unwrap() - (20.0 - 0.2)).abs() < 1e-6);
     }
 
     #[test]
-    fn plan_invalidated_expired_and_unstructured() {
-        let b = bars(&[(154.10, 154.00, 154.05)]);
-        assert_eq!(evaluate_plan(&b, &plan(), &cfg()).outcome, Outcome::PlanInvalidated);
+    fn unfilled_order_expires_and_fill_bar_is_judged_conservatively() {
+        // 期限（3 本）までに 154.10 へ届かない
+        let d = pending(Action::Buy, EntryType::Limit, 154.10, 154.00, 154.30);
+        let b = bars(&[(154.25, 154.15, 154.20); 4]);
+        assert_eq!(score_decision(&b, &d, &cfg()).outcome, Outcome::OrderExpired);
+        // データが期限より短ければ結果不明
+        assert_eq!(score_decision(&b[..2], &d, &cfg()).outcome, Outcome::NoData);
 
-        // bars() は 09:00 から 5 分刻み。期限を 09:10 にすると 3 本目で期限切れ
-        let b = bars(&[(154.22, 154.15, 154.20); 3]);
-        let mut p = plan();
-        p.expires_at = "2026-09-15 09:10:00 UTC".into();
-        assert_eq!(evaluate_plan(&b, &p, &cfg()).outcome, Outcome::PlanExpired);
+        // 約定した足で SL にも触れたら損切り
+        let b = bars(&[(154.20, 153.98, 154.05)]);
+        assert_eq!(score_decision(&b, &d, &cfg()).outcome, Outcome::SlHit);
 
-        let mut p = plan();
-        p.trigger_price = None;
-        assert_eq!(evaluate_plan(&b, &p, &cfg()).outcome, Outcome::PlanUnstructured);
+        // 約定した足で TP にだけ触れても利確とはみなさない（次の足以降で判定）
+        let b = bars(&[(154.32, 154.08, 154.20), (154.25, 154.15, 154.20), (154.25, 154.15, 154.20), (154.25, 154.15, 154.20)]);
+        assert_eq!(score_decision(&b, &d, &cfg()).outcome, Outcome::Timeout);
     }
 
     #[test]
-    fn plan_trigger_index_points_at_the_triggering_bar() {
-        let b = bars(&[(154.22, 154.15, 154.20), (154.30, 154.18, 154.26), (154.65, 154.25, 154.60)]);
-        assert_eq!(plan_trigger_index(&b, &plan()), Ok(1));
-        assert_eq!(plan_trigger_index(&b[..1], &plan()), Err(Outcome::NoData));
-    }
-
-    /// 再判断が HOLD なら見送り、ガードで止まれば不成立。入るなら再判断の価格と SL/TP で採点する
-    #[test]
-    fn followup_is_scored_with_its_own_levels() {
-        let mut d = TradeDecision::fallback_hold("t");
-        assert_eq!(score_followup(&[], &d, true, 2, &cfg()).outcome, Outcome::PlanDeclined);
-
-        d.action = Action::Buy;
-        d.entry_price = Some(154.30);
-        d.stop_loss = Some(154.10);
-        d.take_profit = Some(154.60);
-        assert_eq!(score_followup(&[], &d, false, 2, &cfg()).outcome, Outcome::PlanRejected);
-
-        let b = bars(&[(154.40, 154.25, 154.35), (154.65, 154.30, 154.60)]);
-        let r = score_followup(&b, &d, true, 2, &cfg());
+    fn stop_entry_slips_on_a_gap() {
+        // SELL 逆指値 154.00。2 本目は始値 153.92（bars() は始値 = 終値）で窓を空けて下抜け → 153.92 で約定
+        let d = pending(Action::Sell, EntryType::Stop, 154.00, 154.10, 153.80);
+        let b = bars(&[(154.05, 154.01, 154.03), (153.96, 153.90, 153.92), (153.93, 153.78, 153.80)]);
+        let r = score_decision(&b, &d, &cfg());
+        assert_eq!(r.entry_price, Some(153.92));
         assert_eq!(r.outcome, Outcome::TpHit);
-        assert_eq!(r.entry_price, Some(154.30));
-        assert_eq!(r.bars_to_exit, Some(4));
+        assert_eq!(pending_fill(&b, Action::Sell, EntryType::Stop, 154.00), Some((1, 153.92)));
+        assert_eq!(pending_fill(&b, Action::Buy, EntryType::Stop, 154.10), None);
     }
 }

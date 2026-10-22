@@ -1,17 +1,16 @@
-use crate::fundamentals::FundamentalFacts;
 use crate::snapshot::MarketSnapshot;
 
 /// プロンプトビルダー
 ///
-/// 方向（地合い）はファンダメンタルズの事実から LLM が判断する。チャート画像やローソク足の形の読み
-/// （プライスアクション）は使わない。価格の数値（現在値・ATR・前日高安・スイングなど）は、
-/// エントリー・SL・TP をどこに置くかを決めるためだけに渡す。
+/// 15 分〜2 時間程度で決着させる日中の短期取引を、価格の動き（上位足の流れ・直近の構造・
+/// 前日高安やセッション高安などの水準）から LLM が判断する。新規は予約注文（指値・逆指値）だけで出す。
+/// LLM の判断には数十秒かかるため、成行では判断した価格から離れて約定する。価格を決めて
+/// ブローカーに置いておけば、遅れは「注文を置くまでの時間」になるだけで済む。
 ///
 /// 数値ルール（RR下限、確信度閾値、スプレッド上限など）は意図的に書かない。
 /// それらはプログラム側の事後ガードが扱う。ここでは「読む順序」と「姿勢」だけを指示する。
 pub struct PromptBuilder {
     lessons: Vec<String>,
-    fundamentals: Option<FundamentalFacts>,
 }
 
 impl Default for PromptBuilder {
@@ -22,17 +21,11 @@ impl Default for PromptBuilder {
 
 impl PromptBuilder {
     pub fn new() -> Self {
-        Self { lessons: Vec::new(), fundamentals: None }
+        Self { lessons: Vec::new() }
     }
 
     pub fn with_lessons(mut self, lessons: Vec<String>) -> Self {
         self.lessons = lessons;
-        self
-    }
-
-    /// ファンダメンタルズの事実。渡さない（リプレイなど）場合は「取得していない」と明示する
-    pub fn with_fundamentals(mut self, facts: FundamentalFacts) -> Self {
-        self.fundamentals = Some(facts);
         self
     }
 
@@ -49,61 +42,48 @@ impl PromptBuilder {
             s
         };
 
-        let fundamentals_section = match &self.fundamentals {
-            Some(f) if !f.is_empty() => format!(
-                r#"【ファンダメンタルズの事実 (JSON)】
-公的統計・中央銀行・米財務省/日本財務省・CFTC 建玉明細・経済指標の予定・公式発表のタイトル・関連銘柄の日足騰落です。
-どれも事実だけで、「上がりそう/下がりそう」といった評価は付けていません。どの事実がこの銘柄にどちら向きに効くかは、あなたが判断してください。
-- series: 各系列の最新値（latest）・前回値（previous）と、約1か月・3か月・12か月前の値。date は観測日です。月次の統計は発表が遅れるので、日付を見て鮮度を確かめてください。
-- positioning_cftc: 投機筋（managed_money / noncommercial）のロング・ショート・ネット（火曜時点、金曜公表）と、52週のネットの高値・安値。
-- economic_calendar: 指標の予定時刻（UTC）。released=true は予定時刻を過ぎたもの（このデータに結果の数値は無い）。予定が近い指標は、入るか・待つか・SL をどこに置くかを決める材料になります。
-- official_releases: 中央銀行・統計機関の公式発表のタイトルと時刻（本文は含みません）。
-- related_markets: 関連銘柄の日足終値と騰落率（%）。
-- unavailable: 取得できなかった情報源。欠けている事実を推測で補わないでください。
-```json
-{json}
-```
-"#,
-                json = f.to_json_pretty()
-            ),
-            _ => "【ファンダメンタルズの事実】\n今回は取得できていません。方向の根拠が無いので、原則として HOLD とし、そのことを analysis.fundamental_view に書いてください。\n".to_string(),
-        };
-
         let snapshot_json = snapshot.to_json_pretty();
 
         format!(
-            r#"あなたは FX・貴金属・株価指数・エネルギーの CFD をレバレッジを掛けて取引する、ファンダメンタルズ分析を専門とするプロの裁量トレーダーです。
-「ファンダメンタルズの事実 (JSON)」から相場の地合い（どちらに力が掛かりやすいか）を判断し、「価格の数値 (JSON)」を使ってエントリー・損切り・利確の価格を決めて、売買判断を返してください。
+            r#"あなたは FX・貴金属・株価指数の CFD をレバレッジを掛けて取引する、日中の短期売買（デイトレード）を専門とするプロの裁量トレーダーです。
+保有時間は 15 分〜2 時間程度を想定しています。「価格の数値 (JSON)」から値動きを読み、予約注文（指値・逆指値）をどこに置くか、すでに置いている注文と建玉をどうするかを返してください。
 
 【使ってよい情報】
-- 判断の材料は、このプロンプトに含まれる事実だけです。Web 検索や外部の情報は使えません。
-- あなたが学習で得た知識は、事実の意味を解釈するための一般知識（例: 実質金利と金価格の関係、金利差と為替の関係）としてだけ使ってください。
-  「最近の相場や出来事についての記憶」で事実を上書きしたり、データに無い出来事を前提にしたりしてはいけません。あなたの記憶はデータの日付より古い可能性があります。
-- 方向はファンダメンタルズの事実から決めます。ローソク足の形やチャートパターンから方向を決めないでください。
-- 価格の数値は、今の価格が直近の値幅のどこにあるか、損切りをどこに置けば想定が外れたと分かるかを決めるために使います。
+- 判断の材料は、このプロンプトに含まれる価格の数値だけです。Web 検索や外部の情報は使えません。
+- 学習で得た知識は、値動きの読み方の一般知識（セッションごとの値動きの癖、前日高安やキリ番での攻防など）としてだけ使ってください。「最近の相場や出来事についての記憶」を前提にしてはいけません。あなたの記憶はデータの日付より古い可能性があります。
 
-{fundamentals_section}
+【注文の出し方】
+- 新規は予約注文だけです。成行は使えません。この判断から注文が置かれるまで数十秒〜1分ほどかかり、その後は約定するまでブローカーが価格を見張ります。
+  - LIMIT（指値）: 今より有利な価格まで戻ったら約定。押し目買い・戻り売り。BUY は現在値より下、SELL は現在値より上に置く。
+  - STOP（逆指値）: その価格を抜けたら約定。高値・安値のブレイクに乗る。BUY は現在値より上、SELL は現在値より下に置く。
+- 必ず有効期限（expiry_minutes）を付けてください。シナリオが生きている間だけ注文を残し、相場が変われば期限切れにする想定です。
+- 判断は 5 分足の確定ごと（またはそれより長い間隔）に繰り返されます。次の判断で注文と建玉を見直せるので、1 回で完璧を狙わなくてかまいません。
+
 【読む順序】
-1. ファンダメンタルズの地合い
-   - この銘柄の価格を動かす主な要因（金利・金利差・実質金利・ドルの強さ・物価と雇用・リスク選好・需給・投機筋の偏り）について、事実はどちらに傾いているか。最近どう変化したか。
-   - 事実が乏しい・古い・互いに矛盾する場合は、そう判断してください。無理に方向を作らないこと。
-2. イベントリスク
-   - 予定されている重要指標や、直近の公式発表はあるか。それは今エントリーするリスクをどう変えるか（今入る・発表後まで待つ・SL を広く取る など）。
-   - `instrument.next_market_change` が近い場合（週末・休場前）、持ち越しのリスクも考える。
-3. 価格の位置と損切り
-   - 現在値（current_price）が、前日高安・当日高安・スイング高安・ATR（volatility）から見てどの位置にあるか。
-   - 地合いの判断が間違っていたと分かる価格はどこか。それが損切りの位置です。ATR に対して狭すぎると日々の値動きだけで刈られます。
-   - 利確は、地合いが続いた場合に現実的に届く価格に置く。
-   - 今は入らないが、価格がどこまで来たら入るか（あるいは指標発表後に）という待ち条件があれば、条件付きプランとして具体的な価格と条件を書いてください。
-4. 反対材料
-   - 自分の判断に反する事実を必ず1つ以上挙げてください（逆向きの事実・指標発表・投機筋の偏りの行き過ぎ・ボラティリティなど）。
+1. 流れ
+   - 1H・15M の足（bars_1h, bars_15m）とスイング高安（swing_points）から、上位足は上・下・横のどれか。直近の高値・安値は切り上がっているか、切り下がっているか。
+   - 5M の足（bars_5m）で、直近の値動きは勢いがあるか、止まりかけているか、レンジか。
+2. 水準
+   - 前日高安・当日高安・アジア時間の高安・キリ番・スイング高安（reference_levels, swing_points）のうち、現在値（current_price）の近くで効いていそうなものはどれか。
+   - ATR（volatility）と当日の値幅（today_range_vs_avg）から、今日はあとどれくらい動きうるか。
+3. シナリオと注文
+   - どの水準まで戻ったら入るか（LIMIT）、どの水準を抜けたら入るか（STOP）。その価格に置く根拠。
+   - 読みが間違っていたと分かる価格はどこか。それが損切りの位置です。ATR に対して狭すぎると日中の振れだけで刈られます。
+   - 利確は、保有時間の想定の中で現実的に届く水準に置く。
+   - セッション（session）の移り変わりや、`instrument.next_market_change`（休場・週末）が近い場合は、それも期限と保有の判断に入れる。
+4. 既存の注文と建玉（account_state）
+   - working_orders: 置いたままの予約注文。シナリオがまだ生きているか。価格・SL/TP・期限を直すべきか、取り消すべきか。
+   - open_positions: 保有中の建玉。読みが崩れていないか。SL を建値や直近のスイングへ動かすべきか、利確・撤退すべきか。
+   - 何もしないものは manage に書かない（そのまま残ります）。
+5. 反対材料
+   - 自分のシナリオに反する事実を必ず1つ以上挙げてください（逆向きの上位足、すぐ近くの反対側の水準、値幅の使い切り、薄い時間帯など）。
 
 【判断の姿勢】
 - レバレッジを掛けた取引です。ロットはシステムが SL 幅と許容リスクから決めるので、あなたは「どこで間違いと分かるか」に集中して SL を置いてください。
 - 数値は JSON の価格を使って正確に書く。価格の桁数は `instrument.digits` に合わせる。
-- 自信が無い場合は HOLD とし、待ち条件を提示する。HOLD は失敗ではない。
-- `recent_decisions` に前回までの判断がある場合、前回の地合いの判断が継続しているか崩れたかを明示する。事実が変わっていないのに判断を反転させない。
-- `account_state.triggered_plan` がある場合、前回までに立てた条件付きプランの成立条件が、直近の確定足で満たされています。プランは自動では発注されません。今の事実と価格で、このプランどおりに入るかを改めて判断してください。入るなら今の価格からエントリーすることになるので、SL/TP とリスクリワードは今の価格から測り直してください。
+- 良い位置が無ければ HOLD でかまいません。HOLD は失敗ではありません。
+- `recent_decisions` に前回までの判断がある場合、前回の読みが継続しているか崩れたかを明示する。値動きが変わっていないのに判断を反転させない。
+- 同じ向きの予約注文がすでにあるなら、新しく重ねるより既存の注文を MODIFY で直すことを考える。
 {lessons_section}
 【価格の数値 (JSON)】
 ```json
@@ -112,24 +92,25 @@ impl PromptBuilder {
 
 【出力】
 指定された JSON Schema に従って結果を返してください。各フィールドの意味:
-- action: BUY / SELL / HOLD
-- confidence: 0.0〜1.0（0.1刻み）。地合いの判断とエントリー機会に対する確信度。0.62のような細かい小数ではなく必ず0.1刻みで指定する:
-  - 0.0〜0.4: 事実が拮抗・乏しい・古い（HOLD）
-  - 0.5: どちらかに傾いているが、根拠が薄い / イベント待ち（HOLD）
-  - 0.6: 地合いは読めるが、価格やタイミングの条件が未達（条件付きプラン待ちのHOLDなど）
-  - 0.7: 地合いの根拠が複数の事実で裏付けられ、リスクリワードも見合っている（エントリー検討水準）
-  - 0.8以上: 金利・物価・ポジション・関連市場などの事実がそろって同じ方向を示し、目立った反対材料やイベントリスクが無い
-- entry_type: MARKET（成行で今入る）/ LIMIT / CONDITIONAL（今は入らず conditional_plan を待つ）/ null
-- entry_price, stop_loss, take_profit: BUY/SELL の場合は必須。stop_loss は analysis.invalidation の価格と一致させる
-- analysis.fundamental_view: ファンダメンタルズの読み。どの事実（系列名・日付・値）を根拠に、どちらの地合いと読んだか。予定指標などのイベントリスク。事実が足りない場合はそう書く
-- analysis.price_levels: 価格の位置（現在値が前日高安・スイング・ATR から見てどこにあるか）と、エントリー・利確の価格の根拠
-- analysis.invalidation: 損切りの価格と、その価格で地合いの判断が間違いと分かる理由
+- action: 新しい予約注文を置くなら BUY / SELL、置かないなら HOLD
+- confidence: 0.0〜1.0（0.1刻み）。新しい注文のシナリオに対する確信度。0.62のような細かい小数ではなく必ず0.1刻みで指定する:
+  - 0.0〜0.4: 流れも水準もはっきりしない（HOLD）
+  - 0.5: どちらかに傾いているが、置く価格の根拠が薄い（HOLD）
+  - 0.6: 流れは読めるが、近くに反対側の水準があるなどリスクリワードが見合わない
+  - 0.7: 流れと水準がそろい、損切りの位置も明確で、リスクリワードも見合っている（注文を置く水準）
+  - 0.8以上: 上位足と直近の値動きが同じ向きで、注文の価格・損切り・利確の根拠がどれもはっきりしている
+- entry_type: LIMIT / STOP（BUY/SELL のとき必須）。HOLD なら null
+- entry_price, stop_loss, take_profit: BUY/SELL の場合は必須。entry_price は注文の価格。stop_loss は analysis.invalidation の価格と一致させる
+- expiry_minutes: BUY/SELL の場合は必須。注文の有効期限（今から何分後か）
+- analysis.market_structure: 上位足の流れと、直近の値動きの読み
+- analysis.price_levels: 注文の価格・利確の価格に使った水準と、その根拠
+- analysis.invalidation: 損切りの価格と、その価格で読みが間違いと分かる理由
 - analysis.conflicts: 反対材料
-- conditional_plan: 待ち条件がある場合のみ。wait_for / then_action / invalidate_if / expires_at（"YYYY-MM-DD HH:MM:SS UTC"）に加え、プログラムが機械的に判定するための構造化条件を必ず埋める:
-  - trigger_price + trigger_condition（CLOSE_ABOVE / CLOSE_BELOW）: 5M確定足の終値がこの価格をこの向きに抜けたら成立
-  - invalidate_price + invalidate_condition: 5M確定足の終値がこの価格をこの向きに抜けたら破棄
-  - stop_loss / take_profit: 成立時に使う値
-  条件を1つの価格で表せない場合は、最も本質的な1条件に絞って書く
+- manage: 既存の注文・建玉への操作（無ければ空配列）。各要素:
+  - target: ORDER（working_orders）/ POSITION（open_positions）、id: その ID
+  - op: CANCEL（注文の取消）/ CLOSE（建玉の決済）/ MODIFY（変更）
+  - MODIFY のとき: 注文なら entry_price・stop_loss・take_profit・expiry_minutes、建玉なら stop_loss・take_profit のうち変えるものだけ書く（変えないものは null）
+  - reason: その操作の理由
 - reasoning: 判断に至った論理の要約
 "#
         )
@@ -159,33 +140,14 @@ mod tests {
     }
 
     #[test]
-    fn prompt_carries_fundamental_facts_and_forbids_outside_information() {
-        let facts = FundamentalFacts {
-            symbol: "XAUUSD".into(),
-            as_of: "2026-10-04 00:00 UTC".into(),
-            series: vec![crate::fundamentals::SeriesFact {
-                id: "ust_real:10Y".into(),
-                title: "U.S. Treasury real yield (TIPS) 10Y".into(),
-                units: None,
-                frequency: None,
-                source: "UST".into(),
-                latest: Some(crate::fundamentals::sources::Observation { date: "2026-10-02".into(), value: 2.92 }),
-                previous: None,
-                about_1m_ago: None,
-                about_3m_ago: None,
-                about_12m_ago: None,
-            }],
-            ..Default::default()
-        };
-        let p = PromptBuilder::new().with_fundamentals(facts).build(&snapshot());
-        assert!(p.contains("ust_real:10Y") && p.contains("2.92"));
+    fn prompt_is_price_action_with_pending_orders_only() {
+        let p = PromptBuilder::new().with_lessons(vec!["薄い時間帯のブレイクに注意".into()]).build(&snapshot());
         assert!(p.contains("Web 検索や外部の情報は使えません"));
-        assert!(p.contains("analysis.fundamental_view"));
-        // チャート画像は渡さない（プライスアクションで方向を決めない）
+        assert!(p.contains("成行は使えません") && p.contains("expiry_minutes"));
+        assert!(p.contains("working_orders") && p.contains("manage"));
+        assert!(p.contains("薄い時間帯のブレイクに注意"));
+        assert!(!p.contains("ファンダメンタルズ"));
+        // チャート画像は渡さない
         assert!(!p.contains(".png") && !p.contains("Readツール"));
-
-        // 事実が無いときはその旨を明示する
-        let p = PromptBuilder::new().build(&snapshot());
-        assert!(p.contains("今回は取得できていません"));
     }
 }

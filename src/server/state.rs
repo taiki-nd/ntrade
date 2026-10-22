@@ -8,8 +8,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 use crate::ctrader::{token, BarPeriod, CTraderConfig, CTraderService, TokenSet};
-use crate::executor::{CTraderOrderSink, DisconnectedOrderSink, OrderSink, PlanBook};
-use crate::fundamentals::FundamentalsService;
+use crate::executor::{CTraderOrderSink, DisconnectedOrderSink, OrderSink};
 use crate::guard::GuardConfig;
 use crate::llm::{LlmClient, LlmClientConfig};
 use crate::snapshot::measures;
@@ -17,7 +16,7 @@ use crate::settings::TradingSettings;
 use crate::snapshot::SnapshotBundle;
 use crate::storage::Db;
 use super::types::{
-    AccountInfo, AccountMetrics, BotState, CloseReason, ConnectionStatus, CoTLog, Position, TradeHistory,
+    AccountInfo, AccountMetrics, BotState, CloseReason, ConnectionStatus, CoTLog, Position, TradeHistory, WorkingOrder,
 };
 
 #[derive(Clone)]
@@ -25,6 +24,8 @@ pub struct AppState {
     pub bot_state: Arc<RwLock<BotState>>,
     pub metrics: Arc<RwLock<AccountMetrics>>,
     pub positions: Arc<RwLock<Vec<Position>>>,
+    /// ブローカーに置いてある、まだ約定していない予約注文
+    pub working_orders: Arc<RwLock<Vec<WorkingOrder>>>,
     pub ctrader_service: Arc<RwLock<Option<Arc<CTraderService>>>>,
     pub ctrader_config: Arc<RwLock<Option<CTraderConfig>>>,
     pub available_accounts: Arc<RwLock<Vec<AccountInfo>>>,
@@ -36,19 +37,15 @@ pub struct AppState {
     positions_persist_lock: Arc<tokio::sync::Mutex<()>>,
     /// 画面から変更できる取引設定（対象ペア・待ち秒数・事後ガード）。SQLite の app_settings が正
     pub settings: Arc<RwLock<TradingSettings>>,
-    /// 保持中の条件付きプラン
-    pub plan_book: Arc<RwLock<PlanBook>>,
     /// LLM 推論クライアント
     pub llm: Arc<LlmClient>,
-    /// ファンダメンタルズの事実データ（公的統計・建玉報告・指標予定・公式発表）
-    pub fundamentals: Arc<FundamentalsService>,
     /// 発注先（cTrader 接続時は CTraderOrderSink、未接続時は DisconnectedOrderSink）
     pub order_sink: Arc<RwLock<Arc<dyn OrderSink>>>,
     /// 判断サイクル（読み取り側・ペア間で並行可）と cTrader 接続の差し替え（書き込み側）の排他
     pub cycle_gate: Arc<RwLock<()>>,
     /// 同じペアの判断サイクルを重ねない（スケジューラと手動実行の衝突防止）
     pair_locks: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
-    /// ガード評価（建玉数・日次損失）から発注・建玉記録までを直列化する。
+    /// ガード評価（建玉数・日次損失）から発注・注文記録までを直列化する。
     /// ペアを並行に回すと、両方が「建玉 0」を見て全体上限を超えて発注しうるため
     pub order_lock: Arc<tokio::sync::Mutex<()>>,
     /// ブローカー残高の最終同期時刻
@@ -253,6 +250,31 @@ fn load_saved_positions(db_path: &std::path::Path) -> Vec<Position> {
     }
 }
 
+/// 前回終了時の約定待ちの予約注文（判断との対応と終値判定ラインを引き継ぐため）
+fn load_saved_working_orders(db_path: &std::path::Path) -> Vec<WorkingOrder> {
+    match Db::open(db_path).and_then(|db| db.working_orders()) {
+        Ok(orders) => {
+            if !orders.is_empty() {
+                info!(count = orders.len(), "Restored working orders from SQLite");
+            }
+            orders
+        }
+        Err(e) => {
+            warn!("Failed to load working orders from SQLite: {e:#}");
+            Vec::new()
+        }
+    }
+}
+
+/// 判断 ID を comment に入れて発注しているので、ブローカー側の注文・建玉から判断へ辿れる
+fn cot_id_from_comment(comment: Option<&str>) -> Option<String> {
+    comment.filter(|c| c.starts_with("cot-")).map(str::to_string)
+}
+
+fn ts_string(t: chrono::DateTime<Utc>) -> String {
+    t.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
 fn load_saved_tokens(db_path: &std::path::Path) -> Option<TokenSet> {
     match Db::open(db_path).and_then(|db| db.load_ctrader_tokens()) {
         Ok(tokens) => tokens,
@@ -280,6 +302,7 @@ impl AppState {
 
         let db_path = PathBuf::from(crate::storage::DEFAULT_DB_PATH);
         let positions = load_saved_positions(&db_path);
+        let working_orders = load_saved_working_orders(&db_path);
         let settings = TradingSettings::load_or_seed(&db_path);
         // SQLite に保存済みのトークンがあれば .env の値より優先する（自動更新で .env は古くなるため）
         let initial_config = CTraderConfig::from_env().ok().map(|cfg| match load_saved_tokens(&db_path) {
@@ -290,11 +313,11 @@ impl AppState {
             None => cfg,
         });
 
-        let fundamentals = Arc::new(FundamentalsService::new(db_path.clone()));
         Self {
             bot_state: Arc::new(RwLock::new(BotState::Running)),
             metrics: Arc::new(RwLock::new(metrics)),
             positions: Arc::new(RwLock::new(positions)),
+            working_orders: Arc::new(RwLock::new(working_orders)),
             ctrader_service: Arc::new(RwLock::new(None)),
             ctrader_config: Arc::new(RwLock::new(initial_config)),
             available_accounts: Arc::new(RwLock::new(Vec::new())),
@@ -302,9 +325,7 @@ impl AppState {
             db_path,
             positions_persist_lock: Arc::new(tokio::sync::Mutex::new(())),
             settings: Arc::new(RwLock::new(settings)),
-            plan_book: Arc::new(RwLock::new(PlanBook::default())),
             llm: Arc::new(LlmClient::new(LlmClientConfig::default())),
-            fundamentals,
             order_sink: Arc::new(RwLock::new(Arc::new(DisconnectedOrderSink))),
             cycle_gate: Arc::new(RwLock::new(())),
             pair_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -555,13 +576,25 @@ impl AppState {
         };
 
         self.sync_broker_account().await;
-        let broker = ctrader.get_open_positions().await.context("Failed to reconcile positions")?;
+        let (broker, broker_orders) = ctrader.get_open_book().await.context("Failed to reconcile positions")?;
         {
             // 使用証拠金はブローカーの建玉ごとの値の合計
             let mut m = self.metrics.write().await;
             m.margin = broker.iter().filter_map(|b| b.used_margin).sum();
             m.free_margin = m.equity - m.margin;
         }
+
+        // 0. 予約注文: ブローカーから消えた注文は約定・取消・期限切れのどれか。約定したものは建玉へ引き継ぐ
+        let (seen, orders, filled) = self.reconcile_orders(&ctrader, &broker_orders).await;
+        {
+            // 照合の間に判断サイクルが置いた注文は、今回のブローカーの一覧に無くても残す
+            let mut current = self.working_orders.write().await;
+            let added: Vec<WorkingOrder> = current.iter().filter(|o| !seen.contains(&o.id)).cloned().collect();
+            let mut merged: Vec<WorkingOrder> = orders.into_iter().filter(|o| !added.iter().any(|a| a.id == o.id)).collect();
+            merged.extend(added);
+            *current = merged;
+        }
+        self.persist_working_orders().await;
 
         // 1. ローカルにあってブローカーに無い建玉 = 決済済み
         let local = self.positions.read().await.clone();
@@ -583,7 +616,7 @@ impl AppState {
             }
         }
 
-        // 2. ブローカーにあってローカルに無い建玉（発注は通ったが記録に失敗した等）を取り込む
+        // 2. ブローカーにあってローカルに無い建玉を取り込む。予約注文の約定ならその注文の判断を引き継ぐ
         let orphans: Vec<_> = broker
             .iter()
             .filter(|b| !remaining.iter().any(|p| p.id == b.position_id.to_string()))
@@ -591,9 +624,8 @@ impl AppState {
             .collect();
         for b in orphans {
             let symbol = b.symbol_name.clone().unwrap_or_else(|| format!("symbol-{}", b.symbol_id));
-            warn!(position_id = b.position_id, symbol = %symbol, "orphan broker position adopted (not tracked locally)");
             let entry = b.entry_price.unwrap_or_default();
-            remaining.push(Position {
+            let mut p = Position {
                 id: b.position_id.to_string(),
                 symbol,
                 side: if b.is_buy { "BUY".into() } else { "SELL".into() },
@@ -604,11 +636,46 @@ impl AppState {
                 take_profit: b.take_profit.unwrap_or_default(),
                 pnl_pips: 0.0,
                 pnl_amount: 0.0,
-                open_time: b.open_time.unwrap_or_else(Utc::now).format("%Y-%m-%d %H:%M:%S").to_string(),
+                open_time: ts_string(b.open_time.unwrap_or_else(Utc::now)),
                 invalidation_reason: "ブローカー側から取り込んだ建玉（ntrade の記録に無し）".into(),
-                cot_log_id: None,
+                cot_log_id: cot_id_from_comment(b.comment.as_deref()),
                 close_stop: None,
-            });
+            };
+            match filled.get(&b.position_id) {
+                Some(o) => {
+                    info!(position = %p.id, order = %o.id, cot = ?o.cot_log_id, "pending order filled; position adopted");
+                    p.invalidation_reason = o.invalidation_reason.clone();
+                    p.cot_log_id = o.cot_log_id.clone().or(p.cot_log_id);
+                    p.close_stop = o.close_stop;
+                }
+                None => warn!(position = %p.id, symbol = %p.symbol, cot = ?p.cot_log_id, "orphan broker position adopted (not tracked locally)"),
+            }
+            remaining.push(p);
+        }
+
+        // 2b. 約定したが、照合までの間に決済まで済んだ建玉。建玉としては見えないので、決済として記録する
+        for (position_id, o) in &filled {
+            if broker.iter().any(|b| b.position_id == *position_id) || remaining.iter().any(|p| p.id == position_id.to_string()) {
+                continue;
+            }
+            info!(position = position_id, order = %o.id, "pending order filled and closed between reconciles");
+            let p = Position {
+                id: position_id.to_string(),
+                symbol: o.symbol.clone(),
+                side: o.side.clone(),
+                volume_lots: o.volume_lots,
+                entry_price: o.entry_price,
+                current_price: o.entry_price,
+                stop_loss: o.stop_loss,
+                take_profit: o.take_profit,
+                pnl_pips: 0.0,
+                pnl_amount: 0.0,
+                open_time: o.created_at.clone(),
+                invalidation_reason: o.invalidation_reason.clone(),
+                cot_log_id: o.cot_log_id.clone(),
+                close_stop: o.close_stop,
+            };
+            closed.push(closed_trade(&ctrader, p).await);
         }
 
         // 3. 残った建玉の含み損益をブローカーの値で更新する
@@ -618,6 +685,71 @@ impl AppState {
         self.persist_positions().await;
 
         Ok(self.record_closed_trades(closed).await)
+    }
+
+    /// 予約注文の照合。照合前に把握していた注文 ID、残す注文、約定した注文（建玉 ID → 注文）を返す
+    async fn reconcile_orders(
+        &self,
+        ctrader: &CTraderService,
+        broker_orders: &[crate::ctrader::BrokerOrder],
+    ) -> (Vec<String>, Vec<WorkingOrder>, HashMap<i64, WorkingOrder>) {
+        use crate::ctrader::OrderFate;
+        let local = self.working_orders.read().await.clone();
+        let seen: Vec<String> = local.iter().map(|o| o.id.clone()).collect();
+        let mut keep = Vec::new();
+        let mut filled = HashMap::new();
+        for mut o in local {
+            if let Some(b) = broker_orders.iter().find(|b| b.order_id.to_string() == o.id) {
+                // 変更はブローカーの値が正（手動で動かされた場合も含む）
+                if let Some(price) = b.price {
+                    o.entry_price = price;
+                }
+                o.stop_loss = b.stop_loss.unwrap_or(o.stop_loss);
+                o.take_profit = b.take_profit.unwrap_or(o.take_profit);
+                if let Some(exp) = b.expires_at {
+                    o.expires_at = ts_string(exp);
+                }
+                keep.push(o);
+                continue;
+            }
+            let fate = match o.id.parse::<i64>() {
+                Ok(id) => ctrader.order_fate(id).await.unwrap_or_else(|e| {
+                    warn!(order = %o.id, "failed to resolve what happened to the order: {e:#}");
+                    OrderFate::Unknown
+                }),
+                Err(_) => OrderFate::Unknown,
+            };
+            match fate {
+                OrderFate::Filled { position_id } => {
+                    filled.insert(position_id, o);
+                }
+                // reconcile とのすれ違い。次の照合で見直す
+                OrderFate::Working => keep.push(o),
+                other => info!(order = %o.id, symbol = %o.symbol, ?other, cot = ?o.cot_log_id, "pending order left the book"),
+            }
+        }
+        // ブローカーにだけある注文（cTrader 側で置いた・記録に失敗した）を取り込む
+        let known: Vec<String> = keep.iter().map(|o| o.id.clone()).collect();
+        for b in broker_orders.iter().filter(|b| !known.contains(&b.order_id.to_string())) {
+            let Some(kind) = b.kind else { continue };
+            warn!(order = b.order_id, symbol = ?b.symbol_name, "orphan broker order adopted (not tracked locally)");
+            keep.push(WorkingOrder {
+                id: b.order_id.to_string(),
+                symbol: b.symbol_name.clone().unwrap_or_else(|| format!("symbol-{}", b.symbol_id)),
+                side: if b.is_buy { "BUY".into() } else { "SELL".into() },
+                kind,
+                volume_lots: b.volume_lots,
+                entry_price: b.price.unwrap_or_default(),
+                stop_loss: b.stop_loss.unwrap_or_default(),
+                take_profit: b.take_profit.unwrap_or_default(),
+                close_stop: None,
+                created_at: ts_string(Utc::now()),
+                expires_at: b.expires_at.map(ts_string).unwrap_or_default(),
+                invalidation_reason: "ブローカー側から取り込んだ予約注文（ntrade の記録に無し）".into(),
+                cot_log_id: cot_id_from_comment(b.comment.as_deref()),
+            });
+        }
+        (seen, keep, filled)
     }
 
     /// 単一建玉の手動成行決済。ブローカーの約定を待ってから決済履歴を確定させるので、
@@ -714,6 +846,52 @@ impl AppState {
                 Err(e) => warn!("reconcile failed: {e:#}"),
             }
         }
+    }
+
+    /// 残高の推移を cTrader の決済・入出金履歴から取り込む常駐ループ。
+    /// 初回は口座の開設日から遡り、以降は前回取り込んだ時点からの差分だけを引く。
+    pub async fn run_balance_history_loop(self) {
+        const INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+        /// 接続待ち・初回の取り込み失敗時は、グラフが空のままにならないよう短い間隔で試し直す
+        const RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+        // 口座 ID → 取り込み済みの時刻
+        let mut synced: HashMap<i64, chrono::DateTime<Utc>> = HashMap::new();
+        loop {
+            if let Err(e) = self.sync_balance_history(&mut synced).await {
+                warn!("balance history sync failed: {e:#}");
+            }
+            let account = self.ctrader_config.read().await.as_ref().map(|c| c.account_id);
+            let caught_up = account.is_some_and(|id| synced.contains_key(&id));
+            tokio::time::sleep(if caught_up { INTERVAL } else { RETRY }).await;
+        }
+    }
+
+    async fn sync_balance_history(&self, synced: &mut HashMap<i64, chrono::DateTime<Utc>>) -> Result<()> {
+        let Some(ctrader) = self.ctrader_service.read().await.clone() else { return Ok(()) };
+        let account_id = ctrader.config().account_id;
+        let from = match synced.get(&account_id) {
+            Some(t) => *t,
+            None => {
+                let latest = self.with_db(move |db| db.latest_balance_ts(account_id)).await?;
+                match latest.and_then(|ts| Utc.timestamp_opt(ts, 0).single()) {
+                    Some(t) => t,
+                    None => ctrader
+                        .get_account_info()
+                        .await?
+                        .registered_at
+                        .unwrap_or_else(|| Utc::now() - chrono::Duration::days(365)),
+                }
+            }
+        };
+        // 反映の遅れた約定を取りこぼさないよう少し重ねて取る（重複は ID で上書きされる）
+        let from = from - chrono::Duration::minutes(10);
+        let now = Utc::now();
+        let events = ctrader.get_balance_events(from, now).await?;
+        let count = events.len();
+        self.with_db(move |db| db.insert_balance_events(account_id, &events)).await?;
+        synced.insert(account_id, now);
+        debug!(account_id, count, %from, "balance history synced");
+        Ok(())
     }
 
     /// .env ファイル内の指定されたキーの値を更新・保存する
@@ -905,6 +1083,15 @@ impl AppState {
         }
     }
 
+    /// 約定待ちの予約注文を SQLite に書き出す。`working_orders` を変更したら呼ぶ
+    pub async fn persist_working_orders(&self) {
+        let _serial = self.positions_persist_lock.lock().await;
+        let snapshot = self.working_orders.read().await.clone();
+        if let Err(e) = self.with_db(move |db| db.replace_working_orders(&snapshot)).await {
+            error!("Failed to persist working orders to SQLite: {e:#}");
+        }
+    }
+
     /// 決済履歴を SQLite に記録する
     pub async fn record_trades(&self, trades: Vec<TradeHistory>) {
         if trades.is_empty() {
@@ -990,6 +1177,7 @@ mod tests {
             take_profit: tp,
             open_time: None,
             used_margin: None,
+            comment: None,
         }
     }
 

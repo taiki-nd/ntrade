@@ -1,10 +1,10 @@
-# 事後ガード設定（docs/02_trading_strategy.md 7章）
+# 事後ガード設定（docs/08_intraday_pending_orders.md）
 # ここにある数値は「判断」ではなく「リスク管理」。LLM のプロンプトには書かない。
 #
 # 本番エンジンでは初回起動時の初期値としてだけ使う。以後は SQLite（app_settings）に保存された値が正で、
 # ダッシュボードの設定画面から変更する（このファイルを直しても反映されない）。リプレイ（bin/replay）は引き続きこのファイルを読む。
 
-# 観測整合: LLM が報告した最新足時刻が Snapshot と一致しなければ HOLD
+# 旧: 観測整合（チャート画像を渡していた頃のもの。今は使わない）
 observed_check = true
 
 # 確信度の下限（リプレイで較正するまでの暫定値）
@@ -28,14 +28,14 @@ sl_min_pips = 3.0
 stop_mode = "touch"
 hard_stop_atr = 2.0
 
-# ポジション上限
+# ポジション上限（約定待ちの予約注文も 1 件として数える）
 max_positions_per_pair = 1
 max_positions_total = 1
 
 # 日次損失上限（資金比 %）。到達したらその日は新規発注を遮断
 daily_loss_limit_pct = 3.0
 
-# 条件付きプランの最長有効期間（時間）
+# 予約注文の有効期限の上限（時間）。LLM は注文ごとに期限を決め、これを超える期限の注文は出さない
 plan_max_hours = 8.0
 
 # 発注ロット（固定）。risk_pct を設定すると SL 幅から自動計算する。

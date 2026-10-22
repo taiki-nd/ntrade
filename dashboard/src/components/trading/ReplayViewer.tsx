@@ -21,6 +21,24 @@ import {
   type ReplayCoverage,
 } from "@/lib/trading-api";
 
+/** 採点結果の表示名（旧方式の run の結果も含む） */
+const OUTCOME_LABELS: Record<string, string> = {
+  TP_HIT: "利確",
+  SL_HIT: "損切り",
+  SAME_BAR: "同一足",
+  TIMEOUT: "時間切れ",
+  HOLD: "見送り",
+  ORDER_EXPIRED: "未約定（期限切れ）",
+  NO_SL_TP: "SL/TP なし",
+  NO_DATA: "データ不足",
+  PLAN_EXPIRED: "旧: プラン期限切れ",
+  PLAN_INVALIDATED: "旧: プラン破棄",
+  PLAN_UNSTRUCTURED: "旧: プラン不正",
+  PLAN_DECLINED: "旧: 成立後に見送り",
+  PLAN_REJECTED: "旧: 成立後にガード",
+};
+const outcomeLabel = (k: string) => OUTCOME_LABELS[k] ?? k;
+
 function pct(v: number | null | undefined): string {
   return v === null || v === undefined ? "-" : `${(v * 100).toFixed(0)}%`;
 }
@@ -35,11 +53,11 @@ function BucketRows({ rows }: { rows: [string, ReplayBucket][] }) {
         <TableRow>
           <TableHead className="text-xs">帯</TableHead>
           <TableHead className="text-xs text-right">n</TableHead>
-          <TableHead className="text-xs text-right">trades</TableHead>
-          <TableHead className="text-xs text-right">TP</TableHead>
-          <TableHead className="text-xs text-right">SL</TableHead>
+          <TableHead className="text-xs text-right">約定</TableHead>
+          <TableHead className="text-xs text-right">利確</TableHead>
+          <TableHead className="text-xs text-right">損切り</TableHead>
           <TableHead className="text-xs text-right">同一足</TableHead>
-          <TableHead className="text-xs text-right">TO</TableHead>
+          <TableHead className="text-xs text-right">時間切れ</TableHead>
           <TableHead className="text-xs text-right">勝率</TableHead>
           <TableHead className="text-xs text-right">平均pips</TableHead>
           <TableHead className="text-xs text-right">合計pips</TableHead>
@@ -117,7 +135,7 @@ export function ReplayViewer() {
               <span>リプレイ結果</span>
             </CardTitle>
             <CardDescription className="text-xs">
-              過去スナップショットに対する LLM 判断の採点。確信度帯ごとの勝率でガード閾値を較正。
+              過去の時刻で本番と同じ判断をさせて採点します。予約注文は期限内に 5 分足で価格へ届いたら約定とみなし、その後 SL と TP のどちらに先に届いたかを見ます。
             </CardDescription>
           </div>
           <Button variant="outline" size="sm" onClick={load} disabled={loading} className="h-8 gap-1.5 text-xs">
@@ -145,7 +163,7 @@ export function ReplayViewer() {
                 <TableRow>
                   <TableHead className="text-xs">#</TableHead>
                   <TableHead className="text-xs">作成</TableHead>
-                  <TableHead className="text-xs">ペア</TableHead>
+                  <TableHead className="text-xs">銘柄</TableHead>
                   <TableHead className="text-xs">期間</TableHead>
                   <TableHead className="text-xs">サンプリング</TableHead>
                   <TableHead className="text-xs text-right">判断数</TableHead>
@@ -185,16 +203,17 @@ export function ReplayViewer() {
               <span>判断 {report.total}</span>
               <span>ガード通過 {report.guard_pass}</span>
               <span>HOLD率 {pct(report.hold_rate)}</span>
-              <span>条件付きプラン率 {pct(report.plan_rate)} (成立 {report.plan_triggered})</span>
-              <span>画像未参照率 {pct(report.unobserved_rate)}</span>
+              <span>
+                注文率 {pct(report.order_rate)} (約定 {report.orders_filled ?? 0} / 期限切れ {report.orders_expired ?? 0})
+              </span>
               <span>反対材料未記載率 {pct(report.conflicts_empty_rate)}</span>
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
             <div className="flex flex-wrap gap-1.5">
               {Object.entries(report.by_outcome).map(([k, v]) => (
-                <Badge key={k} variant="outline" className="text-[11px] font-mono">
-                  {k}: {v}
+                <Badge key={k} variant="outline" className="text-[11px]" title={k}>
+                  {outcomeLabel(k)}: {v}
                 </Badge>
               ))}
               {Object.entries(report.by_guard)
@@ -225,14 +244,14 @@ export function ReplayViewer() {
                 <Table>
                   <TableHeader>
                     <TableRow>
-                      <TableHead className="text-xs">t</TableHead>
+                      <TableHead className="text-xs">時刻 (UTC)</TableHead>
                       <TableHead className="text-xs">セッション</TableHead>
-                      <TableHead className="text-xs">action</TableHead>
-                      <TableHead className="text-xs text-right">conf</TableHead>
-                      <TableHead className="text-xs">guard</TableHead>
-                      <TableHead className="text-xs">outcome</TableHead>
+                      <TableHead className="text-xs">判断</TableHead>
+                      <TableHead className="text-xs text-right">確信度</TableHead>
+                      <TableHead className="text-xs">ガード</TableHead>
+                      <TableHead className="text-xs">結果</TableHead>
                       <TableHead className="text-xs text-right">pips</TableHead>
-                      <TableHead className="text-xs text-right">bars</TableHead>
+                      <TableHead className="text-xs text-right">決着まで(本)</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
@@ -243,7 +262,7 @@ export function ReplayViewer() {
                         <TableCell className="text-xs font-medium">{d.action}</TableCell>
                         <TableCell className="text-xs text-right">{d.confidence.toFixed(2)}</TableCell>
                         <TableCell className="text-xs font-mono">{d.guard_result}</TableCell>
-                        <TableCell className="text-xs font-mono">{d.outcome}</TableCell>
+                        <TableCell className="text-xs" title={d.outcome}>{outcomeLabel(d.outcome)}</TableCell>
                         <TableCell className="text-xs text-right">{num(d.pnl_pips)}</TableCell>
                         <TableCell className="text-xs text-right">{d.bars_to_exit ?? "-"}</TableCell>
                       </TableRow>
