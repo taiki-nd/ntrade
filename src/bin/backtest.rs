@@ -12,16 +12,17 @@
 //! ```
 
 use anyhow::{anyhow, bail, Result};
-use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use ntrade::backtest::config::{self, BacktestFileConfig, RunRequest, DEFAULT_BACKTEST_CONFIG_PATH};
-use ntrade::backtest::optimize::{self, GridAxis, Objective};
+use ntrade::backtest::config::{self, BacktestFileConfig, GridRequest, RunRequest, WalkForwardWindows, DEFAULT_BACKTEST_CONFIG_PATH};
+use ntrade::backtest::fetch::FetchRequest;
+use ntrade::backtest::optimize::{Objective, Progress};
 use ntrade::backtest::{self, BacktestResult, BacktestTrade, Metrics};
 use ntrade::ctrader::{BarPeriod, CTraderConfig, CTraderService};
-use ntrade::storage::{Db, NewBacktestRun, DEFAULT_DB_PATH};
+use ntrade::storage::{Db, DEFAULT_DB_PATH};
 use ntrade::strategy::{self, Params, StrategySpec};
 
 #[derive(Parser)]
@@ -168,7 +169,7 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Fetch { pairs, from, to, periods } => {
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(fetch(&mut db, &pairs, parse_date(&from)?, to.map(|s| parse_date(&s)).transpose()?.unwrap_or_else(Utc::now), &periods))?;
+            rt.block_on(fetch(&db, &cli.db, &pairs, parse_date(&from)?, to.map(|s| parse_date(&s)).transpose()?.unwrap_or_else(Utc::now), &periods))?;
             print_coverage(&db)?;
         }
         Cmd::Coverage => print_coverage(&db)?,
@@ -196,16 +197,21 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Sweep { run, grid, top } => {
-            let req = run_request(&run)?;
-            let (combos, objective) = grid_combos(&req.strategy, &grid)?;
-            let lookback = max_lookback(&req.strategy, &combos);
-            let (data, cfg) = config::prepare(&db, &file, &req, lookback)?;
-            println!("{} combinations × {} ({} .. {}, exec {})", combos.len(), cfg.pair, cfg.from, cfg.to, data.exec_period.as_str());
+            let req = grid_request(&run, &grid)?;
             let started = std::time::Instant::now();
-            let rows = optimize::sweep(&data, &cfg, &combos, objective, grid.min_trades, threads(&grid));
-            println!("done in {:.1}s\n", started.elapsed().as_secs_f64());
+            let out = config::run_sweep(&mut db, &file, &req, threads(&grid), &Progress::default())?;
+            let cfg = &out.config;
+            println!(
+                "{} combinations × {} ({} .. {}, exec {}) done in {:.1}s\n",
+                out.combinations,
+                cfg.pair,
+                cfg.from,
+                cfg.to,
+                out.exec_period.as_str(),
+                started.elapsed().as_secs_f64()
+            );
             println!("{:>4}  {:>9}  {}  params", "#", "score", metrics_header());
-            for (i, r) in rows.iter().take(top).enumerate() {
+            for (i, r) in out.rows.iter().take(top).enumerate() {
                 println!(
                     "{:>4}  {:>9}  {}  {}",
                     i + 1,
@@ -214,49 +220,29 @@ fn main() -> Result<()> {
                     params_label(&r.params)
                 );
             }
-            let best = rows.first().map(|r| serde_json::to_value(&r.metrics)).transpose()?.unwrap_or_default();
-            let id = db.insert_backtest_run(
-                &NewBacktestRun {
-                    label: &run.label,
-                    kind: "sweep",
-                    pair: &cfg.pair,
-                    strategy: &format!("{} {} [grid]", cfg.strategy.name, cfg.strategy.timeframe.as_str()),
-                    from: cfg.from,
-                    to: cfg.to,
-                    config: serde_json::json!({ "config": cfg, "execPeriod": data.exec_period, "grid": grid.grid, "objective": objective, "minTrades": grid.min_trades }),
-                    metrics: best,
-                    summary: serde_json::to_value(&rows)?,
-                },
-                &[],
-                &[],
-            )?;
-            println!("\nsaved as run #{id}");
+            println!("\nsaved as run #{}", out.id);
         }
         Cmd::WalkForward { run, grid, train_days, test_days } => {
-            let req = run_request(&run)?;
-            let (combos, objective) = grid_combos(&req.strategy, &grid)?;
-            let lookback = max_lookback(&req.strategy, &combos);
-            let (data, cfg) = config::prepare(&db, &file, &req, lookback)?;
-            println!(
-                "walk-forward: {} combinations, train {train_days}d / test {test_days}d, {} .. {}",
-                combos.len(),
-                cfg.from,
-                cfg.to
-            );
+            let req = grid_request(&run, &grid)?;
             let started = std::time::Instant::now();
-            let wf = optimize::walk_forward(
-                &data,
-                &cfg,
-                &combos,
-                objective,
-                grid.min_trades,
-                Duration::days(train_days),
-                Duration::days(test_days),
+            let out = config::run_walk_forward(
+                &mut db,
+                &file,
+                &req,
+                WalkForwardWindows { train_days, test_days },
                 threads(&grid),
+                &Progress::default(),
             )?;
-            println!("done in {:.1}s\n", started.elapsed().as_secs_f64());
+            let cfg = &out.config;
+            println!(
+                "walk-forward: {} combinations, train {train_days}d / test {test_days}d, {} .. {} done in {:.1}s\n",
+                out.combinations,
+                cfg.from,
+                cfg.to,
+                started.elapsed().as_secs_f64()
+            );
             println!("{:<23} {:<23} {:>8} {:>8}  params", "train", "test", "train", "test");
-            for w in &wf.windows {
+            for w in &out.result.windows {
                 let fmt = |m: &Option<Metrics>| m.as_ref().map(|m| format!("{:+.0}", m.net_profit)).unwrap_or_else(|| "-".into());
                 println!(
                     "{} {} {:>8} {:>8}  {}",
@@ -268,23 +254,8 @@ fn main() -> Result<()> {
                 );
             }
             println!("\n検証期間だけをつないだ成績（未知のデータでの成績）:");
-            print_metrics(&wf.oos);
-            let id = db.insert_backtest_run(
-                &NewBacktestRun {
-                    label: &run.label,
-                    kind: "walk_forward",
-                    pair: &cfg.pair,
-                    strategy: &format!("{} {} [grid]", cfg.strategy.name, cfg.strategy.timeframe.as_str()),
-                    from: cfg.from,
-                    to: cfg.to,
-                    config: serde_json::json!({ "config": cfg, "execPeriod": data.exec_period, "grid": grid.grid, "objective": objective, "minTrades": grid.min_trades, "trainDays": train_days, "testDays": test_days }),
-                    metrics: serde_json::to_value(&wf.oos)?,
-                    summary: serde_json::to_value(&wf.windows)?,
-                },
-                &wf.oos_trades,
-                &backtest::metrics::equity_from_trades(&wf.oos_trades, cfg.initial_balance),
-            )?;
-            println!("\nsaved as run #{id}");
+            print_metrics(&out.result.oos);
+            println!("\nsaved as run #{}", out.id);
         }
         Cmd::List { limit } => {
             println!("{:<5} {:<19} {:<12} {:<10} {:<23} {:>7} {:>11} {:>6}  strategy / label", "#", "created", "kind", "pair", "period", "trades", "net", "PF");
@@ -325,7 +296,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-async fn fetch(db: &mut Db, pairs: &[String], from: DateTime<Utc>, to: DateTime<Utc>, periods: &str) -> Result<()> {
+async fn fetch(db: &Db, db_path: &std::path::Path, pairs: &[String], from: DateTime<Utc>, to: DateTime<Utc>, periods: &str) -> Result<()> {
     // bot が Refresh Token で更新したトークンは SQLite にあり、.env の方は古くなっている
     let mut cfg = CTraderConfig::from_env()?;
     if let Some(tokens) = db.load_ctrader_tokens()? {
@@ -334,42 +305,8 @@ async fn fetch(db: &mut Db, pairs: &[String], from: DateTime<Utc>, to: DateTime<
     let service = CTraderService::connect(cfg).await?;
     let periods: Vec<BarPeriod> =
         periods.split(',').map(|p| BarPeriod::parse(p.trim()).ok_or_else(|| anyhow!("unknown period {p}"))).collect::<Result<_>>()?;
-    for pair in pairs {
-        // 銘柄仕様（lot サイズ・pip 位置）も保存しておく（バックテストのロット計算に使う）
-        match service.symbol_spec(pair).await {
-            Ok(spec) => db.save_instrument(&spec)?,
-            Err(e) => eprintln!("warning: failed to load the symbol spec of {pair}: {e:#}"),
-        }
-        for &period in &periods {
-            let first = db.first_bar_ts(pair, period)?;
-            let last = db.last_bar_ts(pair, period)?;
-            // DB に無い前側と後ろ側だけを取る
-            let mut ranges = Vec::new();
-            match (first, last) {
-                (Some(first), Some(last)) => {
-                    if from < first {
-                        ranges.push((from, first));
-                    }
-                    if last.max(from) < to {
-                        ranges.push((last.max(from), to));
-                    }
-                }
-                _ => ranges.push((from, to)),
-            }
-            for (a, b) in ranges {
-                // 長い期間は区切って取り、区切りごとに保存する（途中で切れても続きから取れるように）
-                let step = Duration::days(if period == BarPeriod::M1 { 30 } else { 180 });
-                let mut cursor = a;
-                while cursor < b {
-                    let end = (cursor + step).min(b);
-                    let bars = service.get_trendbars_range(pair, period, cursor, end).await?;
-                    let n = db.insert_bars(pair, period, &bars)?;
-                    println!("{pair} {:>3} {} .. {}  {n} bars", period.as_str(), cursor.format("%Y-%m-%d"), end.format("%Y-%m-%d"));
-                    cursor = end;
-                }
-            }
-        }
-    }
+    let req = FetchRequest { pairs: pairs.to_vec(), from, to: Some(to), periods };
+    backtest::fetch::fetch(&service, db_path, &req, &Progress::default(), |seg, n| println!("{}  {n} bars", seg.label())).await?;
     Ok(())
 }
 
@@ -400,28 +337,8 @@ fn run_request(a: &RunArgs) -> Result<RunRequest> {
     })
 }
 
-fn grid_combos(spec: &StrategySpec, g: &GridArgs) -> Result<(Vec<Params>, Objective)> {
-    let axes: Vec<GridAxis> = g.grid.iter().map(|s| GridAxis::parse(s)).collect::<Result<_>>()?;
-    let combos = optimize::combinations(&spec.params, &axes);
-    // 名前の誤りは走らせる前に止める
-    for a in &axes {
-        let probe = StrategySpec { params: Params::from([(a.name.clone(), a.values[0])]), ..spec.clone() };
-        if let Err(e) = strategy::resolve_params(&probe) {
-            if e.to_string().contains("unknown") {
-                return Err(e);
-            }
-        }
-    }
-    Ok((combos, Objective::parse(&g.objective)?))
-}
-
-fn max_lookback(spec: &StrategySpec, combos: &[Params]) -> usize {
-    combos
-        .iter()
-        .filter_map(|p| strategy::build(&StrategySpec { params: p.clone(), ..spec.clone() }).ok())
-        .map(|s| s.lookback())
-        .max()
-        .unwrap_or(0)
+fn grid_request(run: &RunArgs, g: &GridArgs) -> Result<GridRequest> {
+    Ok(GridRequest { run: run_request(run)?, grid: g.grid.clone(), objective: Objective::parse(&g.objective)?, min_trades: g.min_trades })
 }
 
 fn threads(g: &GridArgs) -> usize {

@@ -9,6 +9,7 @@
 
 pub mod config;
 pub mod data;
+pub mod fetch;
 pub mod metrics;
 pub mod optimize;
 pub mod sim;

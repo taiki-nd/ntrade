@@ -9,6 +9,7 @@ use tracing::info;
 
 use crate::backtest::config::{self, BacktestFileConfig, RunRequest, DEFAULT_BACKTEST_CONFIG_PATH};
 use crate::backtest::{self, BacktestTrade, EquityPoint};
+use crate::server::jobs::{JobInfo, JobRequest};
 use crate::server::state::AppState;
 use crate::server::types::ApiResponse;
 use crate::storage::{BacktestRunRow, Coverage};
@@ -89,5 +90,35 @@ pub async fn run(State(state): State<AppState>, Json(req): Json<RunRequest>) -> 
     match res {
         Ok(r) => Json(ApiResponse::ok_msg(r, "バックテストが完了しました")),
         Err(e) => Json(ApiResponse::err(format!("{e:#}"))),
+    }
+}
+
+/// GET /api/backtest/jobs … ジョブの一覧（新しい順）
+pub async fn list_jobs(State(state): State<AppState>) -> Json<ApiResponse<Vec<JobInfo>>> {
+    Json(ApiResponse::ok(state.jobs.list()))
+}
+
+/// POST /api/backtest/jobs … 過去データの取得・グリッドサーチ・ウォークフォワードを順番待ちに入れる
+pub async fn submit_job(State(state): State<AppState>, Json(req): Json<JobRequest>) -> Json<ApiResponse<JobInfo>> {
+    // 名前や組み合わせ数の誤りは、順番を待たせずにここで返す
+    let check = match &req {
+        JobRequest::Fetch(r) if r.pairs.is_empty() => Err(anyhow::anyhow!("銘柄を 1 つ以上指定してください")),
+        JobRequest::Fetch(_) => Ok(()),
+        JobRequest::Sweep(g) | JobRequest::WalkForward { grid: g, .. } => config::grid_combos(&g.run.strategy, &g.grid).map(|_| ()),
+    };
+    if let Err(e) = check {
+        return Json(ApiResponse::err(format!("{e:#}")));
+    }
+    let job = state.jobs.submit(state.clone(), req);
+    info!(job = job.id, title = %job.title, "backtest job queued");
+    Json(ApiResponse::ok_msg(job, "ジョブを受け付けました"))
+}
+
+/// POST /api/backtest/jobs/{id}/cancel
+pub async fn cancel_job(State(state): State<AppState>, Path(id): Path<u64>) -> Json<ApiResponse<()>> {
+    if state.jobs.cancel(id) {
+        Json(ApiResponse::ok_msg((), "中止を指示しました"))
+    } else {
+        Json(ApiResponse::err(format!("job {id} is not running")))
     }
 }

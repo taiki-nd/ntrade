@@ -1,5 +1,7 @@
 import {
   AccountMetrics,
+  BacktestJob,
+  BacktestJobRequest,
   BacktestRunDetail,
   BacktestRunRequest,
   BacktestRunRow,
@@ -383,6 +385,23 @@ export const tradingApi = {
       method: "POST",
       body: JSON.stringify(req),
     });
+  },
+
+  /** バックテスト系のジョブ（新しい順） */
+  async getBacktestJobs(): Promise<ApiResponse<BacktestJob[]>> {
+    return await request<ApiResponse<BacktestJob[]>>("/api/backtest/jobs");
+  },
+
+  /** 過去データの取得・グリッドサーチ・ウォークフォワードを順番待ちに入れる（すぐ返る） */
+  async submitBacktestJob(req: BacktestJobRequest): Promise<ApiResponse<BacktestJob>> {
+    return await request<ApiResponse<BacktestJob>>("/api/backtest/jobs", {
+      method: "POST",
+      body: JSON.stringify(req),
+    });
+  },
+
+  async cancelBacktestJob(id: number): Promise<ApiResponse<null>> {
+    return await request<ApiResponse<null>>(`/api/backtest/jobs/${id}/cancel`, { method: "POST" });
   },
 
   /** DB にあるヒストリカルの足の範囲 */

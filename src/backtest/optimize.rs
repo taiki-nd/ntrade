@@ -6,7 +6,7 @@
 use anyhow::{anyhow, bail, Result};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use super::metrics::{self, Metrics};
@@ -98,6 +98,27 @@ impl Objective {
     }
 }
 
+/// 進み具合と中止の指示（画面のジョブ表示に使う。CLI は既定値を渡すだけ）
+#[derive(Debug, Default)]
+pub struct Progress {
+    /// 走らせ終えたバックテストの回数
+    pub done: AtomicUsize,
+    /// 走らせる予定の回数
+    pub total: AtomicUsize,
+    /// true にすると、走っている組み合わせが終わったところで止める
+    pub cancelled: AtomicBool,
+}
+
+impl Progress {
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
+    }
+
+    fn tick(&self) {
+        self.done.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SweepRow {
@@ -115,20 +136,27 @@ pub fn sweep(
     objective: Objective,
     min_trades: usize,
     threads: usize,
+    progress: &Progress,
 ) -> Vec<SweepRow> {
     let next = AtomicUsize::new(0);
     let rows = Mutex::new(Vec::with_capacity(combos.len()));
     std::thread::scope(|s| {
         for _ in 0..threads.max(1).min(combos.len().max(1)) {
             s.spawn(|| loop {
+                if progress.is_cancelled() {
+                    break;
+                }
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 let Some(params) = combos.get(i) else { break };
                 let mut c = cfg.clone();
                 c.strategy.params = params.clone();
                 if strategy::build(&c.strategy).is_err() {
+                    progress.tick();
                     continue;
                 }
-                if let Ok(r) = run(data, &c) {
+                let result = run(data, &c);
+                progress.tick();
+                if let Ok(r) = result {
                     let score = objective.score(&r.metrics, min_trades);
                     let params = strategy::resolve_params(&c.strategy).unwrap_or_else(|_| params.clone());
                     rows.lock().unwrap_or_else(|e| e.into_inner()).push(SweepRow { params, metrics: r.metrics, score });
@@ -179,6 +207,7 @@ pub fn walk_forward(
     train: Duration,
     test: Duration,
     threads: usize,
+    progress: &Progress,
 ) -> Result<WalkForwardResult> {
     if train <= Duration::zero() || test <= Duration::zero() {
         bail!("train and test periods must be positive");
@@ -189,10 +218,18 @@ pub fn walk_forward(
     let mut windows = Vec::new();
     let mut oos_trades = Vec::new();
     let mut start = cfg.from;
+    let mut n_windows = 0;
+    while start + Duration::seconds(test.num_seconds() * n_windows) + train < cfg.to {
+        n_windows += 1;
+    }
+    progress.total.store(n_windows as usize * (combos.len() + 1), Ordering::Relaxed);
     while start + train < cfg.to {
+        if progress.is_cancelled() {
+            bail!("cancelled");
+        }
         let (train_to, test_to) = (start + train, (start + train + test).min(cfg.to));
         let train_cfg = BacktestConfig { from: start, to: train_to, ..cfg.clone() };
-        let rows = sweep(data, &train_cfg, combos, objective, min_trades, threads);
+        let rows = sweep(data, &train_cfg, combos, objective, min_trades, threads, progress);
         let best = rows.into_iter().find(|r| r.score.is_some());
         let mut w = WalkForwardWindow {
             train_from: start,
@@ -207,6 +244,7 @@ pub fn walk_forward(
             let mut test_cfg = BacktestConfig { from: train_to, to: test_to, ..cfg.clone() };
             test_cfg.strategy.params = best.params.clone();
             let r = run(data, &test_cfg)?;
+            progress.tick();
             oos_trades.extend(r.trades);
             w.params = Some(best.params);
             w.train = Some(best.metrics);
@@ -290,12 +328,20 @@ mod tests {
             &Params::new(),
             &[GridAxis::parse("fast=5,10,60").unwrap(), GridAxis::parse("slow=20,50").unwrap()],
         );
-        let rows = sweep(&data, &cfg, &combos, Objective::NetProfit, 1, 4);
+        let progress = Progress::default();
+        let rows = sweep(&data, &cfg, &combos, Objective::NetProfit, 1, 4, &progress);
+        assert_eq!(progress.done.load(Ordering::Relaxed), combos.len());
         // fast=60 は slow より長いので組めない
         assert_eq!(rows.len(), 4);
         assert!(rows.windows(2).all(|w| w[0].score.unwrap_or(f64::MIN) >= w[1].score.unwrap_or(f64::MIN)));
 
-        let wf = walk_forward(&data, &cfg, &combos, Objective::NetProfit, 1, Duration::days(20), Duration::days(10), 4).unwrap();
+        let progress = Progress::default();
+        let wf = walk_forward(&data, &cfg, &combos, Objective::NetProfit, 1, Duration::days(20), Duration::days(10), 4, &progress).unwrap();
+        assert!(progress.done.load(Ordering::Relaxed) <= progress.total.load(Ordering::Relaxed));
+        // 中止したら途中で止まる
+        let stopped = Progress::default();
+        stopped.cancelled.store(true, Ordering::Relaxed);
+        assert!(walk_forward(&data, &cfg, &combos, Objective::NetProfit, 1, Duration::days(20), Duration::days(10), 4, &stopped).is_err());
         assert!(wf.windows.len() >= 4);
         assert!(wf.oos_trades.iter().all(|t| t.entry_time >= cfg.from + Duration::days(20)));
         assert_eq!(wf.oos.trades, wf.oos_trades.len());

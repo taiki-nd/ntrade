@@ -1,4 +1,5 @@
 pub mod handlers;
+pub mod jobs;
 pub mod state;
 pub mod types;
 
@@ -47,6 +48,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/backtest/runs/{id}", get(handlers::backtest::run_detail).delete(handlers::backtest::delete_run))
         .route("/api/backtest/run", post(handlers::backtest::run))
         .route("/api/backtest/coverage", get(handlers::backtest::coverage))
+        .route("/api/backtest/jobs", get(handlers::backtest::list_jobs).post(handlers::backtest::submit_job))
+        .route("/api/backtest/jobs/{id}/cancel", post(handlers::backtest::cancel_job))
         // 9. 予約注文とリスク設定
         .route("/api/orders", get(handlers::orders::list_orders))
         .route("/api/orders/{id}", delete(handlers::orders::cancel_order))

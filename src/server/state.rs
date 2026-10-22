@@ -30,6 +30,8 @@ pub struct AppState {
     pub ctrader_service: Arc<RwLock<Option<Arc<CTraderService>>>>,
     pub ctrader_config: Arc<RwLock<Option<CTraderConfig>>>,
     pub available_accounts: Arc<RwLock<Vec<AccountInfo>>>,
+    /// バックテスト系のジョブ（過去データの取得・グリッドサーチ・ウォークフォワード）
+    pub jobs: super::jobs::Jobs,
     /// デプロイごとの直近の実行状況
     pub deployment_status: Arc<RwLock<HashMap<String, DeploymentStatus>>>,
     /// SQLite（ヒストリカルバー・バックテスト結果・シグナルログ・ポジション・決済履歴）
@@ -322,6 +324,7 @@ impl AppState {
             ctrader_service: Arc::new(RwLock::new(None)),
             ctrader_config: Arc::new(RwLock::new(initial_config)),
             available_accounts: Arc::new(RwLock::new(Vec::new())),
+            jobs: super::jobs::Jobs::default(),
             deployment_status: Arc::new(RwLock::new(HashMap::new())),
             db_path,
             positions_persist_lock: Arc::new(tokio::sync::Mutex::new(())),

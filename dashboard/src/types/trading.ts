@@ -362,6 +362,43 @@ export interface BacktestRunRequest {
   label: string;
 }
 
+/** グリッドサーチ・ウォークフォワードで何を最大化するか */
+export type Objective = "net_profit" | "profit_factor" | "sharpe" | "recovery_factor" | "expectancy";
+
+/** グリッドサーチの本文。grid は "fast=10..30:5" / "slow=50,100" の形 */
+export interface GridRequest extends BacktestRunRequest {
+  grid: string[];
+  objective: Objective;
+  minTrades: number;
+}
+
+/** POST /api/backtest/jobs の本文 */
+export type BacktestJobRequest =
+  | ({ kind: "fetch" } & { pairs: string[]; from: string; to?: string; periods?: StrategyTimeframe[] })
+  | ({ kind: "sweep" } & GridRequest)
+  | ({ kind: "walk_forward" } & GridRequest & { trainDays: number; testDays: number });
+
+export type BacktestJobKind = "fetch" | "sweep" | "walk_forward";
+export type BacktestJobStatus = "queued" | "running" | "succeeded" | "failed" | "cancelled";
+
+/** エンジンの中で 1 件ずつ走るジョブ（再起動で消える） */
+export interface BacktestJob {
+  id: number;
+  kind: BacktestJobKind;
+  title: string;
+  status: BacktestJobStatus;
+  createdAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+  /** 取得なら区切りの数、探索ならバックテストの回数 */
+  done: number;
+  total: number;
+  message: string | null;
+  /** 保存したバックテスト結果（グリッドサーチ・ウォークフォワード） */
+  runId: number | null;
+  error: string | null;
+}
+
 /** DB にある足の範囲（period は "1M" / "5M" / ... / "1D"） */
 export interface BarCoverage {
   pair: string;

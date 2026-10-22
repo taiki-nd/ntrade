@@ -2,17 +2,18 @@
 //! CLI（`bin/backtest`）とダッシュボードの API が同じ手順で実行する。
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
+use super::optimize::{self, GridAxis, Objective, Progress, SweepRow, WalkForwardResult};
 use super::{BacktestConfig, Costs, DataRequest, MarketData};
 use crate::ctrader::BarPeriod;
 use crate::guard::{GuardConfig, DEFAULT_GUARD_CONFIG_PATH};
 use crate::settings::{TradingSettings, SETTINGS_KEY};
 use crate::storage::Db;
-use crate::strategy::{self, StrategySpec};
+use crate::strategy::{self, Params, StrategySpec};
 
 pub const DEFAULT_BACKTEST_CONFIG_PATH: &str = "config/backtest.toml";
 
@@ -191,6 +192,157 @@ pub fn save_single(db: &mut Db, result: &super::BacktestResult, label: &str) -> 
         summary: serde_json::Value::Null,
     };
     db.insert_backtest_run(&run, &result.trades, &super::metrics::downsample(&result.equity, 2000))
+}
+
+/// グリッドサーチ・ウォークフォワードの指定（CLI の引数・API のリクエスト）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GridRequest {
+    #[serde(flatten)]
+    pub run: RunRequest,
+    /// 探索するパラメータ（`fast=5..30:5` / `slow=50,100` / `sl_atr=1.5`）
+    pub grid: Vec<String>,
+    pub objective: Objective,
+    /// これ未満の取引数の組み合わせは選ばない
+    #[serde(default = "default_min_trades")]
+    pub min_trades: usize,
+}
+
+fn default_min_trades() -> usize {
+    30
+}
+
+/// ウォークフォワードの期間（日数）
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WalkForwardWindows {
+    pub train_days: i64,
+    pub test_days: i64,
+}
+
+/// 探索する組み合わせ。パラメータ名の誤りは走らせる前に止める
+pub fn grid_combos(spec: &StrategySpec, grid: &[String]) -> Result<Vec<Params>> {
+    let axes: Vec<GridAxis> = grid.iter().map(|s| GridAxis::parse(s)).collect::<Result<_>>()?;
+    if axes.is_empty() {
+        anyhow::bail!("探索するパラメータを 1 つ以上指定してください");
+    }
+    for a in &axes {
+        let probe = StrategySpec { params: Params::from([(a.name.clone(), a.values[0])]), ..spec.clone() };
+        if let Err(e) = strategy::resolve_params(&probe) {
+            if e.to_string().contains("unknown") {
+                return Err(e);
+            }
+        }
+    }
+    let combos = optimize::combinations(&spec.params, &axes);
+    if combos.len() > MAX_COMBINATIONS {
+        anyhow::bail!("組み合わせが {} 通りあります（上限 {MAX_COMBINATIONS}）。候補を減らしてください", combos.len());
+    }
+    Ok(combos)
+}
+
+/// 1 回のグリッドサーチで試す組み合わせの上限
+pub const MAX_COMBINATIONS: usize = 5000;
+
+/// 組み合わせの中で最も長い助走
+pub fn max_lookback(spec: &StrategySpec, combos: &[Params]) -> usize {
+    combos
+        .iter()
+        .filter_map(|p| strategy::build(&StrategySpec { params: p.clone(), ..spec.clone() }).ok())
+        .map(|s| s.lookback())
+        .max()
+        .unwrap_or(0)
+}
+
+/// グリッドサーチを実行して保存する
+pub struct SweepOutcome {
+    pub id: i64,
+    pub config: BacktestConfig,
+    pub exec_period: BarPeriod,
+    pub combinations: usize,
+    pub rows: Vec<SweepRow>,
+}
+
+pub fn run_sweep(db: &mut Db, file: &BacktestFileConfig, req: &GridRequest, threads: usize, progress: &Progress) -> Result<SweepOutcome> {
+    let combos = grid_combos(&req.run.strategy, &req.grid)?;
+    progress.total.store(combos.len(), std::sync::atomic::Ordering::Relaxed);
+    let (data, cfg) = prepare(db, file, &req.run, max_lookback(&req.run.strategy, &combos))?;
+    let rows = optimize::sweep(&data, &cfg, &combos, req.objective, req.min_trades, threads, progress);
+    if progress.is_cancelled() {
+        anyhow::bail!("cancelled");
+    }
+    let best = rows.first().map(|r| serde_json::to_value(&r.metrics)).transpose()?.unwrap_or_default();
+    let id = db.insert_backtest_run(
+        &crate::storage::NewBacktestRun {
+            label: &req.run.label,
+            kind: "sweep",
+            pair: &cfg.pair,
+            strategy: &grid_label(&cfg.strategy),
+            from: cfg.from,
+            to: cfg.to,
+            config: serde_json::json!({ "config": cfg, "execPeriod": data.exec_period, "grid": req.grid, "objective": req.objective, "minTrades": req.min_trades }),
+            metrics: best,
+            summary: serde_json::to_value(&rows)?,
+        },
+        &[],
+        &[],
+    )?;
+    Ok(SweepOutcome { id, config: cfg, exec_period: data.exec_period, combinations: combos.len(), rows })
+}
+
+pub struct WalkForwardOutcome {
+    pub id: i64,
+    pub config: BacktestConfig,
+    pub combinations: usize,
+    pub result: WalkForwardResult,
+}
+
+/// ウォークフォワードを実行して保存する
+pub fn run_walk_forward(
+    db: &mut Db,
+    file: &BacktestFileConfig,
+    req: &GridRequest,
+    windows: WalkForwardWindows,
+    threads: usize,
+    progress: &Progress,
+) -> Result<WalkForwardOutcome> {
+    let combos = grid_combos(&req.run.strategy, &req.grid)?;
+    let (data, cfg) = prepare(db, file, &req.run, max_lookback(&req.run.strategy, &combos))?;
+    let result = optimize::walk_forward(
+        &data,
+        &cfg,
+        &combos,
+        req.objective,
+        req.min_trades,
+        Duration::days(windows.train_days),
+        Duration::days(windows.test_days),
+        threads,
+        progress,
+    )?;
+    let id = db.insert_backtest_run(
+        &crate::storage::NewBacktestRun {
+            label: &req.run.label,
+            kind: "walk_forward",
+            pair: &cfg.pair,
+            strategy: &grid_label(&cfg.strategy),
+            from: cfg.from,
+            to: cfg.to,
+            config: serde_json::json!({
+                "config": cfg, "execPeriod": data.exec_period, "grid": req.grid, "objective": req.objective,
+                "minTrades": req.min_trades, "trainDays": windows.train_days, "testDays": windows.test_days
+            }),
+            metrics: serde_json::to_value(&result.oos)?,
+            summary: serde_json::to_value(&result.windows)?,
+        },
+        &result.oos_trades,
+        &super::metrics::equity_from_trades(&result.oos_trades, cfg.initial_balance),
+    )?;
+    Ok(WalkForwardOutcome { id, config: cfg, combinations: combos.len(), result })
+}
+
+/// グリッドサーチ・ウォークフォワードの一覧表示用の戦略名（パラメータは組み合わせごとに違うので出さない）
+fn grid_label(spec: &StrategySpec) -> String {
+    format!("{} {} [grid]", spec.name, spec.timeframe.as_str())
 }
 
 #[cfg(test)]

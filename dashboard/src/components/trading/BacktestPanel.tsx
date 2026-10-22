@@ -13,13 +13,16 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { FlaskConical, Loader2, Play, RefreshCw, Trash2 } from "lucide-react";
+import { Database, FlaskConical, Loader2, Play, RefreshCw, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { tradingApi } from "@/lib/trading-api";
 import { BacktestRunForm } from "@/components/trading/BacktestRunForm";
+import { BacktestFetchForm, BacktestJobs } from "@/components/trading/BacktestJobs";
 import { BacktestRunDetail, KIND_LABELS } from "@/components/trading/BacktestRunDetail";
 import type {
+  BacktestJob,
+  BacktestJobRequest,
   BacktestRunDetail as BacktestRunDetailData,
   BacktestRunRequest,
   BacktestRunRow,
@@ -33,6 +36,9 @@ interface BacktestPanelProps {
 }
 
 const RUN_LIMIT = 200;
+/** ジョブが動いている間の一覧の取り直し間隔 */
+const JOB_ACTIVE_INTERVAL = 2000;
+const JOB_IDLE_INTERVAL = 15000;
 
 const errorMessage = (err: unknown) =>
   err instanceof Error ? err.message : "エンジンが起動しているか確認してください。";
@@ -50,6 +56,9 @@ export function BacktestPanel({ pairs }: BacktestPanelProps) {
   const [detailLoading, setDetailLoading] = React.useState(false);
   const [running, setRunning] = React.useState(false);
   const [formOpen, setFormOpen] = React.useState(false);
+  const [fetchOpen, setFetchOpen] = React.useState(false);
+  const [submitting, setSubmitting] = React.useState(false);
+  const [jobs, setJobs] = React.useState<BacktestJob[]>([]);
   // 削除確認ダイアログの対象。null なら閉じている
   const [pendingDelete, setPendingDelete] = React.useState<BacktestRunRow | null>(null);
 
@@ -109,6 +118,76 @@ export function BacktestPanel({ pairs }: BacktestPanelProps) {
     };
   }, [selected]);
 
+  // ジョブの一覧。動いている間は短い間隔で取り直し、終わったジョブがあれば結果と足の範囲を読み直す
+  const jobsActive = jobs.some((j) => j.status === "queued" || j.status === "running");
+  const finishedRef = React.useRef<Set<number> | null>(null);
+  const loadJobs = React.useCallback(async () => {
+    try {
+      const res = await tradingApi.getBacktestJobs();
+      if (!res.success || !res.data) return;
+      const list = res.data;
+      setJobs(list);
+      const finished = new Set(list.filter((j) => j.status !== "queued" && j.status !== "running").map((j) => j.id));
+      const known = finishedRef.current;
+      finishedRef.current = finished;
+      if (!known) return;
+      const fresh = list.filter((j) => finished.has(j.id) && !known.has(j.id));
+      for (const j of fresh) {
+        if (j.status === "succeeded") toast.success(`ジョブ #${j.id} が完了しました`, { description: j.title });
+        else if (j.status === "failed") toast.error(`ジョブ #${j.id} が失敗しました`, { description: j.error ?? j.title });
+      }
+      if (fresh.length > 0) {
+        await loadRuns();
+        const cov = await tradingApi.getBacktestCoverage().catch(() => null);
+        if (cov?.success && cov.data) setCoverage(cov.data);
+        const opened = fresh.find((j) => j.status === "succeeded" && j.runId !== null);
+        if (opened) setSelected(opened.runId);
+      }
+    } catch {
+      // 疎通エラーはページ上部のアラートで表示する
+    }
+  }, [loadRuns]);
+
+  React.useEffect(() => {
+    const first = setTimeout(loadJobs, 0);
+    const id = setInterval(loadJobs, jobsActive ? JOB_ACTIVE_INTERVAL : JOB_IDLE_INTERVAL);
+    return () => {
+      clearTimeout(first);
+      clearInterval(id);
+    };
+  }, [loadJobs, jobsActive]);
+
+  const submitJob = async (req: BacktestJobRequest) => {
+    setSubmitting(true);
+    try {
+      const res = await tradingApi.submitBacktestJob(req);
+      if (res.success && res.data) {
+        toast.success(res.message || "ジョブを受け付けました", { description: res.data.title });
+        setFormOpen(false);
+        setFetchOpen(false);
+        await loadJobs();
+      } else {
+        toast.error("ジョブを受け付けられませんでした", { description: res.message });
+      }
+    } catch (err) {
+      toast.error("ジョブを受け付けられませんでした", { description: errorMessage(err) });
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const cancelJob = async (id: number) => {
+    try {
+      const res = await tradingApi.cancelBacktestJob(id);
+      if (res.success) toast.success(res.message || "中止を指示しました");
+      else toast.error("中止できませんでした", { description: res.message });
+    } catch (err) {
+      toast.error("中止できませんでした", { description: errorMessage(err) });
+    } finally {
+      loadJobs();
+    }
+  };
+
   const handleRun = async (req: BacktestRunRequest) => {
     setRunning(true);
     try {
@@ -155,6 +234,7 @@ export function BacktestPanel({ pairs }: BacktestPanelProps) {
 
   return (
     <div className="space-y-4">
+      <BacktestJobs jobs={jobs} onCancel={cancelJob} onOpenRun={setSelected} />
       <div className="space-y-4">
         {/* 実行一覧 */}
         <Card className="shadow-xs min-w-0">
@@ -168,14 +248,17 @@ export function BacktestPanel({ pairs }: BacktestPanelProps) {
                 </Badge>
               </CardTitle>
               <CardDescription className="text-xs">
-                ヒストリカルの足で戦略を動かした結果。グリッドサーチ・ウォークフォワードは CLI（
-                <code className="font-mono">bin/backtest</code>）で実行するとここに並びます
+                ヒストリカルの足で戦略を動かした結果。CLI（<code className="font-mono">bin/backtest</code>）で実行した結果もここに並びます
               </CardDescription>
             </div>
             <div className="flex items-center gap-2 shrink-0">
               <Button variant="outline" size="sm" onClick={loadAll} disabled={loading} className="h-8 gap-1.5 text-xs">
                 {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
                 更新
+              </Button>
+              <Button variant="outline" size="sm" onClick={() => setFetchOpen(true)} className="h-8 gap-1.5 text-xs">
+                <Database className="h-3.5 w-3.5" />
+                データを取得
               </Button>
               <Button size="sm" onClick={() => setFormOpen(true)} className="h-8 gap-1.5 text-xs">
                 <Play className="h-3.5 w-3.5" />
@@ -282,9 +365,32 @@ export function BacktestPanel({ pairs }: BacktestPanelProps) {
               <Play className="h-4 w-4 text-primary" />
               新しく実行
             </DialogTitle>
-            <DialogDescription className="text-xs">単発のバックテストを実行して保存します。終わると結果を開きます</DialogDescription>
+            <DialogDescription className="text-xs">
+              戦略とパラメータを選んで実行します。単発は終わると結果を開き、グリッドサーチ・ウォークフォワードはジョブとして順番に走ります
+            </DialogDescription>
           </DialogHeader>
-          <BacktestRunForm pairs={pairs} strategies={strategies} coverage={coverage} running={running} onRun={handleRun} />
+          <BacktestRunForm
+            pairs={pairs}
+            strategies={strategies}
+            coverage={coverage}
+            running={running || submitting}
+            onRun={handleRun}
+            onSubmitJob={submitJob}
+          />
+        </DialogContent>
+      </Dialog>
+
+      {/* 過去データの取得 */}
+      <Dialog open={fetchOpen} onOpenChange={setFetchOpen}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-base">
+              <Database className="h-4 w-4 text-primary" />
+              過去データを取得
+            </DialogTitle>
+            <DialogDescription className="text-xs">cTrader から足を取得して DB に保存します（エンジンの cTrader 接続を使います）</DialogDescription>
+          </DialogHeader>
+          <BacktestFetchForm key={pairs.join(",")} pairs={pairs} submitting={submitting} onSubmit={submitJob} />
         </DialogContent>
       </Dialog>
 
