@@ -27,3 +27,8 @@ export function strategyLabel(spec: StrategySpec): string {
 export function defaultParams(info: StrategyInfo | undefined): Record<string, number> {
   return Object.fromEntries((info?.params ?? []).map((p) => [p.name, p.default]));
 }
+
+/** ロジック戦略のシグナル ID か（LLM 時代の判断 ID "cot-..." はシグナルとして開けない） */
+export function isSignalId(id: string | null | undefined): id is string {
+  return !!id && id.startsWith("sig-");
+}

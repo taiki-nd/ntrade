@@ -55,6 +55,7 @@ import {
   ArrowDown,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { isSignalId } from "@/lib/strategy";
 import { SignalDetailDialog } from "@/components/trading/SignalViewer";
 import { StrategyBadge } from "@/components/trading/PositionTable";
 import { PaginationBar, PaginationBarProps } from "@/components/trading/PaginationBar";
@@ -587,12 +588,12 @@ export function TradeHistoryTable({ trades, pagination, filter, onDelete }: Trad
                       <TableCell
                         className={cn(
                           "text-right font-mono tabular-nums text-sm font-bold",
-                          isPositive
+                          trd.pnlAmount >= 0
                             ? "text-profit"
                             : "text-loss"
                         )}
                       >
-                        {isPositive ? "+" : ""}
+                        {trd.pnlAmount > 0 ? "+" : ""}
                         {formatCurrency(trd.pnlAmount)}
                       </TableCell>
                       <TableCell className="text-center">
@@ -607,7 +608,7 @@ export function TradeHistoryTable({ trades, pagination, filter, onDelete }: Trad
                       </TableCell>
 
                       <TableCell className="text-center">
-                        {trd.signalId ? (
+                        {isSignalId(trd.signalId) ? (
                           <Button
                             variant="ghost"
                             size="sm"

@@ -92,7 +92,7 @@ function DashboardNavContent({
                   nt
                 </div>
                 <span className="font-bold text-base tracking-tight truncate">ntrade</span>
-                <span className="text-[10px] bg-muted px-1.5 py-0.5 rounded text-muted-foreground font-mono">v0.1</span>
+                <span className="text-[10px] bg-muted px-1.5 py-0.5 rounded text-muted-foreground font-mono">v0.2</span>
               </Link>
               {onToggleCollapse && (
                 <Button

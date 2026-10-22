@@ -49,6 +49,7 @@ export function BacktestPanel({ pairs }: BacktestPanelProps) {
   const [loading, setLoading] = React.useState(false);
   const [detailLoading, setDetailLoading] = React.useState(false);
   const [running, setRunning] = React.useState(false);
+  const [formOpen, setFormOpen] = React.useState(false);
   // 削除確認ダイアログの対象。null なら閉じている
   const [pendingDelete, setPendingDelete] = React.useState<BacktestRunRow | null>(null);
 
@@ -56,7 +57,12 @@ export function BacktestPanel({ pairs }: BacktestPanelProps) {
     setLoading(true);
     try {
       const res = await tradingApi.getBacktestRuns(RUN_LIMIT);
-      if (res.success && res.data) setRuns(res.data);
+      if (res.success && res.data) {
+        const rows = res.data;
+        setRuns(rows);
+        // 何も選んでいなければ最新の結果を開く
+        setSelected((cur) => cur ?? rows[0]?.id ?? null);
+      }
     } catch {
       // 疎通エラーはページ上部のアラートで表示する
     } finally {
@@ -114,6 +120,7 @@ export function BacktestPanel({ pairs }: BacktestPanelProps) {
         });
         await loadRuns();
         setSelected(res.data.id);
+        setFormOpen(false);
       } else {
         toast.error("バックテストを実行できませんでした", { description: res.message });
       }
@@ -148,7 +155,7 @@ export function BacktestPanel({ pairs }: BacktestPanelProps) {
 
   return (
     <div className="space-y-4">
-      <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_420px] items-start">
+      <div className="space-y-4">
         {/* 実行一覧 */}
         <Card className="shadow-xs min-w-0">
           <CardHeader className="flex flex-col sm:flex-row sm:items-center justify-between pb-3 gap-2">
@@ -165,10 +172,16 @@ export function BacktestPanel({ pairs }: BacktestPanelProps) {
                 <code className="font-mono">bin/backtest</code>）で実行するとここに並びます
               </CardDescription>
             </div>
-            <Button variant="outline" size="sm" onClick={loadAll} disabled={loading} className="h-8 gap-1.5 text-xs shrink-0">
-              {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
-              更新
-            </Button>
+            <div className="flex items-center gap-2 shrink-0">
+              <Button variant="outline" size="sm" onClick={loadAll} disabled={loading} className="h-8 gap-1.5 text-xs">
+                {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+                更新
+              </Button>
+              <Button size="sm" onClick={() => setFormOpen(true)} className="h-8 gap-1.5 text-xs">
+                <Play className="h-3.5 w-3.5" />
+                新しく実行
+              </Button>
+            </div>
           </CardHeader>
           <CardContent className="p-0">
             <div className="max-h-[560px] overflow-auto">
@@ -191,7 +204,7 @@ export function BacktestPanel({ pairs }: BacktestPanelProps) {
                   {runs.length === 0 ? (
                     <TableRow>
                       <TableCell colSpan={10} className="h-20 text-center text-muted-foreground text-sm">
-                        バックテストの結果はまだありません。右のフォームから実行してください
+                        バックテストの結果はまだありません。「新しく実行」から実行してください
                       </TableCell>
                     </TableRow>
                   ) : (
@@ -208,7 +221,7 @@ export function BacktestPanel({ pairs }: BacktestPanelProps) {
                             {KIND_LABELS[r.kind] ?? r.kind}
                           </Badge>
                         </TableCell>
-                        <TableCell className="max-w-[220px]">
+                        <TableCell className="max-w-[360px]">
                           <div className="text-xs font-semibold">{r.pair}</div>
                           <div className="text-[11px] font-mono text-muted-foreground truncate" title={r.strategy}>
                             {r.strategy}
@@ -233,7 +246,7 @@ export function BacktestPanel({ pairs }: BacktestPanelProps) {
                         <TableCell className="text-xs text-right font-mono tabular-nums">
                           {r.metrics ? `${r.metrics.maxDrawdownPct.toFixed(1)}%` : "—"}
                         </TableCell>
-                        <TableCell className="text-xs max-w-[160px] truncate" title={r.label}>
+                        <TableCell className="text-xs max-w-[220px] truncate" title={r.label}>
                           {r.label || <span className="text-muted-foreground">—</span>}
                         </TableCell>
                         <TableCell>
@@ -259,20 +272,21 @@ export function BacktestPanel({ pairs }: BacktestPanelProps) {
           </CardContent>
         </Card>
 
-        {/* 実行フォーム */}
-        <Card className="shadow-xs">
-          <CardHeader className="pb-3">
-            <CardTitle className="text-base font-semibold flex items-center gap-2">
-              <Play className="h-5 w-5 text-primary" />
-              <span>新しく実行</span>
-            </CardTitle>
-            <CardDescription className="text-xs">単発のバックテストを実行して保存します。終わると結果を開きます</CardDescription>
-          </CardHeader>
-          <CardContent>
-            <BacktestRunForm pairs={pairs} strategies={strategies} coverage={coverage} running={running} onRun={handleRun} />
-          </CardContent>
-        </Card>
       </div>
+
+      {/* 実行フォーム */}
+      <Dialog open={formOpen} onOpenChange={(open) => !running && setFormOpen(open)}>
+        <DialogContent className="sm:max-w-xl max-h-[90vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-base">
+              <Play className="h-4 w-4 text-primary" />
+              新しく実行
+            </DialogTitle>
+            <DialogDescription className="text-xs">単発のバックテストを実行して保存します。終わると結果を開きます</DialogDescription>
+          </DialogHeader>
+          <BacktestRunForm pairs={pairs} strategies={strategies} coverage={coverage} running={running} onRun={handleRun} />
+        </DialogContent>
+      </Dialog>
 
       {/* 選んだ実行の結果 */}
       {detailLoading && !detail && (

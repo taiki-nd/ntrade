@@ -9,6 +9,7 @@ import { Hourglass, Radio, Trash2 } from "lucide-react";
 import { tradingApi, type WorkingOrder } from "@/lib/trading-api";
 import { priceDigits } from "@/lib/price";
 import { cn } from "@/lib/utils";
+import { isSignalId } from "@/lib/strategy";
 import { toast } from "sonner";
 import { SideBadge, StrategyBadge, formatLevel } from "@/components/trading/PositionTable";
 import { SignalDetailDialog } from "@/components/trading/SignalViewer";
@@ -144,7 +145,7 @@ export function OrderMonitor({ onChanged, refreshKey }: OrderMonitorProps) {
                       </TableCell>
                       <TableCell className="text-right">
                         <div className="flex items-center justify-end gap-1">
-                          {o.signalId && (
+                          {isSignalId(o.signalId) && (
                             <Button
                               variant="ghost"
                               size="icon-sm"

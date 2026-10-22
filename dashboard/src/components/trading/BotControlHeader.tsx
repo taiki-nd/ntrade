@@ -175,11 +175,11 @@ export function BotControlHeader({
               label="スプレッド (pips)"
               value={
                 Object.entries(metrics.spreads ?? {})
-                  .map(([pair, v]) => `${pair.replace(/_[a-z]+$/i, "")} ${v}`)
+                  .map(([pair, v]) => `${pair.replace(/_[a-z]+$/i, "")} ${v.toFixed(1)}`)
                   .join(" · ") || "-"
               }
               title={Object.entries(metrics.spreads ?? {})
-                .map(([pair, v]) => `${pair}: ${v} pips`)
+                .map(([pair, v]) => `${pair}: ${v.toFixed(2)} pips`)
                 .join("\n")}
             />
           </div>

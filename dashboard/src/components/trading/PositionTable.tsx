@@ -16,6 +16,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { ArrowUpRight, ArrowDownRight, Radio, Wallet, XCircle } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { isSignalId } from "@/lib/strategy";
 import { SignalDetailDialog } from "@/components/trading/SignalViewer";
 import { useNow } from "@/hooks/use-now";
 import { formatDuration, parseEngineTime } from "@/lib/time";
@@ -142,7 +143,7 @@ export function PositionTable({ positions, onClosePosition }: PositionTableProps
                       </TableCell>
                       <TableCell className="text-right">
                         <div className="flex items-center justify-end gap-1">
-                          {pos.signalId && (
+                          {isSignalId(pos.signalId) && (
                             <Button
                               variant="ghost"
                               size="icon-sm"
