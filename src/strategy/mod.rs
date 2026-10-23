@@ -2,7 +2,10 @@
 
 pub mod donchian;
 pub mod ema_cross;
+pub mod noise_area;
+pub mod rsi2_dip;
 pub mod types;
+pub mod us_cash;
 
 use anyhow::{bail, Result};
 
@@ -13,7 +16,7 @@ pub use types::{
 
 /// 使える戦略の一覧
 pub fn catalog() -> Vec<StrategyInfo> {
-    vec![ema_cross::info(), donchian::info()]
+    vec![ema_cross::info(), donchian::info(), noise_area::info(), rsi2_dip::info()]
 }
 
 pub fn info(name: &str) -> Option<StrategyInfo> {
@@ -48,6 +51,8 @@ pub fn build(spec: &StrategySpec) -> Result<Box<dyn Strategy>> {
     Ok(match spec.name.as_str() {
         ema_cross::NAME => Box::new(ema_cross::EmaCross::from_params(get)?),
         donchian::NAME => Box::new(donchian::DonchianBreakout::from_params(get, spec.timeframe)?),
+        noise_area::NAME => Box::new(noise_area::NoiseArea::from_params(get)?),
+        rsi2_dip::NAME => Box::new(rsi2_dip::Rsi2Dip::from_params(get)?),
         other => bail!("unknown strategy '{other}'"),
     })
 }

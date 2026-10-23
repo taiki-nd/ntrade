@@ -35,3 +35,20 @@ commission_per_lot = 800
 
 [pairs.EURUSD_z]
 commission_per_lot = 700
+
+# 株価指数 CFD（pip = 0.1 ポイント）。手数料は無く、コストはスプレッドとスワップ（2026-10 の銘柄仕様と実際の Bid/Ask から）
+# スワップは年率で付く（買い −5.45% / 売り +1.45%）ので、2026-10 の価格（US500 ≈ 7,700 / US100 ≈ 29,000、USDJPY ≈ 157）で 1 日分に直した値。
+# 価格が低かった過去の期間ではスワップを大きめに見積もることになる
+[pairs.US500_Z]
+spread_pips = 6
+slippage_pips = 1
+commission_per_lot = 0
+swap_long_per_lot = -183
+swap_short_per_lot = 49
+
+[pairs.US100_Z]
+spread_pips = 20
+slippage_pips = 3
+commission_per_lot = 0
+swap_long_per_lot = -698
+swap_short_per_lot = 185
